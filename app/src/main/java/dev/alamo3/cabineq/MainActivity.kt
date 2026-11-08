@@ -34,7 +34,7 @@ class MainActivity : Activity() {
     private lateinit var statusText: TextView
     private lateinit var startStopButton: Button
     private val handler = Handler(Looper.getMainLooper())
-    private val bandControls = ArrayList<Pair<SeekBar, TextView>>()
+    private lateinit var eqView: EqView
     private lateinit var updateText: TextView
     private lateinit var updateButton: Button
     private var pendingRelease: Updater.Release? = null
@@ -87,48 +87,44 @@ class MainActivity : Activity() {
         }
         root.addView(startStopButton)
 
-        statusText = TextView(this).apply {
-            setPadding(0, dp(12), 0, dp(12))
-            typeface = android.graphics.Typeface.MONOSPACE
-            textSize = 13f
-        }
-        root.addView(statusText)
-
-        // --- Updates ---
-        updateText = TextView(this).apply {
-            textSize = 13f
-            text = "Version ${Updater.installedVersionName(this@MainActivity)}"
-        }
-        root.addView(updateText)
-        updateButton = Button(this).apply {
-            text = "Check for updates"
-            setOnClickListener { onUpdateButton() }
-        }
-        root.addView(updateButton)
-
         // --- EQ ---
         root.addView(header("Equalizer"))
-        for (i in 0 until Bands.COUNT) {
-            val pair = slider(
-                root,
-                format = { "${Bands.label(i)}  ${signed(it)} dB" },
-                min = -Bands.MAX_BAND_DB, max = Bands.MAX_BAND_DB, step = 0.5f,
-                initial = settings.bandGain(i),
-            ) { settings.setBandGain(i, it) }
-            bandControls.add(pair)
+        eqView = EqView(this).apply {
+            setGains(FloatArray(Bands.COUNT) { settings.bandGain(it) })
+            onBandChanged = { band, db -> settings.setBandGain(band, db) }
         }
+        root.addView(eqView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(300)))
+        root.addView(TextView(this).apply {
+            text = "Drag a band up or down.  Solid = your EQ · dashed orange = live output (incl. speed comp)"
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, dp(4), 0, dp(8))
+        })
+
+        // Presets
+        val presetRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for ((name, values) in PRESETS) {
+            presetRow.addView(Button(this).apply {
+                text = name
+                textSize = 13f
+                setOnClickListener { applyPreset(values) }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        root.addView(presetRow)
+
         slider(
             root, format = { "Preamp  ${signed(it)} dB" },
             min = -12f, max = 6f, step = 0.5f, initial = settings.preampDb,
         ) { settings.preampDb = it }
 
-        root.addView(Button(this).apply {
-            text = "Reset EQ"
-            setOnClickListener {
-                settings.resetEq()
-                recreate()
-            }
-        })
+        // --- Status ---
+        root.addView(header("Status"))
+        statusText = TextView(this).apply {
+            setPadding(0, dp(4), 0, dp(12))
+            typeface = android.graphics.Typeface.MONOSPACE
+            textSize = 13f
+        }
+        root.addView(statusText)
 
         // --- Speed compensation ---
         root.addView(header("Speed compensation"))
@@ -161,7 +157,25 @@ class MainActivity : Activity() {
             alpha = 0.7f
         })
 
+        // --- Updates ---
+        root.addView(header("Updates"))
+        updateText = TextView(this).apply {
+            textSize = 13f
+            text = "Version ${Updater.installedVersionName(this@MainActivity)}"
+        }
+        root.addView(updateText)
+        updateButton = Button(this).apply {
+            text = "Check for updates"
+            setOnClickListener { onUpdateButton() }
+        }
+        root.addView(updateButton)
+
         return ScrollView(this).apply { addView(root) }
+    }
+
+    private fun applyPreset(values: FloatArray) {
+        for (i in 0 until Bands.COUNT) settings.setBandGain(i, values[i])
+        eqView.setGains(values)
     }
 
     private fun header(text: String) = TextView(this).apply {
@@ -216,6 +230,7 @@ class MainActivity : Activity() {
     private fun refreshStatus() {
         val s = EngineState
         startStopButton.text = if (s.running) "Stop CabinEQ" else "Start CabinEQ"
+        eqView.setApplied(if (s.running) s.appliedBands else null)
 
         val sb = StringBuilder()
         sb.append(if (s.running) "● Running\n" else "○ Stopped\n")
@@ -368,4 +383,14 @@ class MainActivity : Activity() {
 
     private fun fmt(v: Float) = String.format(Locale.US, "%.1f", v)
     private fun signed(v: Float) = String.format(Locale.US, "%+.1f", v)
+
+    companion object {
+        // 31, 63, 125, 250, 500, 1k, 2k, 4k, 8k, 16k
+        private val PRESETS = listOf(
+            "Flat" to FloatArray(Bands.COUNT),
+            "Bass" to floatArrayOf(6f, 5.5f, 4f, 2f, 0f, 0f, 0f, 0f, 0f, 0f),
+            "Vocal" to floatArrayOf(-2f, -2f, -1f, 0f, 1.5f, 3f, 3f, 2f, 0f, 0f),
+            "Loudness" to floatArrayOf(5f, 4f, 2f, 0f, -1f, -1f, 0f, 1.5f, 3f, 3f),
+        )
+    }
 }
