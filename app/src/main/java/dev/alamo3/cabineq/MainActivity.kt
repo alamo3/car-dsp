@@ -3,7 +3,11 @@ package dev.alamo3.cabineq
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.Settings as AndroidSettings
+import android.widget.Toast
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -31,6 +35,10 @@ class MainActivity : Activity() {
     private lateinit var startStopButton: Button
     private val handler = Handler(Looper.getMainLooper())
     private val bandControls = ArrayList<Pair<SeekBar, TextView>>()
+    private lateinit var updateText: TextView
+    private lateinit var updateButton: Button
+    private var pendingRelease: Updater.Release? = null
+    private var updateBusy = false
 
     private val statusUpdater = object : Runnable {
         override fun run() {
@@ -44,6 +52,13 @@ class MainActivity : Activity() {
         settings = Settings(this)
         setContentView(buildUi())
         requestNeededPermissions()
+        handleInstallStatus(intent)
+        checkForUpdate(userInitiated = false)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleInstallStatus(intent)
     }
 
     override fun onResume() {
@@ -78,6 +93,18 @@ class MainActivity : Activity() {
             textSize = 13f
         }
         root.addView(statusText)
+
+        // --- Updates ---
+        updateText = TextView(this).apply {
+            textSize = 13f
+            text = "Version ${Updater.installedVersionName(this@MainActivity)}"
+        }
+        root.addView(updateText)
+        updateButton = Button(this).apply {
+            text = "Check for updates"
+            setOnClickListener { onUpdateButton() }
+        }
+        root.addView(updateButton)
 
         // --- EQ ---
         root.addView(header("Equalizer"))
@@ -216,6 +243,97 @@ class MainActivity : Activity() {
         }
         statusText.text = sb.toString()
         statusText.gravity = Gravity.START
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Self-update
+
+    private fun onUpdateButton() {
+        if (updateBusy) return
+        val release = pendingRelease
+        if (release == null) checkForUpdate(userInitiated = true) else downloadAndInstall(release)
+    }
+
+    private fun checkForUpdate(userInitiated: Boolean) {
+        updateBusy = true
+        if (userInitiated) updateText.text = "Checking for updates…"
+        Thread {
+            val result = runCatching { Updater.fetchLatest() }
+            runOnUiThread {
+                updateBusy = false
+                val installed = Updater.installedVersionCode(this)
+                val current = "Version ${Updater.installedVersionName(this)}"
+                val release = result.getOrNull()
+                when {
+                    result.isFailure -> {
+                        if (userInitiated) updateText.text = "$current — update check failed: ${result.exceptionOrNull()?.message}"
+                    }
+                    release != null && release.versionCode > installed -> {
+                        pendingRelease = release
+                        updateText.text = "$current — update available: ${release.tag}"
+                        updateButton.text = "Install ${release.tag}"
+                    }
+                    else -> {
+                        pendingRelease = null
+                        updateText.text = "$current — up to date"
+                        updateButton.text = "Check for updates"
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun downloadAndInstall(release: Updater.Release) {
+        // Android needs a one-time "Install unknown apps" grant for CabinEQ.
+        if (!packageManager.canRequestPackageInstalls()) {
+            Toast.makeText(this, "Allow CabinEQ to install apps, then tap Install again", Toast.LENGTH_LONG).show()
+            startActivity(
+                Intent(AndroidSettings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
+            )
+            return
+        }
+        updateBusy = true
+        updateButton.isEnabled = false
+        Thread {
+            try {
+                val apk = Updater.download(this, release) { pct ->
+                    runOnUiThread {
+                        updateText.text = if (pct >= 0) "Downloading ${release.tag}… $pct%" else "Downloading ${release.tag}…"
+                    }
+                }
+                runOnUiThread { updateText.text = "Installing ${release.tag}…" }
+                Updater.install(this, apk)
+            } catch (e: Exception) {
+                runOnUiThread {
+                    updateText.text = "Update failed: ${e.message}"
+                    updateBusy = false
+                    updateButton.isEnabled = true
+                }
+            }
+        }.start()
+    }
+
+    private fun handleInstallStatus(intent: Intent?) {
+        if (intent?.action != Updater.ACTION_INSTALL_STATUS) return
+        val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
+        when (status) {
+            PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                val confirm: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+                    intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                }
+                confirm?.let { startActivity(it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                return  // the final status arrives in another intent
+            }
+            PackageInstaller.STATUS_SUCCESS -> updateText.text = "Update installed"
+            else -> {
+                val msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: "status $status"
+                updateText.text = "Update failed: $msg"
+            }
+        }
+        updateBusy = false
+        updateButton.isEnabled = true
     }
 
     // ---------------------------------------------------------------------------------
