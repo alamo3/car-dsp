@@ -176,7 +176,7 @@ class MainActivity : Activity() {
         root.addView(statusText)
 
         dspButton = Button(this).apply {
-            text = "Start native DSP"
+            text = "Start native DSP for other apps"
             setOnClickListener { requestDspStart() }
         }
         root.addView(dspButton)
@@ -363,20 +363,31 @@ class MainActivity : Activity() {
             sb.append("Applied: ")
             sb.append(s.appliedBands.joinToString(" ") { String.format(Locale.US, "%+.1f", it) })
             sb.append('\n')
+            // In-app player (TorBox): always runs through its own native DSP engine.
+            val player = FilePlayer.peek()?.takeIf { it.isActive }
+            if (player != null) {
+                sb.append("Player → native DSP: ${player.state.name.lowercase(Locale.US)}")
+                s.playerRoute?.let { sb.append(" → ").append(it) }
+                sb.append('\n')
+                sb.append("  ${player.currentTitle ?: "?"}\n")
+                player.formatInfo?.let { sb.append("  ").append(it).append('\n') }
+                if (player.state == FilePlayer.State.PLAYING) {
+                    sb.append(String.format(Locale.US, "  Peaks: in %.1f dBFS  out %.1f dBFS  limiter %.1f dB\n",
+                        s.playerInPeakDb, s.playerOutPeakDb, s.playerLimiterDb))
+                }
+                s.playerMessage?.let { sb.append("  ⚠ ").append(it).append('\n') }
+            }
+
+            // Other apps' audio: capture DSP or the Android EQ fallback.
             if (s.dspActive) {
-                sb.append(String.format(Locale.US, "DSP: %d Hz, %s\n", s.dspSampleRate,
+                sb.append(String.format(Locale.US, "Other apps → native DSP: %d Hz, %s\n", s.dspSampleRate,
                     if (s.dspOutputPaused) "idle (no audio)" else "processing → ${s.dspRoute ?: "?"}"))
-                sb.append(String.format(Locale.US, "Peaks: in %.1f dBFS  out %.1f dBFS  limiter %.1f dB",
+                sb.append(String.format(Locale.US, "  Peaks: in %.1f dBFS  out %.1f dBFS  limiter %.1f dB",
                     s.dspInPeakDb, s.dspOutPeakDb, s.dspLimiterDb))
             } else {
-                sb.append("DSP: off")
+                sb.append("Other apps → Android EQ (capture DSP not started)")
             }
-            s.dspMessage?.let { sb.append("\n⚠ ").append(it) }
-            FilePlayer.peek()?.takeIf { it.isActive }?.let { p ->
-                sb.append("\nPlayer: ${p.state.name.lowercase(Locale.US)} — ${p.currentTitle ?: "?"}")
-                p.formatInfo?.let { sb.append(" [").append(it).append(']') }
-                s.playerRoute?.let { sb.append(" → ").append(it) }
-            }
+            s.dspMessage?.let { sb.append("\n  ⚠ ").append(it) }
         }
         statusText.text = sb.toString()
         statusText.gravity = Gravity.START

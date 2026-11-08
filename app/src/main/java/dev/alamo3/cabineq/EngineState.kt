@@ -27,6 +27,7 @@ object EngineState {
     @Volatile var sessionModes: Map<Int, String> = emptyMap()  // sessionId -> "DSP" / "Android EQ"
 
     // In-app file player (TorBox). Track/state info lives on FilePlayer itself.
+    @Volatile var playerInPeakDb = -120f
     @Volatile var playerOutPeakDb = -120f
     @Volatile var playerLimiterDb = 0f
     @Volatile var playerRoute: String? = null

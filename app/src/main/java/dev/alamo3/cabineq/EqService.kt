@@ -220,6 +220,8 @@ class EqService : Service() {
 
         if (wantsDsp && capture == null) {
             startDsp(resultCode, resultData!!)
+        } else if (capture == null && intent?.action == ACTION_PLAYER_ATTACH) {
+            EngineState.dspMessage = null  // started for the in-app player, which has its own DSP
         } else if (capture == null) {
             EngineState.dspMessage = when {
                 !settings.dspEngine -> "DSP engine off — using Android EQ"
@@ -512,6 +514,7 @@ class EqService : Service() {
         }
 
         player.readMeters()?.let { m ->
+            EngineState.playerInPeakDb = toDb(m[0])
             EngineState.playerOutPeakDb = toDb(m[1])
             EngineState.playerLimiterDb = toDb(m[2])
         }
