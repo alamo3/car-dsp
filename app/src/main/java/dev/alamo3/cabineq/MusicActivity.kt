@@ -919,11 +919,12 @@ class MusicActivity : Activity() {
             return
         }
         val t = p.currentTrack
+        val info = p.currentInfo   // tags/cover embedded in the file, when the source has none
         val playing = p.state == FilePlayer.State.PLAYING || p.state == FilePlayer.State.LOADING
         if (p.version != shownVersion) {
             shownVersion = p.version
-            val title = t?.title ?: "—"
-            val artist = t?.artist ?: t?.album ?: p.queueTitle ?: ""
+            val title = (if (t?.artist == null) info?.title else null) ?: t?.title ?: "—"
+            val artist = t?.artist ?: info?.artist ?: t?.album ?: p.queueTitle ?: ""
             miniTitle.text = title
             miniSub.text = when (p.state) {
                 FilePlayer.State.LOADING -> p.note ?: "Loading…"
@@ -936,13 +937,22 @@ class MusicActivity : Activity() {
             val icon = if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
             miniToggle.setImageResource(icon)
             fullToggle.setImageResource(icon)
-            val artQuery = trackQuery(t, p.queueTitle)
-            val artKey = "${t?.artworkUrl}|$artQuery"
+            val artQuery = trackQuery(t, info)
+            val embedded = info?.art
+            val artKey = "${t?.artworkUrl}|$artQuery|${embedded?.let { System.identityHashCode(it) }}|${info != null}"
             if (artKey != shownArt) {
                 shownArt = artKey
-                val kind = if (t?.artist != null) Artwork.Kind.SONG else Artwork.Kind.ALBUM
-                Artwork.load(miniArt, t?.artworkUrl, dp(44) * 2, artQuery, kind)
-                Artwork.load(fullArt, t?.artworkUrl, min(resources.displayMetrics.widthPixels, 1000), artQuery, kind)
+                when {
+                    // 1. Cover embedded in the file: exact for this song, even on compilations.
+                    embedded != null -> for (v in listOf(miniArt, fullArt)) { v.tag = null; v.setImageBitmap(embedded) }
+                    // 2. Cover from the source (Nebula), else an iTunes match for this song.
+                    //    For files, wait until their tags are read so the search uses them.
+                    t?.artworkUrl != null || info != null -> {
+                        Artwork.load(miniArt, t?.artworkUrl, dp(44) * 2, artQuery, Artwork.Kind.SONG)
+                        Artwork.load(fullArt, t?.artworkUrl, min(resources.displayMetrics.widthPixels, 1000), artQuery, Artwork.Kind.SONG)
+                    }
+                    else -> for (v in listOf(miniArt, fullArt)) { v.tag = null; v.setImageDrawable(null) }
+                }
             }
         }
         val dur = p.durationMs
@@ -1116,12 +1126,16 @@ class MusicActivity : Activity() {
     private fun query(vararg parts: String?): String? =
         parts.filterNot { it.isNullOrBlank() }.joinToString(" ").ifBlank { null }
 
-    /** Fallback cover search for whatever is playing: "artist title", or the album/queue name. */
-    private fun trackQuery(t: FilePlayer.Track?, queueTitle: String?): String? = when {
+    /**
+     * Cover search for the playing song: "artist title" from the source or the file's tags,
+     * else just the song title. Never the album/queue name: on a compilation that finds the
+     * wrong cover.
+     */
+    private fun trackQuery(t: FilePlayer.Track?, info: FilePlayer.FileInfo?): String? = when {
         t == null -> null
         t.artist != null -> query(t.artist, t.title)
-        t.album != null -> coverQuery(t.album)
-        else -> queueTitle?.let { coverQuery(it) }
+        info != null && info.artist != null -> query(info.artist, info.title ?: t.title)
+        else -> query(info?.title ?: t.title)
     }
 
     companion object {

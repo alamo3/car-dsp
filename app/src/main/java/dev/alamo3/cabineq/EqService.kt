@@ -566,31 +566,44 @@ class EqService : Service() {
         session.setPlaybackState(playback.build())
 
         val track = player.currentTrack
-        // Cover URL from the source, else an iTunes search for "artist title" / the album.
+        val info = player.currentInfo
+        // Cover: embedded in the file, else from the source, else an iTunes match for the song.
         val fallback = when {
             track == null -> null
             track.artist != null -> "${track.artist} ${track.title}"
-            else -> track.album ?: player.queueTitle
+            info != null && info.artist != null -> "${info.artist} ${info.title ?: track.title}"
+            else -> info?.title ?: track.title
         }
-        val art = "${track?.artworkUrl}|$fallback"
+        val waitForTags = track != null && track.artworkUrl == null && info == null
+        val art = "${track?.artworkUrl}|$fallback|${info?.art?.let { System.identityHashCode(it) }}|$waitForTags"
         // Car displays and the lock screen show this; the art bitmap arrives asynchronously.
         session.setMetadata(buildMetadata(player, track, if (art == sessionArtUrl) sessionArt else null))
         if (art != sessionArtUrl) {
             sessionArtUrl = art
             sessionArt = null
-            dev.alamo3.cabineq.music.Artwork.loadBitmap(this, track?.artworkUrl, ART_PX, fallback) { bmp ->
-                if (sessionArtUrl != art || mediaSession == null) return@loadBitmap
-                sessionArt = bmp
-                mediaSession?.setMetadata(buildMetadata(player, player.currentTrack, bmp))
-                updateNotification()
+            val embedded = info?.art
+            when {
+                embedded != null -> {
+                    sessionArt = embedded
+                    session.setMetadata(buildMetadata(player, track, embedded))
+                    updateNotification()
+                }
+                waitForTags -> Unit   // re-run when the file's tags arrive (version bump)
+                else -> dev.alamo3.cabineq.music.Artwork.loadBitmap(this, track?.artworkUrl, ART_PX, fallback) { bmp ->
+                    if (sessionArtUrl != art || mediaSession == null) return@loadBitmap
+                    sessionArt = bmp
+                    mediaSession?.setMetadata(buildMetadata(player, player.currentTrack, bmp))
+                    updateNotification()
+                }
             }
         }
     }
 
     private fun buildMetadata(player: FilePlayer, track: FilePlayer.Track?, art: android.graphics.Bitmap?): MediaMetadata {
         val b = MediaMetadata.Builder()
-            .putString(MediaMetadata.METADATA_KEY_TITLE, track?.title ?: player.currentTitle ?: "")
-            .putString(MediaMetadata.METADATA_KEY_ARTIST, track?.artist ?: player.formatInfo ?: "CabinEQ")
+            .putString(MediaMetadata.METADATA_KEY_TITLE,
+                (if (track?.artist == null) player.currentInfo?.title else null) ?: track?.title ?: player.currentTitle ?: "")
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, track?.artist ?: player.currentInfo?.artist ?: player.formatInfo ?: "CabinEQ")
             .putString(MediaMetadata.METADATA_KEY_ALBUM, track?.album ?: player.queueTitle ?: "")
             .putLong(MediaMetadata.METADATA_KEY_DURATION, player.durationMs)
         track?.artworkUrl?.let { b.putString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, it) }

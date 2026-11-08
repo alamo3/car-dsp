@@ -10,12 +10,16 @@ import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
+import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -65,6 +69,13 @@ class FilePlayer private constructor(private val context: Context) {
         private set
     @Volatile var lastError: String? = null
         private set
+    /** Tags and cover embedded in the current file (read in the background; null until known). */
+    class FileInfo(val art: Bitmap?, val title: String?, val artist: String?, val album: String?)
+
+    @Volatile var currentInfo: FileInfo? = null
+        private set
+    private val infoPool = Executors.newSingleThreadExecutor { r -> Thread(r, "CabinEQ-Tags").apply { isDaemon = true } }
+
     /** Transient status from the track source, e.g. "Waiting on TorBox: caching" (cleared on play). */
     @Volatile var note: String? = null
         private set
@@ -341,6 +352,7 @@ class FilePlayer private constructor(private val context: Context) {
             try {
                 while (live && index in queue.indices) {
                     currentIndex = index
+                    currentInfo = null
                     note = null
                     seekToMs = -1
                     positionMs = 0
@@ -412,6 +424,9 @@ class FilePlayer private constructor(private val context: Context) {
             val url = item.resolveUrl()
             if (!live) return Outcome.Cancelled
             note = null
+            // Files without source artwork (e.g. TorBox library tracks): read the cover and tags
+            // embedded in the file itself, which is exact per song even on compilations.
+            if (item.artworkUrl == null) readFileInfo(url, gen, currentIndex)
 
             val extractor = MediaExtractor()
             var codec: MediaCodec? = null
@@ -540,6 +555,40 @@ class FilePlayer private constructor(private val context: Context) {
         val codec = MediaCodec.createDecoderByType(mime)
         codec.configure(format, null, null, 0)
         return codec
+    }
+
+    private fun readFileInfo(url: String, gen: Int, index: Int) {
+        infoPool.execute {
+            if (gen != generation || index != currentIndex) return@execute
+            val r = MediaMetadataRetriever()
+            val info = try {
+                r.setDataSource(url, HashMap<String, String>())
+                FileInfo(
+                    art = r.embeddedPicture?.let { decodeCover(it, 1000) },
+                    title = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)?.trim()?.ifBlank { null },
+                    artist = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)?.trim()?.ifBlank { null },
+                    album = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)?.trim()?.ifBlank { null },
+                )
+            } catch (e: Exception) {
+                Log.i(TAG, "No embedded tags: ${e.javaClass.simpleName}")
+                FileInfo(null, null, null, null)
+            } finally {
+                runCatching { r.release() }
+            }
+            if (gen == generation && index == currentIndex) {
+                currentInfo = info
+                version++
+            }
+        }
+    }
+
+    private fun decodeCover(bytes: ByteArray, maxPx: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0) return null
+        var sample = 1
+        while (bounds.outWidth / (sample * 2) >= maxPx) sample *= 2
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
     }
 
     /** Before the service's first tick, start from the saved EQ so playback never starts flat. */

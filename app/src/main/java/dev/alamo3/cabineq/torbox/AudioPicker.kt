@@ -56,7 +56,19 @@ object AudioPicker {
     }
 
     /** Display title for a track: file name without extension or leading path. */
-    fun trackTitle(file: TorBoxFile): String = file.shortName.substringAfterLast('/').substringBeforeLast('.')
+    fun trackTitle(file: TorBoxFile): String {
+        val base = file.shortName.substringAfterLast('/').substringBeforeLast('.')
+        return base.replace(TRACK_NUMBER, "").trim().ifBlank { base }
+    }
+
+    /**
+     * Track-number prefixes on file names: "23 - ", "01. ", "07_", "1-03 ", "01 ", "A1 ".
+     * A bare number with only a space is stripped only with a leading zero, so titles like
+     * "99 Problems" survive.
+     */
+    private val TRACK_NUMBER = Regex(
+        """^(?:\d{1,2}[-.]\d{1,3}\s*(?:[-._)]\s*)?|\d{1,3}\s*[-._)]\s*|0\d{1,2}\s+|[A-D]\d{1,2}\s*(?:[-._)]\s*)?)(?=\S)"""
+    )
 
     private fun isJunk(f: TorBoxFile): Boolean {
         val path = f.name.lowercase(Locale.ROOT)

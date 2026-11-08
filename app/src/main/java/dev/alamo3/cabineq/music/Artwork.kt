@@ -124,7 +124,7 @@ object Artwork {
         val cacheKey = "${kind.entity}:${query.lowercase()}"
         lookups[cacheKey]?.let { return it.ifEmpty { null }?.let { u -> sized(u, sizePx) } }
         val term = URLEncoder.encode(query.take(120), "UTF-8")
-        val url = "https://itunes.apple.com/search?media=music&entity=${kind.entity}&limit=1&term=$term"
+        val url = "https://itunes.apple.com/search?media=music&entity=${kind.entity}&limit=10&term=$term"
         return try {
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 8_000
@@ -137,8 +137,21 @@ object Artwork {
                     return null   // not cached: may be rate limiting, retry later
                 }
                 val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-                val first = json.optJSONArray("results")?.optJSONObject(0)
-                val art = first?.optString("artworkUrl100").orEmpty()
+                val results = json.optJSONArray("results")
+                val candidates = (0 until (results?.length() ?: 0)).mapNotNull { i ->
+                    val r = results?.optJSONObject(i) ?: return@mapNotNull null
+                    val art = r.optString("artworkUrl100").ifBlank { return@mapNotNull null }
+                    CoverMatch.Candidate(
+                        artist = r.optString("artistName"),
+                        collection = r.optString("collectionName"),
+                        track = r.optString("trackName"),
+                        artworkUrl = art,
+                    )
+                }
+                // Only accept a result that actually matches; a wrong cover is worse than none.
+                val match = CoverMatch.best(query, candidates)
+                if (match == null && candidates.isNotEmpty()) lastError = "No iTunes match for “$query”"
+                val art = match?.artworkUrl.orEmpty()
                 lookups[cacheKey] = art
                 art.ifEmpty { null }?.let { sized(it, sizePx) }
             } finally {
