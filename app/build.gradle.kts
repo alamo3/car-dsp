@@ -23,6 +23,17 @@ android {
         targetSdk = 35
         versionCode = cabinVersionCode
         versionName = cabinVersionName
+
+        ndk {
+            // Galaxy Z Fold 6 (and every current phone) is arm64.
+            abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
     }
 
     signingConfigs {
@@ -54,5 +65,6 @@ android {
 }
 
 // Framework-only app (no AndroidX), so there is nothing to resolve beyond the build plugins.
+// Native DSP lives in src/main/cpp and is built with CMake + the NDK.
 dependencies {
 }

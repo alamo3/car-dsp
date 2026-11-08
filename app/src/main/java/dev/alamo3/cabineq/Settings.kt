@@ -25,6 +25,32 @@ class Settings(context: Context) {
     fun effectivePreampDb(): Float =
         if (autoPreamp) Bands.recommendedPreamp(bandGains()) else preampDb
 
+    /** Process audio in our own native DSP (capture) instead of the Android effect engine. */
+    var dspEngine: Boolean
+        get() = prefs.getBoolean(KEY_DSP_ENGINE, true)
+        set(v) = prefs.edit().putBoolean(KEY_DSP_ENGINE, v).apply()
+
+    /**
+     * Allow DSP output on the phone's own speaker. Off by default: in the car, output on the
+     * phone speaker always means routing went wrong, so the app falls back instead.
+     */
+    var allowSpeakerOutput: Boolean
+        get() = prefs.getBoolean(KEY_ALLOW_SPEAKER, false)
+        set(v) = prefs.edit().putBoolean(KEY_ALLOW_SPEAKER, v).apply()
+
+    /** Apps that block playback capture; they always use the Android effect engine. */
+    var captureBlockedPackages: Set<String>
+        get() = prefs.getStringSet(KEY_CAPTURE_BLOCKED, null)?.toSet() ?: DEFAULT_CAPTURE_BLOCKED
+        set(v) = prefs.edit().putStringSet(KEY_CAPTURE_BLOCKED, v).apply()
+
+    fun markCaptureBlocked(pkgs: Collection<String>) {
+        captureBlockedPackages = captureBlockedPackages + pkgs
+    }
+
+    fun resetCaptureBlocked() {
+        prefs.edit().remove(KEY_CAPTURE_BLOCKED).apply()
+    }
+
     var globalMode: Boolean
         get() = prefs.getBoolean(KEY_GLOBAL, false)
         set(v) = prefs.edit().putBoolean(KEY_GLOBAL, v).apply()
@@ -69,6 +95,11 @@ class Settings(context: Context) {
         const val KEY_PREAMP = "preamp_db"
         const val KEY_GLOBAL = "global_mode"
         const val KEY_AUTO_PREAMP = "auto_preamp"
+        const val KEY_DSP_ENGINE = "dsp_engine"
+        const val KEY_ALLOW_SPEAKER = "allow_speaker"
+        const val KEY_CAPTURE_BLOCKED = "capture_blocked"
+        // Known to opt out of playback capture.
+        val DEFAULT_CAPTURE_BLOCKED = setOf("com.spotify.music", "com.android.chrome")
         const val KEY_SPEED_ON = "speed_on"
         const val KEY_SPEED_MAX = "speed_max_db"
         const val KEY_SPEED_START = "speed_start_kmh"

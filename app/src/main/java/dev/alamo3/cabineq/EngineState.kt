@@ -14,4 +14,15 @@ object EngineState {
     @Volatile var speedAmount = 0f                           // 0..1
     @Volatile var appliedBands = FloatArray(Bands.COUNT)
     @Volatile var appliedInputGain = 0f
+
+    // Native DSP path
+    @Volatile var dspActive = false
+    @Volatile var dspMessage: String? = null          // why DSP isn't running / fell back
+    @Volatile var dspSampleRate = 0
+    @Volatile var dspOutputPaused = true
+    @Volatile var dspInPeakDb = -120f
+    @Volatile var dspOutPeakDb = -120f
+    @Volatile var dspLimiterDb = 0f                   // gain reduction, <= 0
+    @Volatile var dspRoute: String? = null
+    @Volatile var sessionModes: Map<Int, String> = emptyMap()  // sessionId -> "DSP" / "Android EQ"
 }

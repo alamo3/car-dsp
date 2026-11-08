@@ -30,14 +30,21 @@ object Bands {
     const val MAX_BAND_DB = 12f
 
     /**
-     * Preamp that keeps the EQ from clipping: cut by the largest boost, rounded up to 0.5 dB.
-     * DynamicsProcessing bands split the spectrum rather than overlapping like peaking
-     * filters, so the response never exceeds the largest single band gain.
+     * Preamp that keeps the EQ from clipping: cut by the highest point of the EQ's
+     * response, rounded up to 0.5 dB. That's the largest band gain for the Android engine's
+     * band-split EQ, and slightly more for the native EQ, whose peaking bands overlap —
+     * using the larger of the two keeps both safe.
      */
     fun recommendedPreamp(gains: FloatArray): Float {
-        val peak = (gains.maxOrNull() ?: 0f).coerceAtLeast(0f)
+        val maxBand = (gains.maxOrNull() ?: 0f).coerceAtLeast(0f)
+        val response = EqDesign.peakResponseDb(gains).toFloat().coerceAtLeast(0f)
+        val peak = maxOf(maxBand, response)
         return -(ceil(peak * 2f) / 2f)
     }
+
+    /** Peak boost (dB) the recommendation is based on, for display. */
+    fun peakBoost(gains: FloatArray): Float =
+        maxOf((gains.maxOrNull() ?: 0f).coerceAtLeast(0f), EqDesign.peakResponseDb(gains).toFloat().coerceAtLeast(0f))
 
     fun label(i: Int): String {
         val f = CENTERS[i]

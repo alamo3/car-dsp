@@ -3,7 +3,7 @@
 An Android EQ built for the car: a static EQ, speed-dependent compensation, and
 (later) cabin measurement and content-aware dynamic EQ. Rootless.
 
-## Status: milestone 1
+## Status: milestone 3a — native DSP
 
 - 10-band EQ (31 Hz–16 kHz) + preamp, applied with `DynamicsProcessing`
 - Output limiter at −1 dBFS, and a **preamp recommendation** that cuts by your largest EQ
@@ -17,10 +17,25 @@ An Android EQ built for the car: a static EQ, speed-dependent compensation, and
 - "Simulate speed" slider for testing the curve while parked
 - Live status panel: attached sessions, speed, applied gains
 
+### Native DSP engine (default)
+
+Music app → playback capture → **C++ engine** (preamp → 10 biquads → lookahead limiter) →
+our AudioTrack → Bluetooth / Android Auto. The app's own output is muted with a −200 dB
+effect on its session (capture taps the audio before effects, so it still gets the full
+signal). Filters are designed in Kotlin (`EqDesign.kt`, RBJ cookbook) and run in C++
+(`src/main/cpp`).
+
+- Android asks for screen-capture permission every time DSP starts. Only audio is used.
+- Apps that opt out of capture (Spotify, Chrome, …) are detected (media playing but the
+  capture is silent) and automatically use the Android EQ path instead.
+- **Speaker safety:** if our output is routed to the phone speaker, DSP stops and everything
+  falls back to the Android EQ. This guards against the Android Auto problem seen with
+  RootlessJamesDSP. Our output allows capture by system components, so Android Auto can
+  carry it to the car. A toggle under Testing allows speaker output on purpose.
+
 Roadmap:
-2. Cabin measurement: sine sweep, multi-position averaging, and a correction curve (USB
-   measurement mic recommended)
-3. Playback capture → Oboe/C++ chain: de-clicker, content-aware dynamic EQ
+- 3b: de-clicker and content-aware dynamic EQ in the C++ engine
+- 2: cabin measurement (sine sweep, multi-position averaging, correction curve)
 
 ## Build
 

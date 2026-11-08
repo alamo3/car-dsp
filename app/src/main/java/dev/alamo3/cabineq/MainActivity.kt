@@ -4,6 +4,8 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageInstaller
+import android.media.projection.MediaProjectionConfig
+import android.media.projection.MediaProjectionManager
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings as AndroidSettings
@@ -38,6 +40,8 @@ class MainActivity : Activity() {
     private lateinit var preampBar: SeekBar
     private lateinit var preampHint: TextView
     private lateinit var useRecommendedButton: Button
+    private lateinit var dspButton: Button
+    private lateinit var blockedButton: Button
     private lateinit var updateText: TextView
     private lateinit var updateButton: Button
     private var pendingRelease: Updater.Release? = null
@@ -161,6 +165,32 @@ class MainActivity : Activity() {
         }
         root.addView(statusText)
 
+        dspButton = Button(this).apply {
+            text = "Start native DSP"
+            setOnClickListener { requestDspStart() }
+        }
+        root.addView(dspButton)
+
+        // --- Engine ---
+        root.addView(header("Engine"))
+        root.addView(switch("Native DSP (captures app audio)", settings.dspEngine) { settings.dspEngine = it })
+        root.addView(TextView(this).apply {
+            text = "On: CabinEQ captures your music app's audio, processes it in its own DSP engine and plays " +
+                "it back, muting the original. Android asks for screen-capture permission each time it starts — " +
+                "only audio is used. Apps that block capture automatically use the Android EQ instead.\n" +
+                "Off: Android's built-in effect engine applies the EQ (no capture prompt). Takes effect on next start."
+            textSize = 12f
+            alpha = 0.7f
+        })
+        blockedButton = Button(this).apply {
+            setOnClickListener {
+                settings.resetCaptureBlocked()
+                refreshBlockedButton()
+            }
+        }
+        root.addView(blockedButton)
+        refreshBlockedButton()
+
         // --- Speed compensation ---
         root.addView(header("Speed compensation"))
         root.addView(switch("Enabled", settings.speedCompEnabled) { settings.speedCompEnabled = it })
@@ -184,6 +214,7 @@ class MainActivity : Activity() {
             root, format = { "Simulated  ${it.roundToInt()} km/h" },
             min = 0f, max = 160f, step = 5f, initial = settings.simulatedKmh,
         ) { settings.simulatedKmh = it }
+        root.addView(switch("Allow DSP output on phone speaker", settings.allowSpeakerOutput) { settings.allowSpeakerOutput = it })
         root.addView(switch("Global mode (session 0, fallback)", settings.globalMode) { settings.globalMode = it })
         root.addView(TextView(this).apply {
             text = "Use global mode only if your music app never shows up in the session list. " +
@@ -218,7 +249,7 @@ class MainActivity : Activity() {
     private fun refreshPreampUi() {
         val gains = settings.bandGains()
         val rec = Bands.recommendedPreamp(gains)
-        val peak = (gains.maxOrNull() ?: 0f).coerceAtLeast(0f)
+        val peak = Bands.peakBoost(gains)
         val auto = settings.autoPreamp
         val current = settings.effectivePreampDb()
 
@@ -227,7 +258,7 @@ class MainActivity : Activity() {
         preampBar.isEnabled = !auto
         useRecommendedButton.visibility = if (auto) View.GONE else View.VISIBLE
 
-        val why = if (peak > 0f) "offsets your largest boost (+${fmt(peak)} dB)" else "no boosts, so no cut needed"
+        val why = if (peak > 0f) "offsets your EQ's peak boost (+${fmt(peak)} dB)" else "no boosts, so no cut needed"
         preampHint.text = when {
             auto -> "Auto: following recommended ${signed(rec)} dB — $why"
             current > rec + 0.01f ->
@@ -290,6 +321,8 @@ class MainActivity : Activity() {
     private fun refreshStatus() {
         val s = EngineState
         startStopButton.text = if (s.running) "Stop CabinEQ" else "Start CabinEQ"
+        refreshBlockedButton()
+        dspButton.visibility = if (s.running && !s.dspActive && settings.dspEngine) View.VISIBLE else View.GONE
         eqView.setApplied(if (s.running) s.appliedBands else null)
 
         val sb = StringBuilder()
@@ -302,7 +335,8 @@ class MainActivity : Activity() {
                 sb.append('\n')
                 for ((id, pkg) in s.sessions) {
                     val lost = if (id in s.sessionsWithoutControl) "  (control lost!)" else ""
-                    sb.append("  #$id  $pkg$lost\n")
+                    val mode = s.sessionModes[id]?.let { " [$it]" } ?: ""
+                    sb.append("  #$id  $pkg$mode$lost\n")
                 }
             }
             val gps = when {
@@ -315,6 +349,16 @@ class MainActivity : Activity() {
             sb.append(String.format(Locale.US, "Speed comp: %.0f%%   Input gain: %+.1f dB\n", s.speedAmount * 100, s.appliedInputGain))
             sb.append("Applied: ")
             sb.append(s.appliedBands.joinToString(" ") { String.format(Locale.US, "%+.1f", it) })
+            sb.append('\n')
+            if (s.dspActive) {
+                sb.append(String.format(Locale.US, "DSP: %d Hz, %s\n", s.dspSampleRate,
+                    if (s.dspOutputPaused) "idle (no audio)" else "processing → ${s.dspRoute ?: "?"}"))
+                sb.append(String.format(Locale.US, "Peaks: in %.1f dBFS  out %.1f dBFS  limiter %.1f dB",
+                    s.dspInPeakDb, s.dspOutPeakDb, s.dspLimiterDb))
+            } else {
+                sb.append("DSP: off")
+            }
+            s.dspMessage?.let { sb.append("\n⚠ ").append(it) }
         }
         statusText.text = sb.toString()
         statusText.gravity = Gravity.START
@@ -417,16 +461,66 @@ class MainActivity : Activity() {
     private fun toggleService() {
         if (EngineState.running) {
             startService(Intent(this, EqService::class.java).setAction(EqService.ACTION_STOP))
+        } else if (settings.dspEngine) {
+            requestDspStart()
         } else {
             startForegroundService(Intent(this, EqService::class.java))
         }
         handler.postDelayed({ refreshStatus() }, 300)
     }
 
+    /** Asks for audio + capture permission, then starts (or upgrades) the service with DSP. */
+    private fun requestDspStart() {
+        if (!hasPerm(Manifest.permission.RECORD_AUDIO)) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_RECORD_AUDIO)
+            return
+        }
+        val mpm = getSystemService(MediaProjectionManager::class.java)
+        val intent = if (Build.VERSION.SDK_INT >= 34) {
+            // Whole display: "single app" sharing would limit audio capture to that one app.
+            mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+        } else {
+            mpm.createScreenCaptureIntent()
+        }
+        @Suppress("DEPRECATION")
+        startActivityForResult(intent, REQ_PROJECTION)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_RECORD_AUDIO) return
+        if (hasPerm(Manifest.permission.RECORD_AUDIO)) {
+            requestDspStart()
+        } else {
+            Toast.makeText(this, "Audio permission denied — starting with Android EQ", Toast.LENGTH_LONG).show()
+            startForegroundService(Intent(this, EqService::class.java))
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_PROJECTION) return
+        val intent = Intent(this, EqService::class.java)
+        if (resultCode == RESULT_OK && data != null) {
+            intent.putExtra(EqService.EXTRA_PROJECTION_CODE, resultCode)
+            intent.putExtra(EqService.EXTRA_PROJECTION_DATA, data)
+        } else {
+            Toast.makeText(this, "Capture not allowed — using Android EQ", Toast.LENGTH_LONG).show()
+        }
+        startForegroundService(intent)
+        handler.postDelayed({ refreshStatus() }, 500)
+    }
+
+    private fun refreshBlockedButton() {
+        val blocked = settings.captureBlockedPackages
+        blockedButton.text = "Reset apps that block capture (${blocked.size})"
+    }
+
     private fun requestNeededPermissions() {
         val wanted = mutableListOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.RECORD_AUDIO,
         )
         if (Build.VERSION.SDK_INT >= 33) wanted.add(Manifest.permission.POST_NOTIFICATIONS)
         val missing = wanted.filterNot { hasPerm(it) }
@@ -445,6 +539,8 @@ class MainActivity : Activity() {
     private fun signed(v: Float) = String.format(Locale.US, "%+.1f", v)
 
     companion object {
+        private const val REQ_RECORD_AUDIO = 2
+        private const val REQ_PROJECTION = 3
         private const val PREAMP_MIN = -12f
         private const val PREAMP_MAX = 6f
         private const val PREAMP_STEP = 0.5f
