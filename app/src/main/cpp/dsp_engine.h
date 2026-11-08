@@ -109,6 +109,8 @@ public:
         for (int i = 0; i < frames; ++i) {
             float l = interleaved[2 * i];
             float r = interleaved[2 * i + 1];
+            if (!std::isfinite(l)) l = 0.0f;
+            if (!std::isfinite(r)) r = 0.0f;
             inPeak = std::max(inPeak, std::max(std::fabs(l), std::fabs(r)));
 
             preamp_ += step;
@@ -117,6 +119,17 @@ public:
             for (int b = 0; b < bands; ++b) {
                 dl = stateL_[b].process(active_.coeffs[b], dl);
                 dr = stateR_[b].process(active_.coeffs[b], dr);
+            }
+            // Self-heal: a non-finite value (bad input or coefficients) would otherwise stay
+            // in the filter state forever and turn everything after it into silent NaN.
+            if (!std::isfinite(dl) || !std::isfinite(dr)) {
+                for (int b = 0; b < bands; ++b) {
+                    stateL_[b] = BiquadState{};
+                    stateR_[b] = BiquadState{};
+                }
+                dl = 0.0;
+                dr = 0.0;
+                nonFinite_.fetch_add(1, std::memory_order_relaxed);
             }
             l = static_cast<float>(dl);
             r = static_cast<float>(dr);
@@ -193,6 +206,7 @@ private:
     Limiter limiter_;
 
     std::atomic<float> inPeak_{0.0f}, outPeak_{0.0f}, minGain_{1.0f};
+    std::atomic<uint32_t> nonFinite_{0};  // count of self-heals, for debugging
 };
 
 }  // namespace cabin

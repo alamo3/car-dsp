@@ -495,21 +495,19 @@ class FilePlayer private constructor(private val context: Context) {
         }
     }
 
-    /** Asks for float output (keeps 24-bit sources intact); falls back if the decoder refuses. */
+    /**
+     * Uses the decoder's default PCM output (16-bit for the platform decoders) and reads the
+     * actual encoding from its output format.
+     *
+     * Requesting float output was tried first, but some decoders ignore the request while their
+     * output format still echoes it, so 16-bit samples were read as float: garbage values,
+     * including NaN, which poisoned the EQ filters and played as silence. 16-bit is plenty for
+     * car listening (96 dB of dynamic range).
+     */
     private fun createDecoder(mime: String, format: MediaFormat): MediaCodec {
-        val floatFormat = MediaFormat(format)
-        floatFormat.setInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_FLOAT)
         val codec = MediaCodec.createDecoderByType(mime)
-        return try {
-            codec.configure(floatFormat, null, null, 0)
-            codec
-        } catch (e: Exception) {
-            Log.i(TAG, "Decoder refused float output, using its default PCM format")
-            codec.release()
-            val fallback = MediaCodec.createDecoderByType(mime)
-            fallback.configure(format, null, null, 0)
-            fallback
-        }
+        codec.configure(format, null, null, 0)
+        return codec
     }
 
     /** Before the service's first tick, start from the saved EQ so playback never starts flat. */
@@ -598,11 +596,19 @@ class FilePlayer private constructor(private val context: Context) {
             val base = buf.position()
             for (i in 0 until frames) {
                 val p = base + i * channels * bps
-                val l = readSample(buf, p, encoding)
-                val r = if (channels >= 2) readSample(buf, p + bps, encoding) else l
+                val l = sanitize(readSample(buf, p, encoding))
+                val r = if (channels >= 2) sanitize(readSample(buf, p + bps, encoding)) else l
                 out[2 * i] = l
                 out[2 * i + 1] = r
             }
+        }
+
+        /** One bad sample must never reach the IIR filters: NaN/Inf would poison them for good. */
+        private fun sanitize(x: Float): Float = when {
+            x.isNaN() || x.isInfinite() -> 0f
+            x > 4f -> 4f
+            x < -4f -> -4f
+            else -> x
         }
 
         private fun readSample(buf: ByteBuffer, p: Int, encoding: Int): Float = when (encoding) {

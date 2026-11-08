@@ -309,7 +309,8 @@ class TorBoxActivity : Activity() {
         p.formatInfo?.let { sb.append('\n').append(it).append(" → CabinEQ DSP") }
         EngineState.playerRoute?.let { if (p.state == FilePlayer.State.PLAYING) sb.append(" → ").append(it) }
         if (p.state == FilePlayer.State.PLAYING && EngineState.running) {
-            sb.append(String.format(Locale.US, "\nOut peak %.1f dBFS · limiter %.1f dB", EngineState.playerOutPeakDb, EngineState.playerLimiterDb))
+            sb.append(String.format(Locale.US, "\nLevel in %.1f → out %.1f dBFS · limiter %.1f dB",
+                EngineState.playerInPeakDb, EngineState.playerOutPeakDb, EngineState.playerLimiterDb))
         }
         p.queueTitle?.let { sb.append('\n').append(it) }
         (EngineState.playerMessage ?: p.lastError)?.let { sb.append("\n⚠ ").append(it) }
