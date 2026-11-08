@@ -53,6 +53,10 @@ class TorBoxActivity : Activity() {
     private lateinit var npToggle: Button
 
     @Volatile private var op = 0
+    private val formatButtons = LinkedHashMap<AudioPicker.FormatFilter, Button>()
+    private var lastQuery: String? = null
+    private var lastCandidates: List<AudioPicker.Candidate>? = null
+    private var lastHiddenVideo = 0
     private var shownPlayerVersion = -1
 
     private val playerUpdater = object : Runnable {
@@ -173,8 +177,28 @@ class TorBoxActivity : Activity() {
             textSize = 15f
             minHeight = dp(44)
             isChecked = settings.torboxCachedOnly
-            setOnCheckedChangeListener { _, checked -> settings.torboxCachedOnly = checked }
+            setOnCheckedChangeListener { _, checked ->
+                settings.torboxCachedOnly = checked
+                rerenderResults()
+            }
         })
+
+        // Format filter: checked against the real files for cached torrents.
+        val formatRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for (f in AudioPicker.FormatFilter.values()) {
+            val b = Button(this).apply {
+                textSize = 13f
+                setOnClickListener {
+                    settings.torboxFormat = f
+                    refreshFormatButtons()
+                    rerenderResults()
+                }
+            }
+            formatButtons[f] = b
+            formatRow.addView(b, weight())
+        }
+        root.addView(formatRow)
+        refreshFormatButtons()
 
         val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         tabs.addView(Button(this).apply { text = "My TorBox"; setOnClickListener { loadLibrary() } }, weight())
@@ -249,6 +273,11 @@ class TorBoxActivity : Activity() {
         return TorBoxClient(key)
     }
 
+    private fun refreshFormatButtons() {
+        val selected = settings.torboxFormat
+        for ((f, b) in formatButtons) b.text = if (f == selected) "● ${f.label}" else f.label
+    }
+
     private fun runSearch() {
         val query = searchInput.text.toString().trim()
         if (query.isEmpty()) return
@@ -257,28 +286,64 @@ class TorBoxActivity : Activity() {
         val id = ++op
         setStatus("Searching “$query”…")
         list.removeAllViews()
-        background(id, { c.search(query, checkCache = true) }) { raw -> showResults(query, raw) }
+        lastCandidates = null
+        background(id, {
+            val raw = c.search(query, checkCache = true)
+            // Real file lists for whatever TorBox has cached; failure just means title-only.
+            val files = runCatching { c.checkCachedFiles(raw.map { it.hash }) }.getOrDefault(emptyMap())
+            raw.map { r ->
+                val known = files[r.hash.lowercase()]
+                val result = if (known != null && r.cached != true) r.copy(cached = true) else r
+                AudioPicker.Candidate(result, known)
+            }
+        }) { candidates ->
+            lastQuery = query
+            lastCandidates = candidates
+            showResults()
+        }
     }
 
-    private fun showResults(query: String, raw: List<SearchResult>) {
+    /** Re-applies the cached-only / format filters to the last search without searching again. */
+    private fun rerenderResults() {
+        if (lastCandidates != null) showResults()
+    }
+
+    private fun showResults() {
+        val query = lastQuery ?: return
+        val candidates = lastCandidates ?: return
         list.removeAllViews()
-        val all = AudioPicker.rank(raw)  // drops video releases
-        val hiddenVideo = raw.size - all.size
-        val videoNote = if (hiddenVideo > 0) " ($hiddenVideo video results hidden)" else ""
-        val cacheKnown = all.any { it.cached != null }
-        val results = if (settings.torboxCachedOnly && cacheKnown) all.filter { it.cached == true } else all
+        val filter = settings.torboxFormat
+        val audio = AudioPicker.filterAndRank(candidates, filter)
+        val video = candidates.count { it.kind == AudioPicker.Kind.VIDEO }
+        val cacheKnown = audio.any { it.result.cached != null }
+        val shown = if (settings.torboxCachedOnly && cacheKnown) audio.filter { it.result.cached == true } else audio
+
+        val what = if (filter == AudioPicker.FormatFilter.ANY) "audio" else filter.label
+        val notes = mutableListOf<String>()
+        if (video > 0) notes.add("$video video hidden")
+        val otherFormats = candidates.size - video - audio.size
+        if (otherFormats > 0) notes.add("$otherFormats other/non-$what hidden")
+        val note = if (notes.isEmpty()) "" else " (" + notes.joinToString(", ") + ")"
         setStatus(
             when {
-                all.isEmpty() -> "No audio results for “$query”.$videoNote Try adding “flac” or “album”."
-                results.isEmpty() -> "${all.size} audio results, none cached. Turn off “Cached only” to see them.$videoNote"
-                settings.torboxCachedOnly && !cacheKnown -> "${results.size} audio results (TorBox didn't report cache state).$videoNote"
-                else -> "${results.size} audio results — tap one to add it and play.$videoNote"
+                audio.isEmpty() -> "No $what results for “$query”.$note"
+                shown.isEmpty() -> "${audio.size} $what results, none cached. Turn off “Cached only” to see them.$note"
+                else -> "${shown.size} $what results — tap one to add it and play.$note\n✓ = format confirmed from the files"
             }
         )
-        for (r in results) {
-            val tags = mutableListOf(humanBytes(r.size), "${r.seeders} seeders")
+        for (c in shown) {
+            val r = c.result
+            val tags = mutableListOf<String>()
+            if (c.formats.isNotEmpty()) {
+                // Real files: e.g. "✓ 12 FLAC + 12 MP3"
+                tags.add("✓ " + c.formats.entries.sortedByDescending { it.value }
+                    .joinToString(" + ") { "${it.value} ${it.key.uppercase(Locale.ROOT)}" })
+            } else if (AudioPicker.looksLossless(r.title)) {
+                tags.add("lossless?")
+            }
+            tags.add(humanBytes(r.size))
+            tags.add("${r.seeders} seeders")
             if (r.cached == true) tags.add("⚡ cached")
-            if (AudioPicker.looksLossless(r.title)) tags.add("lossless")
             r.tracker?.let { tags.add(it) }
             list.addView(row(r.title, tags.joinToString(" · ")) { openSearchResult(r) })
         }
@@ -345,7 +410,10 @@ class TorBoxActivity : Activity() {
     }
 
     private fun showTorrent(c: TorBoxClient, t: TorBoxTorrent, autoplay: Boolean) {
-        val pick = AudioPicker.pick(t.files)
+        // Honour the format filter (e.g. MP3 from an album that ships FLAC + MP3), but don't
+        // come up empty just because the filter doesn't match this torrent.
+        val pick = AudioPicker.pick(t.files, settings.torboxFormat).takeIf { it.tracks.isNotEmpty() }
+            ?: AudioPicker.pick(t.files)
         list.removeAllViews()
         if (pick.tracks.isEmpty()) {
             if (AudioPicker.isVideoTorrent(t.files)) {

@@ -166,6 +166,32 @@ class TorBoxClient(
             ?: throw TorBoxException("requestdl returned no link", 200)
     }
 
+    /**
+     * GET /v1/api/torrents/checkcached?hash=…&format=list&list_files=true
+     * Returns hash (lowercase) → file list for the torrents TorBox has cached. Uncached hashes
+     * are simply absent: their files aren't known until the torrent is added.
+     */
+    fun checkCachedFiles(hashes: Collection<String>): Map<String, List<TorBoxFile>> {
+        val out = HashMap<String, List<TorBoxFile>>()
+        for (chunk in hashes.map { it.lowercase() }.distinct().chunked(CHECK_CACHED_BATCH)) {
+            val q = buildQuery("hash" to chunk.joinToString(","), "format" to "list", "list_files" to true)
+            val data = request("GET", "$baseUrl/api/torrents/checkcached$q")
+            val entries: List<JSONObject> = when (data) {
+                is JSONArray -> (0 until data.length()).mapNotNull { data.optJSONObject(it) }
+                // format=object variant: { "<hash>": { … } }
+                is JSONObject -> data.keys().asSequence().mapNotNull { k ->
+                    data.optJSONObject(k)?.also { if (!it.has("hash")) it.put("hash", k) }
+                }.toList()
+                else -> emptyList()
+            }
+            for (e in entries) {
+                val hash = e.optStringOrNull("hash")?.lowercase() ?: continue
+                out[hash] = parseFiles(e.optJSONArray("files"))
+            }
+        }
+        return out
+    }
+
     // ---------------------------------------------------------------- search
 
     /**
@@ -231,18 +257,7 @@ class TorBoxClient(
     }
 
     private fun parseTorrent(o: JSONObject): TorBoxTorrent {
-        val filesArr = o.optJSONArray("files") ?: JSONArray()
-        val files = (0 until filesArr.length()).mapNotNull { i ->
-            val f = filesArr.optJSONObject(i) ?: return@mapNotNull null
-            val name = f.optStringOrNull("name") ?: f.optStringOrNull("short_name") ?: return@mapNotNull null
-            TorBoxFile(
-                id = f.optInt("id", i),
-                name = name,
-                shortName = f.optStringOrNull("short_name") ?: name.substringAfterLast('/'),
-                size = f.optLong("size", 0L),
-                mimetype = f.optStringOrNull("mimetype"),
-            )
-        }
+        val files = parseFiles(o.optJSONArray("files"))
         return TorBoxTorrent(
             id = o.optInt("id", -1),
             hash = o.optStringOrNull("hash").orEmpty(),
@@ -257,6 +272,21 @@ class TorBoxClient(
             downloadPresent = o.optBoolean("download_present", false),
             files = files,
         )
+    }
+
+    private fun parseFiles(filesArr: JSONArray?): List<TorBoxFile> {
+        if (filesArr == null) return emptyList()
+        return (0 until filesArr.length()).mapNotNull { i ->
+            val f = filesArr.optJSONObject(i) ?: return@mapNotNull null
+            val name = f.optStringOrNull("name") ?: f.optStringOrNull("short_name") ?: return@mapNotNull null
+            TorBoxFile(
+                id = f.optInt("id", i),
+                name = name,
+                shortName = f.optStringOrNull("short_name") ?: name.substringAfterLast('/'),
+                size = f.optLong("size", 0L),
+                mimetype = f.optStringOrNull("mimetype"),
+            )
+        }
     }
 
     private fun parseSearchResult(o: JSONObject): SearchResult? {
@@ -313,6 +343,7 @@ class TorBoxClient(
         private const val USER_AGENT = "CabinEQ"
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val READ_TIMEOUT_MS = 30_000
+        private const val CHECK_CACHED_BATCH = 50
 
         fun hashFromMagnet(magnet: String): String? =
             Regex("xt=urn:btih:([A-Za-z0-9]+)", RegexOption.IGNORE_CASE).find(magnet)?.groupValues?.get(1)?.lowercase()

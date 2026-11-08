@@ -43,6 +43,11 @@ AudioTrack. No playback capture and no screen-capture prompt: the engine gets th
 source samples, at the file's own sample rate (44.1/48/96 kHz), with float decoding so 24-bit
 sources stay 24-bit. Consecutive tracks at the same rate share one AudioTrack (gapless).
 
+- **Filter by real file type.** For results TorBox has cached, the app asks
+  `/api/torrents/checkcached?list_files=true` for the actual file list and keeps a result only if it
+  contains playable audio — shown as e.g. "✓ 12 FLAC + 12 MP3". The format buttons (Any audio /
+  Lossless / FLAC / MP3) filter on those files, and the track picker then uses that format.
+  Uncached torrents have no file list yet, so for those the title is used instead:
 - **Audio only.** Search results whose titles mark them as video (resolutions like 1080p, x264/HEVC,
   BluRay/WEB-DL, S01E02, .mkv …) are dropped, even if they mention FLAC (concert videos). Titles with
   audio markers (FLAC, MP3, kbps, album, discography, soundtrack …) come first, then ambiguous ones;

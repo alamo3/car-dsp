@@ -33,12 +33,15 @@ object AudioPicker {
 
     fun extension(name: String): String = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
 
-    fun pick(files: List<TorBoxFile>): Pick {
+    /** [filter] restricts the pick to that format (e.g. MP3 from an album that ships FLAC + MP3). */
+    fun pick(files: List<TorBoxFile>, filter: FormatFilter = FormatFilter.ANY): Pick {
         val candidates = files.filterNot(::isJunk)
         val unsupported = candidates.count { extension(it.name) in UNSUPPORTED }
 
-        val lossless = candidates.filter { extension(it.name) in LOSSLESS }
-        val tier = lossless.ifEmpty { candidates.filter { extension(it.name) in LOSSY } }
+        val allowed = filter.extensions
+        fun ok(f: TorBoxFile) = allowed == null || extension(f.name) in allowed
+        val lossless = candidates.filter { extension(it.name) in LOSSLESS && ok(it) }
+        val tier = lossless.ifEmpty { candidates.filter { extension(it.name) in LOSSY && ok(it) } }
         if (tier.isEmpty()) return Pick(emptyList(), null, false, unsupported)
 
         // Most common extension; ties go to the preferred order below.
@@ -87,6 +90,66 @@ object AudioPicker {
     )
 
     enum class Kind { AUDIO, VIDEO, UNKNOWN }
+
+    /** Format filter for search results and track picking. Null extensions = any playable audio. */
+    enum class FormatFilter(val label: String, val extensions: Set<String>?) {
+        ANY("Any audio", null),
+        LOSSLESS("Lossless", setOf("flac", "wav")),
+        FLAC("FLAC", setOf("flac")),
+        MP3("MP3", setOf("mp3")),
+    }
+
+    private val FLAC_TITLE = Regex("""\bflac\b""", RegexOption.IGNORE_CASE)
+    private val MP3_TITLE = Regex("""\bmp3\b""", RegexOption.IGNORE_CASE)
+
+    /** By actual files: playable audio → AUDIO; video files and no audio → VIDEO; else UNKNOWN. */
+    fun classifyFiles(files: List<TorBoxFile>): Kind = when {
+        pick(files).tracks.isNotEmpty() -> Kind.AUDIO
+        files.any { extension(it.name) in VIDEO_EXT } -> Kind.VIDEO
+        else -> Kind.UNKNOWN
+    }
+
+    /** A search result, plus its real file list when TorBox has it cached. */
+    class Candidate(val result: SearchResult, val files: List<TorBoxFile>?) {
+        val filesKnown: Boolean get() = files != null
+        val kind: Kind = if (files != null) classifyFiles(files) else classify(result.title)
+
+        /** Count per playable extension from the real files, e.g. {flac=12, mp3=12}. */
+        val formats: Map<String, Int> = files.orEmpty().filterNot(::isJunk).map { extension(it.name) }
+            .filter { it in LOSSLESS || it in LOSSY }.groupingBy { it }.eachCount()
+
+        fun matches(filter: FormatFilter): Boolean {
+            if (files != null) {
+                if (kind != Kind.AUDIO) return false   // known not to be audio (video, ebooks, …)
+                val allowed = filter.extensions ?: return true
+                return formats.keys.any { it in allowed }
+            }
+            // Files unknown (not cached): fall back to the title.
+            if (kind == Kind.VIDEO) return false
+            val t = result.title
+            return when (filter) {
+                FormatFilter.ANY -> true
+                FormatFilter.LOSSLESS -> looksLossless(t)
+                FormatFilter.FLAC -> FLAC_TITLE.containsMatchIn(t)
+                FormatFilter.MP3 -> MP3_TITLE.containsMatchIn(t)
+            }
+        }
+    }
+
+    /**
+     * Keeps audio results matching [filter]. Order: confirmed by real files first, then
+     * audio-looking titles, then ambiguous titles; within each: cached, lossless, seeders.
+     */
+    fun filterAndRank(candidates: List<Candidate>, filter: FormatFilter): List<Candidate> = candidates
+        .filter { it.matches(filter) }
+        .sortedWith(
+            compareByDescending<Candidate> { it.filesKnown }
+                .thenByDescending { it.kind == Kind.AUDIO }
+                .thenByDescending { it.result.cached == true }
+                .thenByDescending { c -> c.formats.keys.any { it in LOSSLESS } || looksLossless(c.result.title) }
+                .thenBy { looksLossy(it.result.title) }
+                .thenByDescending { it.result.seeders }
+        )
 
     fun looksLossless(title: String): Boolean = LOSSLESS_TITLE.containsMatchIn(title)
     fun looksLossy(title: String): Boolean = !looksLossless(title) && LOSSY_TITLE.containsMatchIn(title)

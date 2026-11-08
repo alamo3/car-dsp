@@ -93,6 +93,13 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_TORBOX_CACHED_ONLY, false)
         set(v) = prefs.edit().putBoolean(KEY_TORBOX_CACHED_ONLY, v).apply()
 
+    /** Format filter for TorBox search and track picking (AudioPicker.FormatFilter name). */
+    var torboxFormat: dev.alamo3.cabineq.torbox.AudioPicker.FormatFilter
+        get() = runCatching {
+            dev.alamo3.cabineq.torbox.AudioPicker.FormatFilter.valueOf(prefs.getString(KEY_TORBOX_FORMAT, null) ?: "ANY")
+        }.getOrDefault(dev.alamo3.cabineq.torbox.AudioPicker.FormatFilter.ANY)
+        set(v) = prefs.edit().putString(KEY_TORBOX_FORMAT, v.name).apply()
+
     fun resetEq() {
         val e = prefs.edit()
         for (i in 0 until Bands.COUNT) e.putFloat(bandKey(i), 0f)
@@ -118,6 +125,7 @@ class Settings(context: Context) {
         const val KEY_SIM_KMH = "sim_kmh"
         const val KEY_TORBOX_KEY = "torbox_api_key"
         const val KEY_TORBOX_CACHED_ONLY = "torbox_cached_only"
+        const val KEY_TORBOX_FORMAT = "torbox_format"
         fun bandKey(i: Int) = "band_$i"
     }
 }
