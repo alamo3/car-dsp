@@ -129,11 +129,7 @@ class EqService : Service() {
             addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
         }
         // Must be exported: the broadcasts come from other apps (music players).
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(sessionReceiver, filter, Context.RECEIVER_EXPORTED)
-        } else {
-            registerReceiver(sessionReceiver, filter)
-        }
+        registerSessionReceiver(filter)
 
         settings.prefs.registerOnSharedPreferenceChangeListener(prefsListener)
         applyGlobalMode()
@@ -158,6 +154,17 @@ class EqService : Service() {
     }
 
     // ---------------------------------------------------------------------------------
+
+    // Before API 33 the exported flag doesn't exist; dynamically registered receivers
+    // are exported by default there, which is what we need.
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private fun registerSessionReceiver(filter: IntentFilter) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(sessionReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(sessionReceiver, filter)
+        }
+    }
 
     private fun applyGlobalMode() {
         if (settings.globalMode) {

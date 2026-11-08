@@ -19,13 +19,16 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build debug APK
-        run: ./gradlew --no-daemon assembleDebug lintDebug
+        run: ./gradlew --no-daemon assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: cabineq-debug-apk
           path: app/build/outputs/apk/debug/*.apk
+
+      - name: Lint
+        run: ./gradlew --no-daemon lintDebug
 
       - name: Upload lint report
         if: always()
