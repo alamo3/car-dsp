@@ -101,6 +101,19 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_ADDON_LINK, "") ?: ""
         set(v) = prefs.edit().putString(KEY_ADDON_LINK, v.trim()).apply()
 
+    /** Most recent first, at most [MAX_RECENT]. */
+    val recentSearches: List<String>
+        get() = prefs.getString(KEY_RECENT_SEARCHES, "").orEmpty().split('\n').filter { it.isNotBlank() }
+
+    fun addRecentSearch(query: String) {
+        val q = query.trim().replace('\n', ' ')
+        if (q.isEmpty()) return
+        val list = (listOf(q) + recentSearches.filterNot { it.equals(q, ignoreCase = true) }).take(MAX_RECENT)
+        prefs.edit().putString(KEY_RECENT_SEARCHES, list.joinToString("\n")).apply()
+    }
+
+    fun clearRecentSearches() = prefs.edit().remove(KEY_RECENT_SEARCHES).apply()
+
     /** Display name from the addon's manifest, e.g. "Nebula". */
     var addonName: String
         get() = prefs.getString(KEY_ADDON_NAME, "") ?: ""
@@ -141,6 +154,8 @@ class Settings(context: Context) {
         const val KEY_TORBOX_FORMAT = "torbox_format"
         const val KEY_ADDON_LINK = "addon_link"
         const val KEY_ADDON_NAME = "addon_name"
+        const val KEY_RECENT_SEARCHES = "recent_searches"
+        const val MAX_RECENT = 8
         fun bandKey(i: Int) = "band_$i"
     }
 }

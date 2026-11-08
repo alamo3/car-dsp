@@ -88,6 +88,8 @@ class EqService : Service() {
     private var lastPlayerVersion = -1
     private var lastPlayerActive = false
     private var playerSpeakerSince = 0L
+    private var sessionArtUrl: String? = null
+    private var sessionArt: android.graphics.Bitmap? = null
 
     private val sessionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -536,6 +538,7 @@ class EqService : Service() {
             override fun onSkipToNext() = FilePlayer.get(this@EqService).next()
             override fun onSkipToPrevious() = FilePlayer.get(this@EqService).previous()
             override fun onStop() = FilePlayer.get(this@EqService).stop()
+            override fun onSeekTo(pos: Long) = FilePlayer.get(this@EqService).seekTo(pos)
         })
         session.isActive = true
         mediaSession = session
@@ -555,19 +558,38 @@ class EqService : Service() {
         val playback = PlaybackState.Builder()
             .setActions(
                 PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
-                    PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_STOP
+                    PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_STOP or
+                    PlaybackState.ACTION_SEEK_TO
             )
             .setState(state, player.positionMs, if (state == PlaybackState.STATE_PLAYING) 1f else 0f)
         if (state == PlaybackState.STATE_ERROR) playback.setErrorMessage(player.lastError ?: "Playback error")
         session.setPlaybackState(playback.build())
-        session.setMetadata(
-            MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, player.currentTitle ?: "")
-                .putString(MediaMetadata.METADATA_KEY_ALBUM, player.queueTitle ?: "")
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, player.formatInfo ?: "CabinEQ")
-                .putLong(MediaMetadata.METADATA_KEY_DURATION, player.durationMs)
-                .build()
-        )
+
+        val track = player.currentTrack
+        val art = track?.artworkUrl
+        // Car displays and the lock screen show this; the art bitmap arrives asynchronously.
+        session.setMetadata(buildMetadata(player, track, if (art == sessionArtUrl) sessionArt else null))
+        if (art != sessionArtUrl) {
+            sessionArtUrl = art
+            sessionArt = null
+            dev.alamo3.cabineq.music.Artwork.loadBitmap(this, art, ART_PX) { bmp ->
+                if (sessionArtUrl != art || mediaSession == null) return@loadBitmap
+                sessionArt = bmp
+                mediaSession?.setMetadata(buildMetadata(player, player.currentTrack, bmp))
+                updateNotification()
+            }
+        }
+    }
+
+    private fun buildMetadata(player: FilePlayer, track: FilePlayer.Track?, art: android.graphics.Bitmap?): MediaMetadata {
+        val b = MediaMetadata.Builder()
+            .putString(MediaMetadata.METADATA_KEY_TITLE, track?.title ?: player.currentTitle ?: "")
+            .putString(MediaMetadata.METADATA_KEY_ARTIST, track?.artist ?: player.formatInfo ?: "CabinEQ")
+            .putString(MediaMetadata.METADATA_KEY_ALBUM, track?.album ?: player.queueTitle ?: "")
+            .putLong(MediaMetadata.METADATA_KEY_DURATION, player.durationMs)
+        track?.artworkUrl?.let { b.putString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, it) }
+        art?.let { b.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) }
+        return b.build()
     }
 
     private fun slew(current: Float, target: Float): Float {
@@ -613,13 +635,20 @@ class EqService : Service() {
         val player = FilePlayer.peek()
         val session = mediaSession
         if (player != null && player.isActive && session != null) {
+            // While music plays, the notification opens the player screen.
+            builder.setContentIntent(PendingIntent.getActivity(
+                this, 5, Intent(this, MusicActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_IMMUTABLE,
+            ))
             fun action(label: String, action: String, code: Int) = Notification.Action.Builder(
                 null, label,
                 PendingIntent.getService(this, code, Intent(this, EqService::class.java).setAction(action), PendingIntent.FLAG_IMMUTABLE)
             ).build()
             builder
                 .setContentTitle(player.currentTitle ?: "CabinEQ player")
-                .setContentText(listOfNotNull(player.queueTitle, player.formatInfo).joinToString(" · "))
+                .setContentText(listOfNotNull(player.currentTrack?.artist, player.formatInfo).joinToString(" · "))
+            sessionArt?.let { builder.setLargeIcon(it) }
+            builder
                 .addAction(action("Prev", ACTION_PLAYER_PREV, 2))
                 .addAction(action(if (player.state == FilePlayer.State.PAUSED) "Play" else "Pause", ACTION_PLAYER_TOGGLE, 3))
                 .addAction(action("Next", ACTION_PLAYER_NEXT, 4))
@@ -646,6 +675,7 @@ class EqService : Service() {
         private const val GLOBAL_SESSION = 0
 
         private const val TICK_MS = 100L
+        private const val ART_PX = 512
         private const val MAX_STEP_DB = 0.4f          // per tick -> max 4 dB/s; speed is already smoothed upstream
         private const val MAX_TOTAL_DB = 15f
         private const val HEADROOM_SHARE_FOR_SPEED = 0.5f

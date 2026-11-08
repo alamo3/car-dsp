@@ -34,8 +34,17 @@ import kotlin.math.max
  */
 class FilePlayer private constructor(private val context: Context) {
 
-    /** [resolveUrl] runs on the player thread right before the track starts (links can expire). */
-    class Track(val title: String, val resolveUrl: () -> String)
+    /**
+     * One queue entry. [resolveUrl] runs on the player thread right before the track starts
+     * (links can expire). The other fields are display metadata (UI, MediaSession, car screen).
+     */
+    class Track(
+        val title: String,
+        val artist: String? = null,
+        val album: String? = null,
+        val artworkUrl: String? = null,
+        val resolveUrl: () -> String,
+    )
 
     enum class State { IDLE, LOADING, PLAYING, PAUSED, ERROR }
 
@@ -71,6 +80,7 @@ class FilePlayer private constructor(private val context: Context) {
         private set
 
     val currentTitle: String? get() = queue.getOrNull(currentIndex)?.title
+    val currentTrack: Track? get() = queue.getOrNull(currentIndex)
 
     /**
      * Identifies the current queue/skip. A [Track.resolveUrl] that waits (e.g. on TorBox caching)
@@ -85,6 +95,7 @@ class FilePlayer private constructor(private val context: Context) {
 
     @Volatile private var generation = 0          // incremented to retire the current worker
     @Volatile private var jumpTo = -1             // pending skip target
+    @Volatile private var seekToMs = -1L          // pending seek within the current track
     @Volatile private var userPaused = false
     @Volatile private var focusPaused = false
 
@@ -160,6 +171,15 @@ class FilePlayer private constructor(private val context: Context) {
         } else {
             play(queue, index, queueTitle)
         }
+    }
+
+    /** Seeks within the current track (to the nearest sync point at or before [ms]). */
+    fun seekTo(ms: Long) {
+        if (!isActive) return
+        val target = if (durationMs > 0) ms.coerceIn(0, durationMs) else ms.coerceAtLeast(0)
+        seekToMs = target
+        positionMs = target
+        version++
     }
 
     fun stop() {
@@ -322,6 +342,7 @@ class FilePlayer private constructor(private val context: Context) {
                 while (live && index in queue.indices) {
                     currentIndex = index
                     note = null
+                    seekToMs = -1
                     positionMs = 0
                     durationMs = 0
                     formatInfo = null
@@ -426,6 +447,17 @@ class FilePlayer private constructor(private val context: Context) {
                         jumpTo = -1
                         out.pauseAndFlush()
                         return Outcome.Jump(jump)
+                    }
+                    val seek = seekToMs
+                    if (seek >= 0) {
+                        seekToMs = -1
+                        extractor.seekTo(seek * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                        dec.flush()               // drops queued input/output; codec keeps running
+                        inputDone = false
+                        out.pauseAndFlush()       // drop audio already buffered for the old position
+                        positionMs = seek
+                        if (state != State.PAUSED) setState(State.PLAYING) else version++
+                        continue
                     }
                     if (state == State.PAUSED) {
                         if (out.track.playState == AudioTrack.PLAYSTATE_PLAYING) out.track.pause()

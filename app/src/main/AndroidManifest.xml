@@ -30,11 +30,12 @@
         </activity>
 
         <activity
-            android:name=".TorBoxActivity"
+            android:name=".MusicActivity"
             android:exported="false"
             android:label="Music"
             android:parentActivityName=".MainActivity"
-            android:windowSoftInputMode="adjustResize" />
+            android:windowSoftInputMode="adjustResize"
+            android:launchMode="singleTop" />
 
         <service
             android:name=".EqService"

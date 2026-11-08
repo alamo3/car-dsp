@@ -48,6 +48,7 @@ class EclipseAddon(link: String) {
         val format: String?,
         /** Some addons include a ready stream URL in search results. */
         val streamUrl: String?,
+        val artworkUrl: String? = null,
     )
 
     data class Album(
@@ -56,11 +57,20 @@ class EclipseAddon(link: String) {
         val artist: String,
         val year: String?,
         val trackCount: Int?,
+        val artworkUrl: String? = null,
     )
 
-    data class SearchResults(val tracks: List<Track>, val albums: List<Album>)
+    data class Artist(val id: String, val name: String, val artworkUrl: String?, val genres: List<String>)
+
+    data class SearchResults(
+        val tracks: List<Track>,
+        val albums: List<Album>,
+        val artists: List<Artist> = emptyList(),
+    )
 
     data class AlbumDetail(val album: Album, val tracks: List<Track>)
+
+    data class ArtistDetail(val artist: Artist, val topTracks: List<Track>, val albums: List<Album>)
 
     data class Notice(val title: String?, val message: String, val progress: Double?)
 
@@ -74,6 +84,10 @@ class EclipseAddon(link: String) {
 
     // ---------------------------------------------------------------- endpoints
 
+    /** Resource list from the last [manifest] call; used to skip endpoints the addon lacks. */
+    @Volatile var resources: List<String> = emptyList()
+        private set
+
     fun manifest(): Manifest {
         val o = getJson("/manifest.json").json
             ?: throw AddonException("Addon returned no manifest", 200)
@@ -86,6 +100,7 @@ class EclipseAddon(link: String) {
                 else -> null
             }
         }
+        this.resources = resources
         return Manifest(
             id = o.optStr("id") ?: "unknown",
             name = o.optStr("name") ?: "Addon",
@@ -99,6 +114,27 @@ class EclipseAddon(link: String) {
         return SearchResults(
             tracks = o.optJSONArray("tracks").objects().mapNotNull(::parseTrack),
             albums = o.optJSONArray("albums").objects().mapNotNull(::parseAlbum),
+            artists = o.optJSONArray("artists").objects().mapNotNull(::parseArtist),
+        )
+    }
+
+    /**
+     * GET /artist/{id} (optional in the protocol). Returns null when the addon doesn't
+     * implement it, so the caller can fall back to a name search.
+     */
+    fun artist(id: String): ArtistDetail? {
+        val o = try {
+            getJson("/artist/" + encPath(id)).json
+        } catch (e: AddonException) {
+            if (e.status == 404 || e.status == 405 || e.status == 501) return null
+            throw e
+        } ?: return null
+        val artist = parseArtist(o) ?: return null
+        return ArtistDetail(
+            artist = artist,
+            topTracks = o.optJSONArray("topTracks").objects().mapNotNull(::parseTrack)
+                .map { if (it.artworkUrl == null) it.copy(artworkUrl = artist.artworkUrl) else it },
+            albums = o.optJSONArray("albums").objects().mapNotNull(::parseAlbum),
         )
     }
 
@@ -107,7 +143,14 @@ class EclipseAddon(link: String) {
         val album = parseAlbum(o) ?: throw AddonException("Album response had no id/title", 200)
         val fallbackAlbum = album.title
         val tracks = o.optJSONArray("tracks").objects().mapNotNull(::parseTrack)
-            .map { if (it.album == null) it.copy(album = fallbackAlbum) else it }
+            .map { t ->
+                t.copy(
+                    album = t.album ?: fallbackAlbum,
+                    // Album tracks often omit artwork; use the album cover.
+                    artworkUrl = t.artworkUrl ?: album.artworkUrl,
+                    artist = t.artist.ifBlank { album.artist },
+                )
+            }
         return AlbumDetail(album, tracks)
     }
 
@@ -216,6 +259,7 @@ class EclipseAddon(link: String) {
             durationSec = o.optIntOrNull("duration"),
             format = o.optStr("format"),
             streamUrl = o.optStr("streamURL"),
+            artworkUrl = artwork(o),
         )
     }
 
@@ -226,10 +270,22 @@ class EclipseAddon(link: String) {
             id = id,
             title = title,
             artist = o.optStr("artist") ?: "",
-            year = o.optStr("year"),
+            year = o.optStr("year")?.take(4),
             trackCount = o.optIntOrNull("trackCount"),
+            artworkUrl = artwork(o),
         )
     }
+
+    private fun parseArtist(o: JSONObject): Artist? {
+        val id = o.optStr("id") ?: return null
+        val name = o.optStr("name") ?: o.optStr("title") ?: return null
+        val genres = o.optJSONArray("genres")?.let { g -> (0 until g.length()).mapNotNull { g.opt(it)?.toString() } }.orEmpty()
+        return Artist(id, name, artwork(o), genres)
+    }
+
+    /** Protocol field is artworkURL; accept common variants too. */
+    private fun artwork(o: JSONObject): String? =
+        o.optStr("artworkURL") ?: o.optStr("artworkUrl") ?: o.optStr("artwork") ?: o.optStr("image")
 
     private fun parseNotice(o: JSONObject): Notice? {
         val message = o.optStr("message") ?: return null
