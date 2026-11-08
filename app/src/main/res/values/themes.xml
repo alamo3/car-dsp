@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        No window action bar: with targetSdk 35 Android 15 draws apps edge-to-edge, and the
+        framework action bar ends up on top of the content. Each screen draws its own title
+        and pads itself for the system bars (see Insets.kt).
+    -->
+    <style name="Theme.CabinEQ" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+</resources>

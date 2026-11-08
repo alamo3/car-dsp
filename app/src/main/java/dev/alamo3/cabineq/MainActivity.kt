@@ -86,6 +86,11 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(32))
         }
+        root.addView(TextView(this).apply {
+            text = "CabinEQ"
+            textSize = 26f
+            setPadding(0, dp(4), 0, dp(12))
+        })
 
         startStopButton = Button(this).apply {
             textSize = 18f
@@ -241,7 +246,10 @@ class MainActivity : Activity() {
         }
         root.addView(updateButton)
 
-        return ScrollView(this).apply { addView(root) }
+        return ScrollView(this).apply {
+            addView(root)
+            padForSystemBars()
+        }
     }
 
     private fun applyPreset(values: FloatArray) {

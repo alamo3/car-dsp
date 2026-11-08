@@ -98,6 +98,11 @@ class TorBoxActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(32))
         }
+        root.addView(TextView(this).apply {
+            text = "TorBox"
+            textSize = 26f
+            setPadding(0, dp(4), 0, dp(12))
+        })
 
         // --- Now playing ---
         nowPlaying = LinearLayout(this).apply {
@@ -213,7 +218,10 @@ class TorBoxActivity : Activity() {
         list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(list)
 
-        return ScrollView(this).apply { addView(root) }
+        return ScrollView(this).apply {
+            addView(root)
+            padForSystemBars()
+        }
     }
 
     private fun refreshKeyUi(editing: Boolean) {
