@@ -213,8 +213,21 @@ class TorBoxClient(
 
     // ---------------------------------------------------------------- core
 
-    /** Performs the call and returns the envelope's `data` (JSONObject, JSONArray, String, … or null). */
+    /**
+     * Performs the call and returns the envelope's `data`. GETs are retried once on a dropped
+     * connection (mobile data in the car), never on an HTTP error.
+     */
     private fun request(method: String, url: String, form: Multipart? = null): Any? {
+        try {
+            return requestOnce(method, url, form)
+        } catch (e: TorBoxException) {
+            if (method != "GET" || e.code != "NETWORK_ERROR") throw e
+            Thread.sleep(RETRY_DELAY_MS)
+            return requestOnce(method, url, form)
+        }
+    }
+
+    private fun requestOnce(method: String, url: String, form: Multipart?): Any? {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = CONNECT_TIMEOUT_MS
@@ -250,7 +263,13 @@ class TorBoxClient(
         } catch (e: SocketTimeoutException) {
             throw TorBoxException("TorBox $method $safeUrl timed out", 0, "TIMEOUT", e)
         } catch (e: IOException) {
-            throw TorBoxException("TorBox $method $safeUrl failed: ${e.message}", 0, "NETWORK_ERROR", e)
+            // Android's HttpURLConnection throws instead of returning a 401 that has no
+            // WWW-Authenticate header ("No authentication challenges found").
+            if (e.message?.contains("authentication challenge", ignoreCase = true) == true) {
+                throw TorBoxException("TorBox $method $safeUrl → 401: API key not accepted here", 401, "AUTH_ERROR", e)
+            }
+            val why = e.message ?: e.javaClass.simpleName
+            throw TorBoxException("TorBox $method $safeUrl failed: ${e.javaClass.simpleName}: $why", 0, "NETWORK_ERROR", e)
         } finally {
             conn.disconnect()
         }
@@ -344,6 +363,7 @@ class TorBoxClient(
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val READ_TIMEOUT_MS = 30_000
         private const val CHECK_CACHED_BATCH = 50
+        private const val RETRY_DELAY_MS = 800L
 
         fun hashFromMagnet(magnet: String): String? =
             Regex("xt=urn:btih:([A-Za-z0-9]+)", RegexOption.IGNORE_CASE).find(magnet)?.groupValues?.get(1)?.lowercase()

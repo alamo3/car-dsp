@@ -474,14 +474,27 @@ class TorBoxActivity : Activity() {
         }.start()
     }
 
-    private fun describe(e: Throwable): String = when {
-        e is TorBoxException && e.isAuthError -> {
-            refreshKeyUi(editing = true)
-            "TorBox rejected the API key. Check it and save again."
+    /** User-facing error, always ending with the underlying detail so failures can be diagnosed. */
+    private fun describe(e: Throwable): String {
+        val detail = "\n\nDetail: ${e.message ?: e.javaClass.simpleName}" +
+            (e.cause?.let { "\nCause: ${it.javaClass.simpleName}: ${it.message}" } ?: "")
+        val isSearch = e.message?.contains("search-api") == true
+        return when {
+            e is TorBoxException && e.isAuthError && isSearch ->
+                // The main API accepted the key (playback/library work), so don't ask to re-enter it.
+                "TorBox search refused the API key. Search needs a paid TorBox plan; " +
+                    "My TorBox and playback work without it.$detail"
+            e is TorBoxException && e.isAuthError -> {
+                refreshKeyUi(editing = true)
+                "TorBox rejected the API key. Check it and save again.$detail"
+            }
+            e is TorBoxException && e.isRateLimited -> "TorBox rate limit hit — wait a minute and try again.$detail"
+            e is TorBoxException && e.code == "TIMEOUT" ->
+                "TorBox ${if (isSearch) "search" else "API"} timed out. Try again.$detail"
+            e is TorBoxException && e.status == 0 ->
+                "Can't reach TorBox ${if (isSearch) "search" else "API"}. Check your connection or VPN.$detail"
+            else -> "TorBox error.$detail"
         }
-        e is TorBoxException && e.isRateLimited -> "TorBox rate limit hit — wait a minute and try again."
-        e is TorBoxException && e.status == 0 -> "Can't reach TorBox (${e.code}). Check your connection."
-        else -> "TorBox error: ${e.message}"
     }
 
     private fun setStatus(text: String) {
