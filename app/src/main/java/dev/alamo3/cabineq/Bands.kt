@@ -1,0 +1,36 @@
+package dev.alamo3.cabineq
+
+import kotlin.math.sqrt
+
+/**
+ * 10-band octave EQ layout.
+ *
+ * DynamicsProcessing defines each EQ band by its *upper* cutoff frequency (the band
+ * covers everything from the previous band's cutoff up to its own). To make the bands
+ * behave like a normal octave EQ centred on [CENTERS], each cutoff is placed at the
+ * geometric midpoint between neighbouring centres.
+ */
+object Bands {
+    val CENTERS = floatArrayOf(31f, 63f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f)
+    val COUNT = CENTERS.size
+
+    val CUTOFFS = FloatArray(COUNT) { i ->
+        if (i == COUNT - 1) 20000f else sqrt(CENTERS[i] * CENTERS[i + 1])
+    }
+
+    /**
+     * How much of the speed-compensation boost each band receives (0..1).
+     * EV cabin noise at speed is mostly tyre/road rumble and wind, concentrated in the
+     * lows and low-mids, so the boost leans heavily on those bands. Treble gets a small
+     * lift to preserve clarity against wind noise.
+     */
+    val SPEED_WEIGHTS = floatArrayOf(1.0f, 1.0f, 0.9f, 0.7f, 0.45f, 0.25f, 0.15f, 0.15f, 0.2f, 0.2f)
+
+    const val MAX_BAND_DB = 12f
+
+    fun label(i: Int): String {
+        val f = CENTERS[i]
+        return if (f >= 1000f) "${(f / 1000f).let { if (it % 1f == 0f) it.toInt().toString() else it.toString() }} kHz"
+        else "${f.toInt()} Hz"
+    }
+}
