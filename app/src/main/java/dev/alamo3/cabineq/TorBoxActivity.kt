@@ -18,10 +18,10 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
+import dev.alamo3.cabineq.addon.AddonException
+import dev.alamo3.cabineq.addon.EclipseAddon
 import dev.alamo3.cabineq.torbox.AudioPicker
-import dev.alamo3.cabineq.torbox.SearchResult
 import dev.alamo3.cabineq.torbox.TorBoxClient
 import dev.alamo3.cabineq.torbox.TorBoxException
 import dev.alamo3.cabineq.torbox.TorBoxTorrent
@@ -29,8 +29,12 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * TorBox front end: search → add to TorBox → wait until it's on TorBox's servers → pick the
- * audio files automatically → stream them through [FilePlayer] (native EQ).
+ * Music front end. Everything plays through [FilePlayer] → native DSP.
+ *
+ *  - **Search** goes through an Eclipse addon such as Nebula (Apple Music catalog, audio served
+ *    from the user's TorBox). TorBox retired its own search API, and its main API has none.
+ *  - **My TorBox** lists torrents already on the account and auto-picks their audio files.
+ *  - A **magnet link** typed into the search box is added to TorBox and played.
  *
  * Framework-only like the rest of the app. Network calls run on a background thread; each
  * new action bumps [op] so stale results and polling loops from an earlier action are dropped.
@@ -40,6 +44,9 @@ class TorBoxActivity : Activity() {
     private lateinit var settings: Settings
     private val handler = Handler(Looper.getMainLooper())
 
+    private lateinit var addonRow: LinearLayout
+    private lateinit var addonInput: EditText
+    private lateinit var addonSummary: TextView
     private lateinit var keyRow: LinearLayout
     private lateinit var keyInput: EditText
     private lateinit var keySummary: TextView
@@ -54,9 +61,6 @@ class TorBoxActivity : Activity() {
 
     @Volatile private var op = 0
     private val formatButtons = LinkedHashMap<AudioPicker.FormatFilter, Button>()
-    private var lastQuery: String? = null
-    private var lastCandidates: List<AudioPicker.Candidate>? = null
-    private var lastHiddenVideo = 0
     private var shownPlayerVersion = -1
 
     private val playerUpdater = object : Runnable {
@@ -69,10 +73,15 @@ class TorBoxActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = Settings(this)
-        title = "TorBox"
+        title = "Music"
         setContentView(buildUi())
-        refreshKeyUi(editing = settings.torboxApiKey.isBlank())
-        if (settings.torboxApiKey.isNotBlank()) loadLibrary()
+        refreshAddonUi(editing = settings.addonLink.isBlank())
+        refreshKeyUi(editing = false)
+        setStatus(
+            if (settings.addonLink.isBlank())
+                "Paste your Nebula addon link above (the same link you installed in Eclipse) to search music."
+            else "Search for a song, album or artist."
+        )
     }
 
     override fun onResume() {
@@ -99,7 +108,7 @@ class TorBoxActivity : Activity() {
             setPadding(dp(16), dp(16), dp(16), dp(32))
         }
         root.addView(TextView(this).apply {
-            text = "TorBox"
+            text = "Music"
             textSize = 26f
             setPadding(0, dp(4), 0, dp(12))
         })
@@ -129,10 +138,73 @@ class TorBoxActivity : Activity() {
         nowPlaying.addView(controls)
         root.addView(nowPlaying)
 
-        // --- API key ---
+        // --- Search ---
+        val searchRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        searchInput = EditText(this).apply {
+            hint = "Song, album or artist — or paste a magnet link"
+            isSingleLine = true
+            imeOptions = EditorInfo.IME_ACTION_SEARCH
+            setOnEditorActionListener { _, actionId, event ->
+                val enter = event != null && event.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN
+                if (actionId == EditorInfo.IME_ACTION_SEARCH || enter) { runSearch(); true } else false
+            }
+        }
+        searchRow.addView(searchInput, weight())
+        searchRow.addView(Button(this).apply { text = "Search"; setOnClickListener { runSearch() } })
+        root.addView(searchRow)
+
+        root.addView(Button(this).apply {
+            text = "My TorBox library"
+            setOnClickListener { loadLibrary() }
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        statusText = TextView(this).apply {
+            textSize = 14f
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        root.addView(statusText)
+
+        list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(list)
+
+        // --- Settings ---
+        root.addView(TextView(this).apply {
+            text = "Sources"
+            textSize = 18f
+            setPadding(0, dp(24), 0, dp(4))
+        })
+
+        // Nebula / Eclipse addon link
+        addonSummary = TextView(this).apply {
+            textSize = 13f
+            alpha = 0.8f
+            setPadding(0, dp(4), 0, dp(4))
+            setOnClickListener { refreshAddonUi(editing = true) }
+        }
+        root.addView(addonSummary)
+        addonRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        addonInput = EditText(this).apply {
+            hint = "https://nebula.eclipsemusic.app/…/manifest.json"
+            isSingleLine = true
+            // Hidden like a password: the link contains your TorBox key.
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(settings.addonLink)
+        }
+        addonRow.addView(addonInput, weight())
+        addonRow.addView(Button(this).apply { text = "Save"; setOnClickListener { saveAddon() } })
+        root.addView(addonRow)
+
+        // TorBox key (library + magnet links)
         keySummary = TextView(this).apply {
             textSize = 13f
             alpha = 0.8f
+            setPadding(0, dp(8), 0, dp(4))
             setOnClickListener { refreshKeyUi(editing = true) }
         }
         root.addView(keySummary)
@@ -153,42 +225,17 @@ class TorBoxActivity : Activity() {
                 settings.torboxApiKey = keyInput.text.toString()
                 hideKeyboard()
                 refreshKeyUi(editing = settings.torboxApiKey.isBlank())
-                if (settings.torboxApiKey.isNotBlank()) loadLibrary()
             }
         })
         root.addView(keyRow)
 
-        // --- Search ---
-        val searchRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        // Which format to play from library torrents that ship several (e.g. FLAC + MP3).
+        root.addView(TextView(this).apply {
+            text = "Library format"
+            textSize = 13f
+            alpha = 0.8f
             setPadding(0, dp(8), 0, 0)
-        }
-        searchInput = EditText(this).apply {
-            hint = "Artist / album (add \"flac\" for lossless)"
-            isSingleLine = true
-            imeOptions = EditorInfo.IME_ACTION_SEARCH
-            setOnEditorActionListener { _, actionId, event ->
-                val enter = event != null && event.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN
-                if (actionId == EditorInfo.IME_ACTION_SEARCH || enter) { runSearch(); true } else false
-            }
-        }
-        searchRow.addView(searchInput, weight())
-        searchRow.addView(Button(this).apply { text = "Search"; setOnClickListener { runSearch() } })
-        root.addView(searchRow)
-
-        root.addView(Switch(this).apply {
-            text = "Cached only (plays instantly)"
-            textSize = 15f
-            minHeight = dp(44)
-            isChecked = settings.torboxCachedOnly
-            setOnCheckedChangeListener { _, checked ->
-                settings.torboxCachedOnly = checked
-                rerenderResults()
-            }
         })
-
-        // Format filter: checked against the real files for cached torrents.
         val formatRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         for (f in AudioPicker.FormatFilter.values()) {
             val b = Button(this).apply {
@@ -196,7 +243,6 @@ class TorBoxActivity : Activity() {
                 setOnClickListener {
                     settings.torboxFormat = f
                     refreshFormatButtons()
-                    rerenderResults()
                 }
             }
             formatButtons[f] = b
@@ -205,33 +251,34 @@ class TorBoxActivity : Activity() {
         root.addView(formatRow)
         refreshFormatButtons()
 
-        val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        tabs.addView(Button(this).apply { text = "My TorBox"; setOnClickListener { loadLibrary() } }, weight())
-        root.addView(tabs)
-
-        statusText = TextView(this).apply {
-            textSize = 14f
-            setPadding(0, dp(8), 0, dp(8))
-        }
-        root.addView(statusText)
-
-        list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(list)
-
         return ScrollView(this).apply {
             addView(root)
             padForSystemBars()
         }
     }
 
+    private fun refreshAddonUi(editing: Boolean) {
+        val link = settings.addonLink
+        addonRow.visibility = if (editing) View.VISIBLE else View.GONE
+        addonSummary.text = when {
+            editing -> "Search source: paste your Nebula link from Eclipse (Settings → Connections), then Save."
+            link.isNotBlank() -> "Search: ${settings.addonName.ifBlank { "addon" }} (${EclipseAddon.displayHost(link)}) · tap to change"
+            else -> "Search: not set · tap to add your Nebula link"
+        }
+    }
+
     private fun refreshKeyUi(editing: Boolean) {
-        val hasKey = settings.torboxApiKey.isNotBlank()
         keyRow.visibility = if (editing) View.VISIBLE else View.GONE
         keySummary.text = when {
-            editing -> "Paste your API key from TorBox → Settings → API."
-            hasKey -> "TorBox API key saved · tap to change"
-            else -> ""
+            editing -> "TorBox API key (for your library and magnet links): TorBox → Settings → API."
+            settings.torboxApiKey.isNotBlank() -> "TorBox key saved (library + magnets) · tap to change"
+            else -> "TorBox key: not set (only needed for your library and magnet links) · tap to add"
         }
+    }
+
+    private fun refreshFormatButtons() {
+        val selected = settings.torboxFormat
+        for ((f, b) in formatButtons) b.text = if (f == selected) "● ${f.label}" else f.label
     }
 
     private fun refreshNowPlaying() {
@@ -258,6 +305,7 @@ class TorBoxActivity : Activity() {
         sb.append("  ").append(mmss(p.positionMs))
         if (p.durationMs > 0) sb.append(" / ").append(mmss(p.durationMs))
         sb.append("  ·  track ${p.currentIndex + 1}/${p.queue.size}")
+        p.note?.let { sb.append("\n⏳ ").append(it) }
         p.formatInfo?.let { sb.append('\n').append(it).append(" → CabinEQ DSP") }
         EngineState.playerRoute?.let { if (p.state == FilePlayer.State.PLAYING) sb.append(" → ").append(it) }
         if (p.state == FilePlayer.State.PLAYING && EngineState.running) {
@@ -269,112 +317,173 @@ class TorBoxActivity : Activity() {
     }
 
     // ---------------------------------------------------------------------------------
-    // Actions
+    // Addon search (Nebula)
 
-    private fun client(): TorBoxClient? {
-        val key = settings.torboxApiKey
-        if (key.isBlank()) {
-            refreshKeyUi(editing = true)
-            setStatus("Add your TorBox API key first.")
+    private fun addon(): EclipseAddon? {
+        val link = settings.addonLink
+        if (link.isBlank()) {
+            refreshAddonUi(editing = true)
+            setStatus("Paste your Nebula addon link first (Eclipse → Settings → Connections).")
             return null
         }
-        return TorBoxClient(key)
+        return runCatching { EclipseAddon(link) }.getOrElse {
+            refreshAddonUi(editing = true)
+            setStatus("That addon link isn't valid: ${it.message}")
+            null
+        }
     }
 
-    private fun refreshFormatButtons() {
-        val selected = settings.torboxFormat
-        for ((f, b) in formatButtons) b.text = if (f == selected) "● ${f.label}" else f.label
+    private fun saveAddon() {
+        val link = addonInput.text.toString().trim()
+        hideKeyboard()
+        if (link.isBlank()) {
+            settings.addonLink = ""
+            settings.addonName = ""
+            refreshAddonUi(editing = true)
+            return
+        }
+        val candidate = runCatching { EclipseAddon(link) }.getOrElse {
+            setStatus("That addon link isn't valid: ${it.message}")
+            return
+        }
+        val id = ++op
+        setStatus("Checking addon…")
+        background(id, { candidate.manifest() }) { m ->
+            settings.addonLink = link
+            settings.addonName = m.name
+            refreshAddonUi(editing = false)
+            val missing = listOfNotNull(
+                if (!m.canSearch) "search" else null,
+                if (!m.canStream) "stream" else null,
+            )
+            setStatus(
+                "Connected to ${m.name} ${m.version}." +
+                    if (missing.isEmpty()) " Search away." else " ⚠ It doesn't offer: ${missing.joinToString()}."
+            )
+        }
     }
 
     private fun runSearch() {
         val query = searchInput.text.toString().trim()
         if (query.isEmpty()) return
-        val c = client() ?: return
         hideKeyboard()
+        if (query.startsWith("magnet:?")) {
+            addMagnet(query)
+            return
+        }
+        val a = addon() ?: return
         val id = ++op
         setStatus("Searching “$query”…")
         list.removeAllViews()
-        lastCandidates = null
-        background(id, {
-            val raw = c.search(query, checkCache = true)
-            // Real file lists for whatever TorBox has cached; failure just means title-only.
-            val files = runCatching { c.checkCachedFiles(raw.map { it.hash }) }.getOrDefault(emptyMap())
-            raw.map { r ->
-                val known = files[r.hash.lowercase()]
-                val result = if (known != null && r.cached != true) r.copy(cached = true) else r
-                AudioPicker.Candidate(result, known)
-            }
-        }) { candidates ->
-            lastQuery = query
-            lastCandidates = candidates
-            showResults()
-        }
+        background(id, { a.search(query) }) { results -> showResults(a, query, results) }
     }
 
-    /** Re-applies the cached-only / format filters to the last search without searching again. */
-    private fun rerenderResults() {
-        if (lastCandidates != null) showResults()
-    }
-
-    private fun showResults() {
-        val query = lastQuery ?: return
-        val candidates = lastCandidates ?: return
+    private fun showResults(a: EclipseAddon, query: String, r: EclipseAddon.SearchResults) {
         list.removeAllViews()
-        val filter = settings.torboxFormat
-        val audio = AudioPicker.filterAndRank(candidates, filter)
-        val video = candidates.count { it.kind == AudioPicker.Kind.VIDEO }
-        val cacheKnown = audio.any { it.result.cached != null }
-        val shown = if (settings.torboxCachedOnly && cacheKnown) audio.filter { it.result.cached == true } else audio
-
-        val what = if (filter == AudioPicker.FormatFilter.ANY) "audio" else filter.label
-        val notes = mutableListOf<String>()
-        if (video > 0) notes.add("$video video hidden")
-        val otherFormats = candidates.size - video - audio.size
-        if (otherFormats > 0) notes.add("$otherFormats other/non-$what hidden")
-        val note = if (notes.isEmpty()) "" else " (" + notes.joinToString(", ") + ")"
-        setStatus(
-            when {
-                audio.isEmpty() -> "No $what results for “$query”.$note"
-                shown.isEmpty() -> "${audio.size} $what results, none cached. Turn off “Cached only” to see them.$note"
-                else -> "${shown.size} $what results — tap one to add it and play.$note\n✓ = format confirmed from the files"
+        if (r.tracks.isEmpty() && r.albums.isEmpty()) {
+            setStatus("No results for “$query”.")
+            return
+        }
+        setStatus("Results for “$query” — tap a song to play, or an album to open it.")
+        if (r.albums.isNotEmpty()) {
+            list.addView(sectionLabel("Albums"))
+            for (al in r.albums.take(MAX_ALBUMS)) {
+                val detail = listOfNotNull(al.artist.ifBlank { null }, al.year, al.trackCount?.let { "$it tracks" })
+                    .joinToString(" · ")
+                list.addView(row(al.title, detail) { openAlbum(a, al) })
             }
-        )
-        for (c in shown) {
-            val r = c.result
-            val tags = mutableListOf<String>()
-            if (c.formats.isNotEmpty()) {
-                // Real files: e.g. "✓ 12 FLAC + 12 MP3"
-                tags.add("✓ " + c.formats.entries.sortedByDescending { it.value }
-                    .joinToString(" + ") { "${it.value} ${it.key.uppercase(Locale.ROOT)}" })
-            } else if (AudioPicker.looksLossless(r.title)) {
-                tags.add("lossless?")
+        }
+        if (r.tracks.isNotEmpty()) {
+            list.addView(sectionLabel("Songs"))
+            val tracks = r.tracks.take(MAX_TRACKS)
+            tracks.forEachIndexed { i, t ->
+                list.addView(row(t.title, trackDetail(t)) {
+                    // Play from the tapped song and keep going through the results.
+                    play(tracks.map { addonTrack(a, it) }, i, "Search: $query")
+                })
             }
-            tags.add(humanBytes(r.size))
-            tags.add("${r.seeders} seeders")
-            if (r.cached == true) tags.add("⚡ cached")
-            r.tracker?.let { tags.add(it) }
-            list.addView(row(r.title, tags.joinToString(" · ")) { openSearchResult(r) })
         }
     }
 
-    private fun openSearchResult(r: SearchResult) {
-        val c = client() ?: return
+    private fun openAlbum(a: EclipseAddon, album: EclipseAddon.Album) {
         val id = ++op
-        setStatus("Adding to TorBox…")
-        background(id, {
-            val torrentId = try {
-                c.createTorrentFromMagnet(r.magnet, allowZip = false).torrentId
-            } catch (e: TorBoxException) {
-                // Already on the account (or a duplicate error): find it by hash instead.
-                if (e.isAuthError || e.isRateLimited) throw e
-                c.findByHash(r.hash)?.id ?: throw e
+        setStatus("Opening “${album.title}”…")
+        background(id, { a.album(album.id) }) { detail ->
+            list.removeAllViews()
+            val al = detail.album
+            setStatus(listOfNotNull(al.title, al.artist.ifBlank { null }, al.year).joinToString(" · ") +
+                "\n${detail.tracks.size} tracks")
+            if (detail.tracks.isEmpty()) return@background
+            val queue = detail.tracks.map { addonTrack(a, it) }
+            val queueTitle = "${al.artist} — ${al.title}".trimStart(' ', '—')
+            list.addView(Button(this).apply {
+                text = "▶ Play album"
+                setOnClickListener { play(queue, 0, queueTitle) }
+            })
+            detail.tracks.forEachIndexed { i, t ->
+                list.addView(row("${i + 1}. ${t.title}", trackDetail(t)) { play(queue, i, queueTitle) })
             }
-            torrentId
+            play(queue, 0, queueTitle)
+        }
+    }
+
+    /** A player track that asks the addon for its stream right before it plays. */
+    private fun addonTrack(a: EclipseAddon, t: EclipseAddon.Track): FilePlayer.Track {
+        val label = if (t.artist.isBlank()) t.title else "${t.title} — ${t.artist}"
+        return FilePlayer.Track(label) {
+            t.streamUrl ?: run {
+                val player = FilePlayer.get(this)
+                val ticket = player.ticket
+                a.resolveStream(t.id, isCancelled = { player.isStale(ticket) }) { notice ->
+                    player.setNote(
+                        notice?.let { n ->
+                            listOfNotNull(n.title, n.message).joinToString(": ") +
+                                (n.progress?.let { p -> " (${(if (p <= 1.0) p * 100 else p).roundToInt()}%)" } ?: "")
+                        } ?: "Preparing…"
+                    )
+                }.url
+            }
+        }
+    }
+
+    private fun trackDetail(t: EclipseAddon.Track): String = listOfNotNull(
+        t.artist.ifBlank { null },
+        t.album,
+        t.durationSec?.let { mmss(it * 1000L) },
+        t.format?.uppercase(Locale.ROOT),
+    ).joinToString(" · ")
+
+    // ---------------------------------------------------------------------------------
+    // TorBox: library and magnet links
+
+    private fun torbox(): TorBoxClient? {
+        val key = settings.torboxApiKey
+        if (key.isBlank()) {
+            refreshKeyUi(editing = true)
+            setStatus("Add your TorBox API key under Sources for your library and magnet links.")
+            return null
+        }
+        return TorBoxClient(key)
+    }
+
+    private fun addMagnet(magnet: String) {
+        val c = torbox() ?: return
+        val id = ++op
+        list.removeAllViews()
+        setStatus("Adding magnet to TorBox…")
+        background(id, {
+            try {
+                c.createTorrentFromMagnet(magnet, allowZip = false).torrentId
+            } catch (e: TorBoxException) {
+                // Already on the account: find it by hash instead.
+                if (e.isAuthError || e.isRateLimited) throw e
+                TorBoxClient.hashFromMagnet(magnet)?.let { c.findByHash(it)?.id } ?: throw e
+            }
         }) { torrentId -> awaitReady(c, torrentId, id) }
     }
 
     private fun loadLibrary() {
-        val c = client() ?: return
+        val c = torbox() ?: return
         val id = ++op
         setStatus("Loading your TorBox torrents…")
         list.removeAllViews()
@@ -384,7 +493,7 @@ class TorBoxActivity : Activity() {
             val torrents = everything.filterNot { it.isReady && AudioPicker.isVideoTorrent(it.files) }
             val hidden = everything.size - torrents.size
             val hiddenNote = if (hidden > 0) " · $hidden video torrents hidden" else ""
-            setStatus(if (torrents.isEmpty()) "No audio torrents on your TorBox yet. Search above.$hiddenNote" else "My TorBox — audio (${torrents.size})$hiddenNote")
+            setStatus(if (torrents.isEmpty()) "No audio torrents on your TorBox.$hiddenNote" else "My TorBox — audio (${torrents.size})$hiddenNote")
             for (t in torrents) {
                 val pick = AudioPicker.pick(t.files)
                 val detail = mutableListOf(humanBytes(t.size))
@@ -418,8 +527,8 @@ class TorBoxActivity : Activity() {
     }
 
     private fun showTorrent(c: TorBoxClient, t: TorBoxTorrent, autoplay: Boolean) {
-        // Honour the format filter (e.g. MP3 from an album that ships FLAC + MP3), but don't
-        // come up empty just because the filter doesn't match this torrent.
+        // Honour the format choice (e.g. MP3 from an album that ships FLAC + MP3), but don't
+        // come up empty just because it doesn't match this torrent.
         val pick = AudioPicker.pick(t.files, settings.torboxFormat).takeIf { it.tracks.isNotEmpty() }
             ?: AudioPicker.pick(t.files)
         list.removeAllViews()
@@ -451,6 +560,9 @@ class TorBoxActivity : Activity() {
         if (autoplay) play(tracks, 0, t.name)
     }
 
+    // ---------------------------------------------------------------------------------
+    // Playback
+
     private fun play(tracks: List<FilePlayer.Track>, index: Int, title: String) {
         EngineState.playerMessage = null
         FilePlayer.get(this).play(tracks, index, title)
@@ -478,27 +590,34 @@ class TorBoxActivity : Activity() {
     private fun describe(e: Throwable): String {
         val detail = "\n\nDetail: ${e.message ?: e.javaClass.simpleName}" +
             (e.cause?.let { "\nCause: ${it.javaClass.simpleName}: ${it.message}" } ?: "")
-        val isSearch = e.message?.contains("search-api") == true
         return when {
-            e is TorBoxException && e.isAuthError && isSearch ->
-                // The main API accepted the key (playback/library work), so don't ask to re-enter it.
-                "TorBox search refused the API key. Search needs a paid TorBox plan; " +
-                    "My TorBox and playback work without it.$detail"
+            e is AddonException && (e.status == 401 || e.status == 403) -> {
+                refreshAddonUi(editing = true)
+                "The addon refused this link. Copy a fresh install link from Nebula.$detail"
+            }
+            e is AddonException && e.status == 404 -> "The addon doesn't have that.$detail"
+            e is AddonException && e.status == 0 -> "Can't reach the addon. Check your connection or VPN.$detail"
+            e is AddonException -> "Addon error.$detail"
             e is TorBoxException && e.isAuthError -> {
                 refreshKeyUi(editing = true)
                 "TorBox rejected the API key. Check it and save again.$detail"
             }
             e is TorBoxException && e.isRateLimited -> "TorBox rate limit hit — wait a minute and try again.$detail"
-            e is TorBoxException && e.code == "TIMEOUT" ->
-                "TorBox ${if (isSearch) "search" else "API"} timed out. Try again.$detail"
-            e is TorBoxException && e.status == 0 ->
-                "Can't reach TorBox ${if (isSearch) "search" else "API"}. Check your connection or VPN.$detail"
-            else -> "TorBox error.$detail"
+            e is TorBoxException && e.code == "TIMEOUT" -> "TorBox timed out. Try again.$detail"
+            e is TorBoxException && e.status == 0 -> "Can't reach TorBox. Check your connection or VPN.$detail"
+            else -> "Error.$detail"
         }
     }
 
     private fun setStatus(text: String) {
         statusText.text = text
+    }
+
+    private fun sectionLabel(text: String) = TextView(this).apply {
+        this.text = text
+        textSize = 16f
+        setTypeface(typeface, Typeface.BOLD)
+        setPadding(0, dp(12), 0, dp(4))
     }
 
     private fun row(title: String, detail: String, onClick: () -> Unit): View = LinearLayout(this).apply {
@@ -515,7 +634,7 @@ class TorBoxActivity : Activity() {
             maxLines = 3
             ellipsize = TextUtils.TruncateAt.END
         })
-        addView(TextView(context).apply {
+        if (detail.isNotBlank()) addView(TextView(context).apply {
             text = detail
             textSize = 12f
             alpha = 0.7f
@@ -543,6 +662,8 @@ class TorBoxActivity : Activity() {
 
     companion object {
         private const val POLL_MS = 3000L
+        private const val MAX_ALBUMS = 10
+        private const val MAX_TRACKS = 50
 
         fun humanBytes(bytes: Long): String {
             if (bytes <= 0) return "?"

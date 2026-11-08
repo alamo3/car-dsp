@@ -93,6 +93,19 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_TORBOX_CACHED_ONLY, false)
         set(v) = prefs.edit().putBoolean(KEY_TORBOX_CACHED_ONLY, v).apply()
 
+    /**
+     * Eclipse addon install link (e.g. Nebula). It embeds the user's TorBox key, so it's kept
+     * in app-private prefs and only its host is ever shown.
+     */
+    var addonLink: String
+        get() = prefs.getString(KEY_ADDON_LINK, "") ?: ""
+        set(v) = prefs.edit().putString(KEY_ADDON_LINK, v.trim()).apply()
+
+    /** Display name from the addon's manifest, e.g. "Nebula". */
+    var addonName: String
+        get() = prefs.getString(KEY_ADDON_NAME, "") ?: ""
+        set(v) = prefs.edit().putString(KEY_ADDON_NAME, v).apply()
+
     /** Format filter for TorBox search and track picking (AudioPicker.FormatFilter name). */
     var torboxFormat: dev.alamo3.cabineq.torbox.AudioPicker.FormatFilter
         get() = runCatching {
@@ -126,6 +139,8 @@ class Settings(context: Context) {
         const val KEY_TORBOX_KEY = "torbox_api_key"
         const val KEY_TORBOX_CACHED_ONLY = "torbox_cached_only"
         const val KEY_TORBOX_FORMAT = "torbox_format"
+        const val KEY_ADDON_LINK = "addon_link"
+        const val KEY_ADDON_NAME = "addon_name"
         fun bandKey(i: Int) = "band_$i"
     }
 }

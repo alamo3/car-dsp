@@ -67,15 +67,15 @@ data class SearchResult(
 )
 
 /**
- * Blocking client for the TorBox Main API (torrents) and Search API. Call off the main thread.
+ * Blocking client for the TorBox Main API (torrents). Call off the main thread.
  *
- * Main API:   https://api.torbox.app/v1 + /api/torrents/...  (Bearer auth)
- * Search API: https://search-api.torbox.app                   (Bearer auth)
+ * Main API: https://api.torbox.app/v1 + /api/torrents/...  (Bearer auth)
+ * TorBox retired its search API (search-api.torbox.app no longer resolves) and the main API
+ * has no search endpoint; music search goes through an Eclipse addon instead (EclipseAddon).
  */
 class TorBoxClient(
     apiKey: String,
     private val baseUrl: String = API_BASE,
-    private val searchBaseUrl: String = SEARCH_BASE,
 ) {
     private val apiKey = apiKey.trim()
 
@@ -192,25 +192,6 @@ class TorBoxClient(
         return out
     }
 
-    // ---------------------------------------------------------------- search
-
-    /**
-     * Keyword search through TorBox's search engine.
-     * GET https://search-api.torbox.app/torrents/search/{query}?check_cache=true
-     */
-    fun search(query: String, checkCache: Boolean = true): List<SearchResult> {
-        val path = URLEncoder.encode(query.trim(), "UTF-8").replace("+", "%20")
-        val q = buildQuery("metadata" to false, "check_cache" to checkCache)
-        val data = request("GET", "$searchBaseUrl/torrents/search/$path$q")
-        val arr = when (data) {
-            is JSONObject -> data.optJSONArray("torrents") ?: JSONArray()
-            is JSONArray -> data
-            else -> JSONArray()
-        }
-        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let(::parseSearchResult) }
-            .distinctBy { it.hash.lowercase() }
-    }
-
     // ---------------------------------------------------------------- core
 
     /**
@@ -308,23 +289,6 @@ class TorBoxClient(
         }
     }
 
-    private fun parseSearchResult(o: JSONObject): SearchResult? {
-        val magnet0 = o.optStringOrNull("magnet")
-        val hash = o.optStringOrNull("hash") ?: magnet0?.let(::hashFromMagnet) ?: return null
-        val title = o.optStringOrNull("raw_title") ?: o.optStringOrNull("title") ?: o.optStringOrNull("name") ?: hash
-        val magnet = magnet0 ?: "magnet:?xt=urn:btih:$hash&dn=${URLEncoder.encode(title, "UTF-8")}"
-        val cached = if (o.has("cached") && !o.isNull("cached")) o.optBoolean("cached") else null
-        return SearchResult(
-            hash = hash,
-            title = title,
-            magnet = magnet,
-            size = o.optLong("size", 0L),
-            seeders = if (o.has("last_known_seeders")) o.optInt("last_known_seeders", 0) else o.optInt("seeders", 0),
-            cached = cached,
-            tracker = o.optStringOrNull("tracker"),
-        )
-    }
-
     enum class Seed(val apiValue: Int) { AUTO(1), SEED(2), NONE(3) }
 
     /** Minimal multipart/form-data builder. */
@@ -358,7 +322,6 @@ class TorBoxClient(
 
     companion object {
         const val API_BASE = "https://api.torbox.app/v1"
-        const val SEARCH_BASE = "https://search-api.torbox.app"
         private const val USER_AGENT = "CabinEQ"
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val READ_TIMEOUT_MS = 30_000

@@ -99,7 +99,7 @@ class MainActivity : Activity() {
         }
         root.addView(startStopButton)
         root.addView(Button(this).apply {
-            text = "TorBox — search & play through the EQ"
+            text = "Music — search & play through the EQ"
             minHeight = dp(48)
             setOnClickListener { startActivity(Intent(this@MainActivity, TorBoxActivity::class.java)) }
         })

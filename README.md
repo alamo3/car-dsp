@@ -33,40 +33,35 @@ signal). Filters are designed in Kotlin (`EqDesign.kt`, RBJ cookbook) and run in
   RootlessJamesDSP. Our output allows capture by system components, so Android Auto can
   carry it to the car. A toggle under Testing allows speaker output on purpose.
 
-### TorBox player (search → stream → native EQ)
+### Music player (Nebula / TorBox → native EQ)
 
-"TorBox — search & play" on the main screen opens a player that streams audio straight from
-your TorBox account through the same C++ engine:
+"Music — search & play" on the main screen opens a player that streams audio straight through
+the same C++ engine:
 
-TorBox HTTPS link → `MediaExtractor`/`MediaCodec` decode → stereo float → **C++ engine** →
+HTTPS audio link → `MediaExtractor`/`MediaCodec` decode → stereo float → **C++ engine** →
 AudioTrack. No playback capture and no screen-capture prompt: the engine gets the decoded
 source samples, at the file's own sample rate (44.1/48/96 kHz), with float decoding so 24-bit
 sources stay 24-bit. Consecutive tracks at the same rate share one AudioTrack (gapless).
 
-- **Filter by real file type.** For results TorBox has cached, the app asks
-  `/api/torrents/checkcached?list_files=true` for the actual file list and keeps a result only if it
-  contains playable audio — shown as e.g. "✓ 12 FLAC + 12 MP3". The format buttons (Any audio /
-  Lossless / FLAC / MP3) filter on those files, and the track picker then uses that format.
-  Uncached torrents have no file list yet, so for those the title is used instead:
-- **Audio only.** Search results whose titles mark them as video (resolutions like 1080p, x264/HEVC,
-  BluRay/WEB-DL, S01E02, .mkv …) are dropped, even if they mention FLAC (concert videos). Titles with
-  audio markers (FLAC, MP3, kbps, album, discography, soundtrack …) come first, then ambiguous ones;
-  within each group: cached, lossless, seeders. "Cached only" hides anything TorBox would have to
-  download first.
-- **My TorBox** lists the audio torrents already on your account (`/api/torrents/mylist`); finished
-  torrents that only contain video are hidden.
-- Tapping a result adds it (`/api/torrents/createtorrent`, falls back to finding it by hash if it's
-  already there), waits until TorBox has it, then **auto-selects the tracks**: lossless (FLAC/WAV)
-  if present, otherwise the most common lossy format; junk (samples, `__MACOSX`, tiny files) is
-  dropped; tracks are naturally sorted by path so multi-disc albums play in order. APE, WavPack,
-  AIFF and DSD files are skipped — Android can't decode them.
-- Download links (`/api/torrents/requestdl`) are fetched per track just before it plays, since
-  they expire.
+- **Search** goes through an [Eclipse addon](https://eclipsemusic.app/docs) such as **Nebula**:
+  paste the same install link you use in Eclipse (Settings → Connections). Results are songs and
+  albums from Apple Music's catalog, so there is no video. When a song plays, the addon finds it
+  on TorBox and returns a direct audio link; while TorBox is still caching it, the addon answers
+  "not ready" and the player shows its progress and retries. The link carries your TorBox key, so
+  the app hides it and only ever shows the host.
+  TorBox's own search API is gone (`search-api.torbox.app` no longer resolves, and the main API
+  has no search endpoint), which is why search goes through the addon.
+- **My TorBox library** lists torrents already on your account (`/api/torrents/mylist`); video-only
+  ones are hidden. Opening one **auto-selects the tracks**: lossless (FLAC/WAV) if present,
+  otherwise the most common lossy format (or the format you pick under "Library format"); junk
+  (samples, `__MACOSX`, tiny files) is dropped; tracks are naturally sorted by path so multi-disc
+  albums play in order. APE, WavPack, AIFF and DSD are skipped — Android can't decode them.
+- **Magnet links** pasted into the search box are added to TorBox (`/api/torrents/createtorrent`),
+  then played once TorBox has them.
 - Playback gets the live EQ, preamp, limiter and speed compensation, a MediaSession (steering-wheel
   / Bluetooth next/prev), notification controls and audio focus (pauses for calls, ducks for
   navigation). Same speaker safety as DSP: it pauses if the output lands on the phone speaker,
   unless allowed under Testing.
-- Get your API key from TorBox → Settings → API and paste it at the top of the TorBox screen.
 
 Roadmap:
 - 3b: de-clicker and content-aware dynamic EQ in the C++ engine

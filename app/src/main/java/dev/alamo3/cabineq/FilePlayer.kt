@@ -56,11 +56,28 @@ class FilePlayer private constructor(private val context: Context) {
         private set
     @Volatile var lastError: String? = null
         private set
+    /** Transient status from the track source, e.g. "Waiting on TorBox: caching" (cleared on play). */
+    @Volatile var note: String? = null
+        private set
+
+    /** Called from a [Track.resolveUrl] while it waits on its source. */
+    fun setNote(text: String?) {
+        note = text
+        version++
+    }
+
     /** Bumped on every track / state change so observers (MediaSession, UI) can update cheaply. */
     @Volatile var version = 0
         private set
 
     val currentTitle: String? get() = queue.getOrNull(currentIndex)?.title
+
+    /**
+     * Identifies the current queue/skip. A [Track.resolveUrl] that waits (e.g. on TorBox caching)
+     * captures it at start and gives up once [isStale] says playback moved on.
+     */
+    val ticket: Int get() = generation * 100_000 + (if (jumpTo >= 0) -1 else currentIndex)
+    fun isStale(ticket: Int): Boolean = ticket != this.ticket
     val isActive: Boolean get() = state == State.LOADING || state == State.PLAYING || state == State.PAUSED
 
     private val audioManager = context.getSystemService(AudioManager::class.java)
@@ -304,6 +321,7 @@ class FilePlayer private constructor(private val context: Context) {
             try {
                 while (live && index in queue.indices) {
                     currentIndex = index
+                    note = null
                     positionMs = 0
                     durationMs = 0
                     formatInfo = null
@@ -313,6 +331,15 @@ class FilePlayer private constructor(private val context: Context) {
                     } catch (e: Exception) {
                         Log.e(TAG, "Track ${queue.getOrNull(index)?.title} failed", e)
                         Outcome.Failed(e.message ?: e.javaClass.simpleName)
+                    }
+                    // A skip that arrived while the source was still resolving cancels that
+                    // track (it fails with "cancelled"); follow the skip, not the failure.
+                    val pendingJump = jumpTo
+                    if (pendingJump >= 0 && outcome !is Outcome.Jump && outcome !is Outcome.Cancelled) {
+                        jumpTo = -1
+                        consecutiveFailures = 0
+                        index = pendingJump
+                        continue
                     }
                     when (outcome) {
                         Outcome.Finished -> { consecutiveFailures = 0; index++ }
@@ -363,6 +390,7 @@ class FilePlayer private constructor(private val context: Context) {
         private fun playTrack(item: Track): Outcome {
             val url = item.resolveUrl()
             if (!live) return Outcome.Cancelled
+            note = null
 
             val extractor = MediaExtractor()
             var codec: MediaCodec? = null
