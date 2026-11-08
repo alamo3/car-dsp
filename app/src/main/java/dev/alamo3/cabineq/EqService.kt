@@ -207,18 +207,16 @@ class EqService : Service() {
         SpeedCompensator.bandBoosts(amount, settings.speedMaxBoostDb, speedBoosts)
 
         // --- Targets -----------------------------------------------------------------
-        var maxUserBoost = 0f
         var maxSpeedBoost = 0f
         for (i in 0 until Bands.COUNT) {
             val user = settings.bandGain(i)
-            maxUserBoost = max(maxUserBoost, user)
             maxSpeedBoost = max(maxSpeedBoost, speedBoosts[i])
             targetBands[i] = (user + speedBoosts[i]).coerceIn(-MAX_TOTAL_DB, MAX_TOTAL_DB)
         }
-        // Headroom: fully offset static EQ boosts so they can't clip, but only offset half
-        // of the speed boost — the point of speed compensation is to get louder, and the
-        // limiter catches the remaining peaks.
-        val targetInput = settings.preampDb - maxUserBoost - HEADROOM_SHARE_FOR_SPEED * maxSpeedBoost
+        // Headroom: the preamp (auto = recommended, or the user's manual value) covers the
+        // static EQ. Only half of the speed boost is offset — the point of speed
+        // compensation is to get louder, and the limiter catches the remaining peaks.
+        val targetInput = settings.effectivePreampDb() - HEADROOM_SHARE_FOR_SPEED * maxSpeedBoost
 
         // --- Slew-limited ramp -------------------------------------------------------
         if (!initialised) {

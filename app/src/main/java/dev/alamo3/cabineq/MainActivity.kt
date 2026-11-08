@@ -35,6 +35,9 @@ class MainActivity : Activity() {
     private lateinit var startStopButton: Button
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var eqView: EqView
+    private lateinit var preampBar: SeekBar
+    private lateinit var preampHint: TextView
+    private lateinit var useRecommendedButton: Button
     private lateinit var updateText: TextView
     private lateinit var updateButton: Button
     private var pendingRelease: Updater.Release? = null
@@ -91,7 +94,10 @@ class MainActivity : Activity() {
         root.addView(header("Equalizer"))
         eqView = EqView(this).apply {
             setGains(FloatArray(Bands.COUNT) { settings.bandGain(it) })
-            onBandChanged = { band, db -> settings.setBandGain(band, db) }
+            onBandChanged = { band, db ->
+                settings.setBandGain(band, db)
+                refreshPreampUi()
+            }
         }
         root.addView(eqView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(300)))
         root.addView(TextView(this).apply {
@@ -112,10 +118,39 @@ class MainActivity : Activity() {
         }
         root.addView(presetRow)
 
-        slider(
+        // Preamp + recommendation
+        val (bar, _) = slider(
             root, format = { "Preamp  ${signed(it)} dB" },
-            min = -12f, max = 6f, step = 0.5f, initial = settings.preampDb,
-        ) { settings.preampDb = it }
+            min = PREAMP_MIN, max = PREAMP_MAX, step = PREAMP_STEP, initial = settings.effectivePreampDb(),
+        ) {
+            settings.preampDb = it
+            refreshPreampUi()
+        }
+        preampBar = bar
+        preampHint = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, dp(2), 0, dp(4))
+        }
+        root.addView(preampHint)
+        val preampRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        preampRow.addView(switch("Auto preamp", settings.autoPreamp) {
+            if (!it) settings.preampDb = settings.effectivePreampDb()  // start manual from where auto was
+            settings.autoPreamp = it
+            refreshPreampUi()
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        useRecommendedButton = Button(this).apply {
+            text = "Use recommended"
+            setOnClickListener {
+                settings.preampDb = Bands.recommendedPreamp(settings.bandGains())
+                refreshPreampUi()
+            }
+        }
+        preampRow.addView(useRecommendedButton)
+        root.addView(preampRow)
+        refreshPreampUi()
 
         // --- Status ---
         root.addView(header("Status"))
@@ -176,6 +211,31 @@ class MainActivity : Activity() {
     private fun applyPreset(values: FloatArray) {
         for (i in 0 until Bands.COUNT) settings.setBandGain(i, values[i])
         eqView.setGains(values)
+        refreshPreampUi()
+    }
+
+    /** Updates the preamp slider, recommendation text and controls from current settings. */
+    private fun refreshPreampUi() {
+        val gains = settings.bandGains()
+        val rec = Bands.recommendedPreamp(gains)
+        val peak = (gains.maxOrNull() ?: 0f).coerceAtLeast(0f)
+        val auto = settings.autoPreamp
+        val current = settings.effectivePreampDb()
+
+        // Setting progress programmatically doesn't count as fromUser, so it won't write prefs.
+        preampBar.progress = ((current.coerceIn(PREAMP_MIN, PREAMP_MAX) - PREAMP_MIN) / PREAMP_STEP).roundToInt()
+        preampBar.isEnabled = !auto
+        useRecommendedButton.visibility = if (auto) View.GONE else View.VISIBLE
+
+        val why = if (peak > 0f) "offsets your largest boost (+${fmt(peak)} dB)" else "no boosts, so no cut needed"
+        preampHint.text = when {
+            auto -> "Auto: following recommended ${signed(rec)} dB — $why"
+            current > rec + 0.01f ->
+                "Recommended ${signed(rec)} dB — $why.\n⚠ ${fmt(current - rec)} dB above it: loud passages will hit the limiter or crackle."
+            current < rec - 0.01f ->
+                "Recommended ${signed(rec)} dB — $why. You're ${fmt(rec - current)} dB below it (safe, just quieter)."
+            else -> "At recommended ${signed(rec)} dB — $why"
+        }
     }
 
     private fun header(text: String) = TextView(this).apply {
@@ -385,6 +445,10 @@ class MainActivity : Activity() {
     private fun signed(v: Float) = String.format(Locale.US, "%+.1f", v)
 
     companion object {
+        private const val PREAMP_MIN = -12f
+        private const val PREAMP_MAX = 6f
+        private const val PREAMP_STEP = 0.5f
+
         // 31, 63, 125, 250, 500, 1k, 2k, 4k, 8k, 16k
         private val PRESETS = listOf(
             "Flat" to FloatArray(Bands.COUNT),

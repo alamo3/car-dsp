@@ -15,6 +15,16 @@ class Settings(context: Context) {
         get() = prefs.getFloat(KEY_PREAMP, 0f)
         set(v) = prefs.edit().putFloat(KEY_PREAMP, v).apply()
 
+    /** When on, the preamp follows [Bands.recommendedPreamp] instead of [preampDb]. */
+    var autoPreamp: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_PREAMP, true)
+        set(v) = prefs.edit().putBoolean(KEY_AUTO_PREAMP, v).apply()
+
+    fun bandGains(): FloatArray = FloatArray(Bands.COUNT) { bandGain(it) }
+
+    fun effectivePreampDb(): Float =
+        if (autoPreamp) Bands.recommendedPreamp(bandGains()) else preampDb
+
     var globalMode: Boolean
         get() = prefs.getBoolean(KEY_GLOBAL, false)
         set(v) = prefs.edit().putBoolean(KEY_GLOBAL, v).apply()
@@ -58,6 +68,7 @@ class Settings(context: Context) {
         const val PREFS_NAME = "cabin_eq"
         const val KEY_PREAMP = "preamp_db"
         const val KEY_GLOBAL = "global_mode"
+        const val KEY_AUTO_PREAMP = "auto_preamp"
         const val KEY_SPEED_ON = "speed_on"
         const val KEY_SPEED_MAX = "speed_max_db"
         const val KEY_SPEED_START = "speed_start_kmh"

@@ -6,8 +6,10 @@ An Android EQ built for the car: a static EQ, speed-dependent compensation, and
 ## Status: milestone 1
 
 - 10-band EQ (31 Hz–16 kHz) + preamp, applied with `DynamicsProcessing`
-- Output limiter at −1 dBFS, plus automatic headroom so EQ boosts don't clip (clipping is
-  the most common source of crackle)
+- Output limiter at −1 dBFS, and a **preamp recommendation** that cuts by your largest EQ
+  boost so the EQ can't clip (clipping is the most common source of crackle). Auto preamp
+  (on by default) keeps it at the recommended value; turn it off to set the preamp yourself,
+  and the app warns you if it's above the recommendation.
 - **Speed compensation** from GPS. It boosts mainly the lows and low-mids, where EV road and
   tyre noise sits, with a smoothstep ramp between a start speed and a full speed. Speed is
   smoothed (τ = 3 s) and the gain changes are slew-limited, so the adjustments can't be heard.

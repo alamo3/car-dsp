@@ -1,5 +1,6 @@
 package dev.alamo3.cabineq
 
+import kotlin.math.ceil
 import kotlin.math.sqrt
 
 /**
@@ -27,6 +28,16 @@ object Bands {
     val SPEED_WEIGHTS = floatArrayOf(1.0f, 1.0f, 0.9f, 0.7f, 0.45f, 0.25f, 0.15f, 0.15f, 0.2f, 0.2f)
 
     const val MAX_BAND_DB = 12f
+
+    /**
+     * Preamp that keeps the EQ from clipping: cut by the largest boost, rounded up to 0.5 dB.
+     * DynamicsProcessing bands split the spectrum rather than overlapping like peaking
+     * filters, so the response never exceeds the largest single band gain.
+     */
+    fun recommendedPreamp(gains: FloatArray): Float {
+        val peak = (gains.maxOrNull() ?: 0f).coerceAtLeast(0f)
+        return -(ceil(peak * 2f) / 2f)
+    }
 
     fun label(i: Int): String {
         val f = CENTERS[i]
