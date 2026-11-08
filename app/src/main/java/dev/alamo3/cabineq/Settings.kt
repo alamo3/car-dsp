@@ -83,6 +83,16 @@ class Settings(context: Context) {
         get() = prefs.getFloat(KEY_SIM_KMH, 0f)
         set(v) = prefs.edit().putFloat(KEY_SIM_KMH, v).apply()
 
+    /** TorBox API key (TorBox dashboard → Settings → API). Stored in app-private prefs. */
+    var torboxApiKey: String
+        get() = prefs.getString(KEY_TORBOX_KEY, "") ?: ""
+        set(v) = prefs.edit().putString(KEY_TORBOX_KEY, v.trim()).apply()
+
+    /** Only show search results TorBox already has cached (instant playback). */
+    var torboxCachedOnly: Boolean
+        get() = prefs.getBoolean(KEY_TORBOX_CACHED_ONLY, false)
+        set(v) = prefs.edit().putBoolean(KEY_TORBOX_CACHED_ONLY, v).apply()
+
     fun resetEq() {
         val e = prefs.edit()
         for (i in 0 until Bands.COUNT) e.putFloat(bandKey(i), 0f)
@@ -106,6 +116,8 @@ class Settings(context: Context) {
         const val KEY_SPEED_FULL = "speed_full_kmh"
         const val KEY_SIM_ON = "sim_on"
         const val KEY_SIM_KMH = "sim_kmh"
+        const val KEY_TORBOX_KEY = "torbox_api_key"
+        const val KEY_TORBOX_CACHED_ONLY = "torbox_cached_only"
         fun bandKey(i: Int) = "band_$i"
     }
 }

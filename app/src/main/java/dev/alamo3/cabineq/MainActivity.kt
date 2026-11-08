@@ -93,6 +93,11 @@ class MainActivity : Activity() {
             setOnClickListener { toggleService() }
         }
         root.addView(startStopButton)
+        root.addView(Button(this).apply {
+            text = "TorBox — search & play through the EQ"
+            minHeight = dp(48)
+            setOnClickListener { startActivity(Intent(this@MainActivity, TorBoxActivity::class.java)) }
+        })
 
         // --- EQ ---
         root.addView(header("Equalizer"))
@@ -359,6 +364,11 @@ class MainActivity : Activity() {
                 sb.append("DSP: off")
             }
             s.dspMessage?.let { sb.append("\n⚠ ").append(it) }
+            FilePlayer.peek()?.takeIf { it.isActive }?.let { p ->
+                sb.append("\nPlayer: ${p.state.name.lowercase(Locale.US)} — ${p.currentTitle ?: "?"}")
+                p.formatInfo?.let { sb.append(" [").append(it).append(']') }
+                s.playerRoute?.let { sb.append(" → ").append(it) }
+            }
         }
         statusText.text = sb.toString()
         statusText.gravity = Gravity.START

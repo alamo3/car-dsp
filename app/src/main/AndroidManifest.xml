@@ -29,6 +29,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".TorBoxActivity"
+            android:exported="false"
+            android:label="TorBox"
+            android:parentActivityName=".MainActivity"
+            android:windowSoftInputMode="adjustResize" />
+
         <service
             android:name=".EqService"
             android:exported="false"

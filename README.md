@@ -33,6 +33,32 @@ signal). Filters are designed in Kotlin (`EqDesign.kt`, RBJ cookbook) and run in
   RootlessJamesDSP. Our output allows capture by system components, so Android Auto can
   carry it to the car. A toggle under Testing allows speaker output on purpose.
 
+### TorBox player (search → stream → native EQ)
+
+"TorBox — search & play" on the main screen opens a player that streams audio straight from
+your TorBox account through the same C++ engine:
+
+TorBox HTTPS link → `MediaExtractor`/`MediaCodec` decode → stereo float → **C++ engine** →
+AudioTrack. No playback capture and no screen-capture prompt: the engine gets the decoded
+source samples, at the file's own sample rate (44.1/48/96 kHz), with float decoding so 24-bit
+sources stay 24-bit. Consecutive tracks at the same rate share one AudioTrack (gapless).
+
+- **Search** uses TorBox's search engine; results are ranked cached-first, then lossless-looking
+  titles, then seeders. "Cached only" hides anything TorBox would have to download first.
+- **My TorBox** lists the torrents already on your account (`/api/torrents/mylist`).
+- Tapping a result adds it (`/api/torrents/createtorrent`, falls back to finding it by hash if it's
+  already there), waits until TorBox has it, then **auto-selects the tracks**: lossless (FLAC/WAV)
+  if present, otherwise the most common lossy format; junk (samples, `__MACOSX`, tiny files) is
+  dropped; tracks are naturally sorted by path so multi-disc albums play in order. APE, WavPack,
+  AIFF and DSD files are skipped — Android can't decode them.
+- Download links (`/api/torrents/requestdl`) are fetched per track just before it plays, since
+  they expire.
+- Playback gets the live EQ, preamp, limiter and speed compensation, a MediaSession (steering-wheel
+  / Bluetooth next/prev), notification controls and audio focus (pauses for calls, ducks for
+  navigation). Same speaker safety as DSP: it pauses if the output lands on the phone speaker,
+  unless allowed under Testing.
+- Get your API key from TorBox → Settings → API and paste it at the top of the TorBox screen.
+
 Roadmap:
 - 3b: de-clicker and content-aware dynamic EQ in the C++ engine
 - 2: cabin measurement (sine sweep, multi-position averaging, correction curve)

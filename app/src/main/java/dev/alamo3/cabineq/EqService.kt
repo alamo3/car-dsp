@@ -20,7 +20,10 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.MediaMetadata
 import android.media.audiofx.AudioEffect
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
@@ -45,6 +48,10 @@ import kotlin.math.pow
  *    routing problem.
  *
  * Both paths get the same EQ + speed compensation, recomputed and slew-limited at 10 Hz.
+ *
+ * A third consumer of that EQ is the in-app [FilePlayer] (TorBox streams): it decodes files
+ * itself and runs them through its own native engine, so it needs no capture at all. The
+ * service gives it a MediaSession (steering-wheel / Bluetooth controls) and notification controls.
  */
 class EqService : Service() {
 
@@ -75,6 +82,12 @@ class EqService : Service() {
     private var lastGpsFixElapsed = 0L
     private var speakerSince = 0L
     private var stoppedForProjection = false
+
+    // In-app file player (TorBox)
+    private var mediaSession: MediaSession? = null
+    private var lastPlayerVersion = -1
+    private var lastPlayerActive = false
+    private var playerSpeakerSince = 0L
 
     private val sessionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -150,6 +163,23 @@ class EqService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        // Notification media buttons. Only meaningful while we're already running.
+        val action = intent?.action
+        when (action) {
+            ACTION_PLAYER_PREV, ACTION_PLAYER_TOGGLE, ACTION_PLAYER_NEXT -> {
+                if (!EngineState.running) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                val player = FilePlayer.get(this)
+                when (action) {
+                    ACTION_PLAYER_PREV -> player.previous()
+                    ACTION_PLAYER_TOGGLE -> player.togglePause()
+                    ACTION_PLAYER_NEXT -> player.next()
+                }
+                return START_NOT_STICKY
+            }
+        }
 
         val resultCode = intent?.getIntExtra(EXTRA_PROJECTION_CODE, Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
         val resultData: Intent? = intent?.let {
@@ -166,6 +196,7 @@ class EqService : Service() {
         if (wantsDsp || projection != null) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
         startForeground(NOTIF_ID, buildNotification(), type)
 
+        val wasRunning = EngineState.running
         if (!EngineState.running) {
             val filter = IntentFilter().apply {
                 addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
@@ -176,6 +207,15 @@ class EqService : Service() {
             if (hasLocation) startLocation()
             EngineState.running = true
             handler.post(ticker)
+        }
+
+        if (intent?.action == ACTION_PLAYER_ATTACH) {
+            ensureMediaSession()
+            if (wasRunning) {
+                // The player was just started; the EQ/DSP side is already set up.
+                applyGlobalMode()
+                return START_NOT_STICKY
+            }
         }
 
         if (wantsDsp && capture == null) {
@@ -201,6 +241,9 @@ class EqService : Service() {
         projection?.unregisterCallback(projectionCallback)
         projection?.stop()
         projection = null
+        FilePlayer.peek()?.stop()
+        mediaSession?.release()
+        mediaSession = null
         muter.unmuteAll()
         effects.releaseAll()
         sessionPackages.clear()
@@ -294,8 +337,9 @@ class EqService : Service() {
     }
 
     private fun applyGlobalMode() {
-        // With DSP running, an effect on the global mix would also hit our own output.
-        if (settings.globalMode && !dspRunning()) {
+        // With DSP or the file player running, an effect on the global mix would also hit
+        // our own output and EQ it twice.
+        if (settings.globalMode && !dspRunning() && FilePlayer.peek()?.isActive != true) {
             if (effects.attach(GLOBAL_SESSION)) sessionPackages[GLOBAL_SESSION] = "global mix (session 0)"
         } else {
             effects.detach(GLOBAL_SESSION)
@@ -358,6 +402,12 @@ class EqService : Service() {
 
         // Android EQ path (sessions not on DSP)
         effects.apply(currentBands, currentInputGain)
+
+        // In-app file player (TorBox)
+        FilePlayer.peek()?.let { player ->
+            player.setEq(currentBands, currentInputGain, LIMITER_THRESHOLD_LIN)
+            tickPlayer(player)
+        }
 
         // DSP path
         capture?.let { engine ->
@@ -427,12 +477,94 @@ class EqService : Service() {
         val dspPackages = muter.sessionIds.mapNotNull { sessionPackages[it] }.toSet()
         if (dspPackages.isNotEmpty() && engine.outputPaused &&
             nowMs - engine.lastSignalAt > BLOCKED_SILENCE_MS &&
-            audioManager.isMusicActive
+            audioManager.isMusicActive &&
+            FilePlayer.peek()?.isActive != true  // our own player also makes isMusicActive true
         ) {
             Log.w(TAG, "Capture silent while media is active; marking blocked: $dspPackages")
             settings.markCaptureBlocked(dspPackages)  // triggers rerouteAllSessions via prefs listener
             EngineState.dspMessage = "${dspPackages.joinToString()} blocks audio capture — using Android EQ for it"
         }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // File player
+
+    private fun tickPlayer(player: FilePlayer) {
+        val nowMs = SystemClock.elapsedRealtime()
+        val active = player.isActive
+        if (active != lastPlayerActive) {
+            lastPlayerActive = active
+            applyGlobalMode()
+        }
+
+        // Same speaker safety as the DSP path, but pause instead of falling back.
+        if (!settings.allowSpeakerOutput && player.isRoutedToPhoneSpeaker()) {
+            if (playerSpeakerSince == 0L) playerSpeakerSince = nowMs
+            if (nowMs - playerSpeakerSince > SPEAKER_GRACE_MS) {
+                playerSpeakerSince = 0L
+                player.pause()
+                EngineState.playerMessage = "Player paused: output went to the phone speaker. " +
+                    "(Allow it under Testing if that's intended.)"
+            }
+        } else {
+            playerSpeakerSince = 0L
+            if (player.state == FilePlayer.State.PLAYING) EngineState.playerMessage = null
+        }
+
+        player.readMeters()?.let { m ->
+            EngineState.playerOutPeakDb = toDb(m[1])
+            EngineState.playerLimiterDb = toDb(m[2])
+        }
+        EngineState.playerRoute = player.routedDeviceType()?.let { deviceName(it) }
+
+        if (player.version != lastPlayerVersion) {
+            lastPlayerVersion = player.version
+            updateMediaSession(player)
+            updateNotification()
+        }
+    }
+
+    private fun ensureMediaSession(): MediaSession {
+        mediaSession?.let { return it }
+        val session = MediaSession(this, "CabinEQ")
+        session.setCallback(object : MediaSession.Callback() {
+            override fun onPlay() = FilePlayer.get(this@EqService).resume()
+            override fun onPause() = FilePlayer.get(this@EqService).pause()
+            override fun onSkipToNext() = FilePlayer.get(this@EqService).next()
+            override fun onSkipToPrevious() = FilePlayer.get(this@EqService).previous()
+            override fun onStop() = FilePlayer.get(this@EqService).stop()
+        })
+        session.isActive = true
+        mediaSession = session
+        lastPlayerVersion = -1  // force a state push on the next tick
+        return session
+    }
+
+    private fun updateMediaSession(player: FilePlayer) {
+        val session = mediaSession ?: return
+        val state = when (player.state) {
+            FilePlayer.State.PLAYING -> PlaybackState.STATE_PLAYING
+            FilePlayer.State.PAUSED -> PlaybackState.STATE_PAUSED
+            FilePlayer.State.LOADING -> PlaybackState.STATE_BUFFERING
+            FilePlayer.State.ERROR -> PlaybackState.STATE_ERROR
+            FilePlayer.State.IDLE -> PlaybackState.STATE_STOPPED
+        }
+        val playback = PlaybackState.Builder()
+            .setActions(
+                PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
+                    PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_STOP
+            )
+            .setState(state, player.positionMs, if (state == PlaybackState.STATE_PLAYING) 1f else 0f)
+        if (state == PlaybackState.STATE_ERROR) playback.setErrorMessage(player.lastError ?: "Playback error")
+        session.setPlaybackState(playback.build())
+        session.setMetadata(
+            MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, player.currentTitle ?: "")
+                .putString(MediaMetadata.METADATA_KEY_ALBUM, player.queueTitle ?: "")
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, player.formatInfo ?: "CabinEQ")
+                .putLong(MediaMetadata.METADATA_KEY_DURATION, player.durationMs)
+                .build()
+        )
     }
 
     private fun slew(current: Float, target: Float): Float {
@@ -468,19 +600,42 @@ class EqService : Service() {
         val stop = PendingIntent.getService(
             this, 1, Intent(this, EqService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE
         )
-        return Notification.Builder(this, CHANNEL_ID)
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
             .setContentTitle("CabinEQ is running")
             .setContentText(if (capture != null) "Native DSP active" else "Android EQ active")
             .setContentIntent(openApp)
             .setOngoing(true)
-            .addAction(Notification.Action.Builder(null, "Stop", stop).build())
-            .build()
+
+        val player = FilePlayer.peek()
+        val session = mediaSession
+        if (player != null && player.isActive && session != null) {
+            fun action(label: String, action: String, code: Int) = Notification.Action.Builder(
+                null, label,
+                PendingIntent.getService(this, code, Intent(this, EqService::class.java).setAction(action), PendingIntent.FLAG_IMMUTABLE)
+            ).build()
+            builder
+                .setContentTitle(player.currentTitle ?: "CabinEQ player")
+                .setContentText(listOfNotNull(player.queueTitle, player.formatInfo).joinToString(" · "))
+                .addAction(action("Prev", ACTION_PLAYER_PREV, 2))
+                .addAction(action(if (player.state == FilePlayer.State.PAUSED) "Play" else "Pause", ACTION_PLAYER_TOGGLE, 3))
+                .addAction(action("Next", ACTION_PLAYER_NEXT, 4))
+                .addAction(Notification.Action.Builder(null, "Stop", stop).build())
+                .setStyle(Notification.MediaStyle().setMediaSession(session.sessionToken).setShowActionsInCompactView(0, 1, 2))
+        } else {
+            builder.addAction(Notification.Action.Builder(null, "Stop", stop).build())
+        }
+        return builder.build()
     }
 
     companion object {
         private const val TAG = "CabinEQ/Service"
         const val ACTION_STOP = "dev.alamo3.cabineq.STOP"
+        /** Sent when the in-app player starts, so the service runs (EQ updates, MediaSession). */
+        const val ACTION_PLAYER_ATTACH = "dev.alamo3.cabineq.PLAYER_ATTACH"
+        const val ACTION_PLAYER_PREV = "dev.alamo3.cabineq.PLAYER_PREV"
+        const val ACTION_PLAYER_TOGGLE = "dev.alamo3.cabineq.PLAYER_TOGGLE"
+        const val ACTION_PLAYER_NEXT = "dev.alamo3.cabineq.PLAYER_NEXT"
         const val EXTRA_PROJECTION_CODE = "projection_code"
         const val EXTRA_PROJECTION_DATA = "projection_data"
         private const val CHANNEL_ID = "eq_running"

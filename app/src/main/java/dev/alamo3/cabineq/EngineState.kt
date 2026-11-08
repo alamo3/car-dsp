@@ -25,4 +25,10 @@ object EngineState {
     @Volatile var dspLimiterDb = 0f                   // gain reduction, <= 0
     @Volatile var dspRoute: String? = null
     @Volatile var sessionModes: Map<Int, String> = emptyMap()  // sessionId -> "DSP" / "Android EQ"
+
+    // In-app file player (TorBox). Track/state info lives on FilePlayer itself.
+    @Volatile var playerOutPeakDb = -120f
+    @Volatile var playerLimiterDb = 0f
+    @Volatile var playerRoute: String? = null
+    @Volatile var playerMessage: String? = null
 }
