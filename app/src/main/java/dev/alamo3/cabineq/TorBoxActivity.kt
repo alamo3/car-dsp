@@ -257,21 +257,22 @@ class TorBoxActivity : Activity() {
         val id = ++op
         setStatus("Searching “$query”…")
         list.removeAllViews()
-        background(id, {
-            AudioPicker.rank(c.search(query, checkCache = true))
-        }) { results -> showResults(query, results) }
+        background(id, { c.search(query, checkCache = true) }) { raw -> showResults(query, raw) }
     }
 
-    private fun showResults(query: String, all: List<SearchResult>) {
+    private fun showResults(query: String, raw: List<SearchResult>) {
         list.removeAllViews()
+        val all = AudioPicker.rank(raw)  // drops video releases
+        val hiddenVideo = raw.size - all.size
+        val videoNote = if (hiddenVideo > 0) " ($hiddenVideo video results hidden)" else ""
         val cacheKnown = all.any { it.cached != null }
         val results = if (settings.torboxCachedOnly && cacheKnown) all.filter { it.cached == true } else all
         setStatus(
             when {
-                all.isEmpty() -> "No results for “$query”."
-                results.isEmpty() -> "${all.size} results, none cached. Turn off “Cached only” to see them."
-                settings.torboxCachedOnly && !cacheKnown -> "${results.size} results (TorBox didn't report cache state)."
-                else -> "${results.size} results — tap one to add it and play."
+                all.isEmpty() -> "No audio results for “$query”.$videoNote Try adding “flac” or “album”."
+                results.isEmpty() -> "${all.size} audio results, none cached. Turn off “Cached only” to see them.$videoNote"
+                settings.torboxCachedOnly && !cacheKnown -> "${results.size} audio results (TorBox didn't report cache state).$videoNote"
+                else -> "${results.size} audio results — tap one to add it and play.$videoNote"
             }
         )
         for (r in results) {
@@ -304,9 +305,13 @@ class TorBoxActivity : Activity() {
         val id = ++op
         setStatus("Loading your TorBox torrents…")
         list.removeAllViews()
-        background(id, { c.listTorrents(bypassCache = true) }) { torrents ->
+        background(id, { c.listTorrents(bypassCache = true) }) { everything ->
             list.removeAllViews()
-            setStatus(if (torrents.isEmpty()) "No torrents on your TorBox yet. Search above." else "My TorBox (${torrents.size})")
+            // Audio only: hide finished torrents that are video (video files, no playable audio).
+            val torrents = everything.filterNot { it.isReady && AudioPicker.isVideoTorrent(it.files) }
+            val hidden = everything.size - torrents.size
+            val hiddenNote = if (hidden > 0) " · $hidden video torrents hidden" else ""
+            setStatus(if (torrents.isEmpty()) "No audio torrents on your TorBox yet. Search above.$hiddenNote" else "My TorBox — audio (${torrents.size})$hiddenNote")
             for (t in torrents) {
                 val pick = AudioPicker.pick(t.files)
                 val detail = mutableListOf(humanBytes(t.size))
@@ -343,6 +348,10 @@ class TorBoxActivity : Activity() {
         val pick = AudioPicker.pick(t.files)
         list.removeAllViews()
         if (pick.tracks.isEmpty()) {
+            if (AudioPicker.isVideoTorrent(t.files)) {
+                setStatus("“${t.name}” is a video torrent — CabinEQ only plays audio.")
+                return
+            }
             setStatus(
                 "No playable audio in “${t.name}”." +
                     if (pick.unsupportedCount > 0) " (${pick.unsupportedCount} files in formats Android can't decode, e.g. APE/WavPack/DSD.)" else ""

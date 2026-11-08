@@ -64,21 +64,64 @@ object AudioPicker {
             (f.size in 1 until MIN_TRACK_BYTES)
     }
 
-    // ------------------------------------------------------------------ search ranking
+    // ------------------------------------------------------------------ audio vs video
 
     private val LOSSLESS_TITLE = Regex("""\b(flac|lossless|alac|wav|24[- ]?bit|16[- ]?bit|hi[- ]?res|cd[- ]?rip|web[- ]?flac)\b""", RegexOption.IGNORE_CASE)
-    private val LOSSY_TITLE = Regex("""\b(mp3|320\s?kbps|v0|aac|opus)\b""", RegexOption.IGNORE_CASE)
+    private val LOSSY_TITLE = Regex("""\b(mp3|\d{3}\s?kbps|v0|aac|opus|ogg)\b""", RegexOption.IGNORE_CASE)
+    private val AUDIO_TITLE = Regex(
+        """\b(album|discography|ep|single|ost|soundtrack|vinyl|lp|cd\d?|disc\s?\d|remaster(ed)?|deluxe|kbps|khz|audiobook)\b""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * Video release markers: resolutions, video codecs, video sources, TV episode tags and
+     * video containers. One of these is enough to call a title video, even if it also says
+     * FLAC — "Concert 1080p BluRay FLAC" is a video with a lossless audio track.
+     */
+    private val VIDEO_TITLE = Regex(
+        """\b(\d{3,4}p|4k|uhd|hdr(10)?|dolby[ .]?vision|dv|[xh][ .]?26[45]|hevc|avc|xvid|divx|av1|vp9|""" +
+            """blu[- ]?ray|bdrip|brrip|bdremux|remux|web[- .]?dl|webrip|hdtv|hdrip|dvd(rip|scr|5|9)?|""" +
+            """camrip|hdcam|telesync|s\d{1,2}e\d{1,3}|s\d{1,2}|season\s?\d+|complete series|""" +
+            """mkv|mp4|avi|m2ts|wmv)\b""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    enum class Kind { AUDIO, VIDEO, UNKNOWN }
 
     fun looksLossless(title: String): Boolean = LOSSLESS_TITLE.containsMatchIn(title)
     fun looksLossy(title: String): Boolean = !looksLossless(title) && LOSSY_TITLE.containsMatchIn(title)
 
-    /** Cached first (instant), then lossless-looking titles, then seeders. */
-    fun rank(results: List<SearchResult>): List<SearchResult> = results.sortedWith(
-        compareByDescending<SearchResult> { it.cached == true }
-            .thenByDescending { looksLossless(it.title) }
-            .thenBy { looksLossy(it.title) }
-            .thenByDescending { it.seeders }
-    )
+    /** Classifies a release title. Any video marker wins; otherwise audio markers make it audio. */
+    fun classify(title: String): Kind {
+        // Separators like "." and "_" are common in release names; treat them as spaces.
+        val t = title.replace('_', ' ').replace(Regex("""(?<=\w)\.(?=\w)"""), " ")
+        return when {
+            VIDEO_TITLE.containsMatchIn(t) -> Kind.VIDEO
+            LOSSLESS_TITLE.containsMatchIn(t) || LOSSY_TITLE.containsMatchIn(t) || AUDIO_TITLE.containsMatchIn(t) -> Kind.AUDIO
+            else -> Kind.UNKNOWN
+        }
+    }
+
+    /** True if a torrent already on the account contains video files and no playable audio. */
+    fun isVideoTorrent(files: List<TorBoxFile>): Boolean =
+        pick(files).tracks.isEmpty() && files.any { extension(it.name) in VIDEO_EXT }
+
+    private val VIDEO_EXT = setOf("mkv", "mp4", "avi", "mov", "m2ts", "ts", "wmv", "webm", "m4v", "iso", "vob")
+
+    /**
+     * Audio-only search results: video releases are dropped. Titles with clear audio markers
+     * come before ambiguous ones (plain "Artist - Album (2020)"); within each group cached
+     * first (instant), then lossless, then seeders.
+     */
+    fun rank(results: List<SearchResult>): List<SearchResult> = results
+        .filter { classify(it.title) != Kind.VIDEO }
+        .sortedWith(
+            compareByDescending<SearchResult> { classify(it.title) == Kind.AUDIO }
+                .thenByDescending { it.cached == true }
+                .thenByDescending { looksLossless(it.title) }
+                .thenBy { looksLossy(it.title) }
+                .thenByDescending { it.seeders }
+        )
 
     // ------------------------------------------------------------------ natural sort
 

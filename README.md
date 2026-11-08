@@ -43,9 +43,13 @@ AudioTrack. No playback capture and no screen-capture prompt: the engine gets th
 source samples, at the file's own sample rate (44.1/48/96 kHz), with float decoding so 24-bit
 sources stay 24-bit. Consecutive tracks at the same rate share one AudioTrack (gapless).
 
-- **Search** uses TorBox's search engine; results are ranked cached-first, then lossless-looking
-  titles, then seeders. "Cached only" hides anything TorBox would have to download first.
-- **My TorBox** lists the torrents already on your account (`/api/torrents/mylist`).
+- **Audio only.** Search results whose titles mark them as video (resolutions like 1080p, x264/HEVC,
+  BluRay/WEB-DL, S01E02, .mkv …) are dropped, even if they mention FLAC (concert videos). Titles with
+  audio markers (FLAC, MP3, kbps, album, discography, soundtrack …) come first, then ambiguous ones;
+  within each group: cached, lossless, seeders. "Cached only" hides anything TorBox would have to
+  download first.
+- **My TorBox** lists the audio torrents already on your account (`/api/torrents/mylist`); finished
+  torrents that only contain video are hidden.
 - Tapping a result adds it (`/api/torrents/createtorrent`, falls back to finding it by hash if it's
   already there), waits until TorBox has it, then **auto-selects the tracks**: lossless (FLAC/WAV)
   if present, otherwise the most common lossy format; junk (samples, `__MACOSX`, tiny files) is
