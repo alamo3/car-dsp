@@ -566,13 +566,19 @@ class EqService : Service() {
         session.setPlaybackState(playback.build())
 
         val track = player.currentTrack
-        val art = track?.artworkUrl
+        // Cover URL from the source, else an iTunes search for "artist title" / the album.
+        val fallback = when {
+            track == null -> null
+            track.artist != null -> "${track.artist} ${track.title}"
+            else -> track.album ?: player.queueTitle
+        }
+        val art = "${track?.artworkUrl}|$fallback"
         // Car displays and the lock screen show this; the art bitmap arrives asynchronously.
         session.setMetadata(buildMetadata(player, track, if (art == sessionArtUrl) sessionArt else null))
         if (art != sessionArtUrl) {
             sessionArtUrl = art
             sessionArt = null
-            dev.alamo3.cabineq.music.Artwork.loadBitmap(this, art, ART_PX) { bmp ->
+            dev.alamo3.cabineq.music.Artwork.loadBitmap(this, track?.artworkUrl, ART_PX, fallback) { bmp ->
                 if (sessionArtUrl != art || mediaSession == null) return@loadBitmap
                 sessionArt = bmp
                 mediaSession?.setMetadata(buildMetadata(player, player.currentTrack, bmp))

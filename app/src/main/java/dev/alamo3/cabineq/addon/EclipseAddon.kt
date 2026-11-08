@@ -283,9 +283,8 @@ class EclipseAddon(link: String) {
         return Artist(id, name, artwork(o), genres)
     }
 
-    /** Protocol field is artworkURL; accept common variants too. */
-    private fun artwork(o: JSONObject): String? =
-        o.optStr("artworkURL") ?: o.optStr("artworkUrl") ?: o.optStr("artwork") ?: o.optStr("image")
+    /** Protocol field is artworkURL; accept the variants other sources use too. */
+    private fun artwork(o: JSONObject): String? = Companion.artworkFrom(o)
 
     private fun parseNotice(o: JSONObject): Notice? {
         val message = o.optStr("message") ?: return null
@@ -294,6 +293,42 @@ class EclipseAddon(link: String) {
     }
 
     companion object {
+        private val ART_KEYS = listOf(
+            "artworkURL", "artworkUrl", "artwork_url", "artwork", "coverURL", "coverUrl", "cover",
+            "image", "imageURL", "imageUrl", "picture", "thumbnail", "thumb", "art",
+        )
+        private val TIDAL_UUID = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+        /**
+         * Finds a cover URL in an item: a plain URL string under any common key, a nested
+         * object ({ url / large / … }) or array, or a bare Tidal cover id (UUID), which is
+         * turned into Tidal's image URL.
+         */
+        fun artworkFrom(o: JSONObject): String? {
+            for (k in ART_KEYS) {
+                if (!o.has(k) || o.isNull(k)) continue
+                urlFrom(o.opt(k))?.let { return it }
+            }
+            // Albums nested in tracks sometimes carry the cover.
+            o.optJSONObject("album")?.let { album -> for (k in ART_KEYS) urlFrom(album.opt(k))?.let { return it } }
+            return null
+        }
+
+        private fun urlFrom(v: Any?): String? = when (v) {
+            is String -> v.trim().let { s ->
+                when {
+                    s.startsWith("https://") || s.startsWith("http://") -> s
+                    s.startsWith("//") -> "https:$s"
+                    TIDAL_UUID.matches(s) -> "https://resources.tidal.com/images/${s.replace('-', '/')}/640x640.jpg"
+                    else -> null
+                }
+            }
+            is JSONObject -> listOf("url", "large", "xl", "original", "src", "href", "medium", "640x640", "small")
+                .firstNotNullOfOrNull { k -> if (v.has(k) && !v.isNull(k)) urlFrom(v.opt(k)) else null }
+            is JSONArray -> (0 until v.length()).asSequence().mapNotNull { urlFrom(v.opt(it)) }.lastOrNull()  // usually ascending size
+            else -> null
+        }
+
         fun normalize(link: String): String =
             link.trim().removeSuffix("/").removeSuffix("/manifest.json").removeSuffix("/")
 

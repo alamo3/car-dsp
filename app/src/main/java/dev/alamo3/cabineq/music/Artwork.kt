@@ -8,16 +8,23 @@ import android.os.Looper
 import android.util.Log
 import android.util.LruCache
 import android.widget.ImageView
+import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Small album-art loader (framework only, no Glide/Coil): memory LRU + disk cache in
  * cacheDir/art, decoded at the requested size. Safe for recycled views: each ImageView is
- * tagged with the URL it should show, and stale results are dropped.
+ * tagged with what it should show, and stale results are dropped.
+ *
+ * When an item has no cover URL, or its URL fails, it falls back to Apple's public iTunes
+ * Search API (no key) using a text query such as "artist album".
  */
 object Artwork {
     private const val TAG = "CabinEQ/Artwork"
@@ -28,45 +35,125 @@ object Artwork {
         override fun sizeOf(key: String, value: Bitmap) = value.byteCount / 1024
     }
 
-    /**
-     * Apple Music artwork URLs are often templates ("…/{w}x{h}bb.{f}"). Fill them in; plain
-     * URLs pass through unchanged.
-     */
-    fun resolveUrl(url: String, sizePx: Int): String =
-        url.replace("{w}", sizePx.toString()).replace("{h}", sizePx.toString()).replace("{f}", "jpg")
+    /** iTunes lookups: query → artwork URL ("" = nothing found). */
+    private val lookups = ConcurrentHashMap<String, String>()
 
-    /** Shows [url] in [view] at about [sizePx]; [placeholder] (a drawable res) until it loads. */
-    fun load(view: ImageView, url: String?, sizePx: Int, placeholder: Int = 0) {
-        if (url.isNullOrBlank()) {
-            view.tag = null
-            if (placeholder != 0) view.setImageResource(placeholder) else view.setImageDrawable(null)
-            return
-        }
-        val resolved = resolveUrl(url, sizePx)
-        val key = "$resolved@$sizePx"
+    // Diagnostics, shown in Settings.
+    val loaded = AtomicInteger()
+    val failed = AtomicInteger()
+    val missing = AtomicInteger()
+    val fromFallback = AtomicInteger()
+    @Volatile var lastError: String? = null
+        private set
+
+    enum class Kind(val entity: String) { ALBUM("album"), SONG("song"), ARTIST("album") }
+
+    /**
+     * Apple Music artwork URLs are often templates ("…/{w}x{h}bb.{f}"); fill them in. Plain
+     * http is upgraded to https (Android blocks cleartext traffic).
+     */
+    fun resolveUrl(url: String, sizePx: Int): String {
+        val u = url.trim().replace("{w}", sizePx.toString()).replace("{h}", sizePx.toString()).replace("{f}", "jpg")
+        return if (u.startsWith("http://")) "https://" + u.removePrefix("http://") else u
+    }
+
+    /**
+     * Shows a cover in [view]: [url] if it loads, otherwise the iTunes result for
+     * [fallbackQuery] (e.g. "Don Toliver Hardstone Psycho"), otherwise the grey placeholder.
+     */
+    fun load(view: ImageView, url: String?, sizePx: Int, fallbackQuery: String? = null, kind: Kind = Kind.ALBUM) {
+        val key = "${url.orEmpty()}|${fallbackQuery.orEmpty()}@$sizePx"
         view.tag = key
         memory.get(key)?.let { view.setImageBitmap(it); return }
-        if (placeholder != 0) view.setImageResource(placeholder) else view.setImageDrawable(null)
+        view.setImageDrawable(null)
+        if (url.isNullOrBlank() && fallbackQuery.isNullOrBlank()) {
+            missing.incrementAndGet()
+            return
+        }
         val ctx = view.context.applicationContext
         pool.execute {
-            val bmp = fetch(ctx, resolved, sizePx) ?: return@execute
+            val bmp = resolve(ctx, url, sizePx, fallbackQuery, kind) ?: return@execute
             memory.put(key, bmp)
             main.post { if (view.tag == key) view.setImageBitmap(bmp) }
         }
     }
 
-    /** Loads a bitmap off the main thread and delivers it on the main thread (null on failure). */
-    fun loadBitmap(context: Context, url: String?, sizePx: Int, done: (Bitmap?) -> Unit) {
-        if (url.isNullOrBlank()) { done(null); return }
-        val resolved = resolveUrl(url, sizePx)
-        val key = "$resolved@$sizePx"
+    /** Same as [load] but delivers the bitmap (null on failure) on the main thread. */
+    fun loadBitmap(context: Context, url: String?, sizePx: Int, fallbackQuery: String? = null, done: (Bitmap?) -> Unit) {
+        if (url.isNullOrBlank() && fallbackQuery.isNullOrBlank()) { done(null); return }
+        val key = "${url.orEmpty()}|${fallbackQuery.orEmpty()}@$sizePx"
         memory.get(key)?.let { done(it); return }
         val ctx = context.applicationContext
         pool.execute {
-            val bmp = fetch(ctx, resolved, sizePx)
+            val bmp = resolve(ctx, url, sizePx, fallbackQuery, Kind.SONG)
             if (bmp != null) memory.put(key, bmp)
             main.post { done(bmp) }
         }
+    }
+
+    /** Diagnostic summary for the settings screen. */
+    fun summary(): String {
+        val base = "Covers: ${loaded.get()} loaded (${fromFallback.get()} via iTunes), ${failed.get()} failed, ${missing.get()} without art info"
+        return lastError?.let { "$base\nLast problem: $it" } ?: base
+    }
+
+    // ---------------------------------------------------------------- internals
+
+    private fun resolve(ctx: Context, url: String?, sizePx: Int, fallbackQuery: String?, kind: Kind): Bitmap? {
+        if (!url.isNullOrBlank()) {
+            fetch(ctx, resolveUrl(url, sizePx), sizePx)?.let { loaded.incrementAndGet(); return it }
+        } else {
+            missing.incrementAndGet()
+        }
+        if (!fallbackQuery.isNullOrBlank()) {
+            val alt = itunesArtwork(fallbackQuery, kind, sizePx)
+            if (alt != null) {
+                fetch(ctx, alt, sizePx)?.let {
+                    loaded.incrementAndGet()
+                    fromFallback.incrementAndGet()
+                    return it
+                }
+            }
+        }
+        failed.incrementAndGet()
+        return null
+    }
+
+    /** Apple's public search: https://itunes.apple.com/search?term=…&entity=album|song. */
+    private fun itunesArtwork(query: String, kind: Kind, sizePx: Int): String? {
+        val cacheKey = "${kind.entity}:${query.lowercase()}"
+        lookups[cacheKey]?.let { return it.ifEmpty { null }?.let { u -> sized(u, sizePx) } }
+        val term = URLEncoder.encode(query.take(120), "UTF-8")
+        val url = "https://itunes.apple.com/search?media=music&entity=${kind.entity}&limit=1&term=$term"
+        return try {
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 8_000
+                readTimeout = 10_000
+                setRequestProperty("User-Agent", "CabinEQ")
+            }
+            try {
+                if (conn.responseCode !in 200..299) {
+                    lastError = "iTunes lookup HTTP ${conn.responseCode}"
+                    return null   // not cached: may be rate limiting, retry later
+                }
+                val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+                val first = json.optJSONArray("results")?.optJSONObject(0)
+                val art = first?.optString("artworkUrl100").orEmpty()
+                lookups[cacheKey] = art
+                art.ifEmpty { null }?.let { sized(it, sizePx) }
+            } finally {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            lastError = "iTunes lookup: ${e.javaClass.simpleName}: ${e.message}"
+            null
+        }
+    }
+
+    /** iTunes gives 100x100; the same URL serves other sizes ("…/100x100bb.jpg" → "…/600x600bb.jpg"). */
+    private fun sized(url: String, sizePx: Int): String {
+        val s = sizePx.coerceIn(100, 1200)
+        return url.replace(Regex("""/\d+x\d+(bb)?\.(jpg|png|webp)$"""), "/${s}x${s}bb.jpg")
     }
 
     private fun fetch(context: Context, url: String, sizePx: Int): Bitmap? {
@@ -78,10 +165,15 @@ object Artwork {
                     connectTimeout = 10_000
                     readTimeout = 15_000
                     instanceFollowRedirects = true
-                    setRequestProperty("User-Agent", "CabinEQ")
+                    setRequestProperty("User-Agent", "Mozilla/5.0 (Android) CabinEQ")
+                    setRequestProperty("Accept", "image/*")
                 }
                 try {
-                    if (conn.responseCode !in 200..299) return null
+                    val code = conn.responseCode
+                    if (code !in 200..299) {
+                        lastError = "HTTP $code from ${URL(url).host}"
+                        return null
+                    }
                     val tmp = File(dir, file.name + ".tmp")
                     conn.inputStream.use { input -> tmp.outputStream().use { input.copyTo(it) } }
                     if (!tmp.renameTo(file)) { tmp.delete(); return null }
@@ -90,9 +182,13 @@ object Artwork {
                 }
                 trimDisk(dir)
             }
-            return decode(file, sizePx)
+            return decode(file, sizePx) ?: run {
+                lastError = "Not an image from ${URL(url).host}"
+                null
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "Artwork failed: ${e.javaClass.simpleName}")
+            lastError = "${e.javaClass.simpleName}: ${e.message} (${runCatching { URL(url).host }.getOrDefault("?")})"
+            Log.w(TAG, "Artwork failed: $lastError")
             return null
         }
     }

@@ -475,7 +475,8 @@ class MusicActivity : Activity() {
         page.addView(backRow())
         val id = op
         // Header right away from what the search gave us; tracks fill in when they arrive.
-        val header = albumHeader(album.title, album.artist, listOfNotNull("Album", album.year).joinToString(" · "), album.artworkUrl)
+        val header = albumHeader(album.title, album.artist, listOfNotNull("Album", album.year).joinToString(" · "), album.artworkUrl,
+            query(album.artist, album.title))
         page.addView(header)
         val tracksBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(tracksBox)
@@ -503,7 +504,7 @@ class MusicActivity : Activity() {
             setPadding(0, dp(8), 0, dp(8))
         }
         val art = Ui.cover(this, dp(160), 0f, circle = true)
-        Artwork.load(art, artist.artworkUrl, dp(160))
+        Artwork.load(art, artist.artworkUrl, dp(160) * 2, artist.name, Artwork.Kind.ARTIST)
         head.addView(art, LinearLayout.LayoutParams(dp(160), dp(160)))
         head.addView(Ui.text(this, artist.name, 26f, bold = true, lines = 2).apply { gravity = Gravity.CENTER; setPadding(0, dp(16), 0, 0) })
         if (artist.genres.isNotEmpty()) head.addView(Ui.text(this, artist.genres.take(3).joinToString(" · "), 13f, Ui.TEXT_2).apply { gravity = Gravity.CENTER })
@@ -599,6 +600,9 @@ class MusicActivity : Activity() {
         refreshChips()
         page.addView(HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(chips) })
 
+        page.addView(sectionTitle("Album art"))
+        page.addView(Ui.text(this, Artwork.summary(), 13f, Ui.TEXT_2, lines = 6))
+
         if (settings.recentSearches.isNotEmpty()) {
             page.addView(Ui.pill(this, "Clear recent searches", filled = false) {
                 settings.clearRecentSearches()
@@ -630,7 +634,7 @@ class MusicActivity : Activity() {
                     pick.tracks.isNotEmpty() -> "${pick.tracks.size} songs · ${pick.format?.uppercase(Locale.ROOT)}"
                     else -> "No playable audio"
                 }
-                box.addView(simpleRow(cleanTorrentName(t.name), detail, android.R.drawable.ic_media_play) {
+                box.addView(coverRow(cleanTorrentName(t.name), detail, coverQuery(t.name)) {
                     navigate { renderTorrent(c, t) }
                 })
             }
@@ -641,7 +645,7 @@ class MusicActivity : Activity() {
         clearPage()
         page.addView(backRow())
         val title = cleanTorrentName(initial.name)
-        page.addView(albumHeader(title, "", "From your TorBox", null))
+        page.addView(albumHeader(title, "", "From your TorBox", null, coverQuery(initial.name)))
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         page.addView(box)
         val id = op
@@ -665,7 +669,7 @@ class MusicActivity : Activity() {
                 return
             }
             val queue = pick.tracks.map { f ->
-                FilePlayer.Track(AudioPicker.trackTitle(f), album = title) { c.requestDownloadUrl(t.id, f.id) }
+                FilePlayer.Track(AudioPicker.trackTitle(f), album = title, artworkUrl = null) { c.requestDownloadUrl(t.id, f.id) }
             }
             addPlayShuffle(box, queue, title, "${pick.tracks.size} songs · ${pick.format?.uppercase(Locale.ROOT)}")
             pick.tracks.forEachIndexed { i, f ->
@@ -704,7 +708,7 @@ class MusicActivity : Activity() {
         Ui.selectable(row)
         if (showArt) {
             val art = Ui.cover(this, dp(52), dp(6).toFloat())
-            Artwork.load(art, t.artworkUrl, dp(52) * 2)
+            Artwork.load(art, t.artworkUrl, dp(52) * 2, query(t.artist, t.title), Artwork.Kind.SONG)
             row.addView(art, LinearLayout.LayoutParams(dp(52), dp(52)))
         }
         val texts = LinearLayout(this).apply {
@@ -750,7 +754,7 @@ class MusicActivity : Activity() {
         }
         Ui.selectable(row)
         val art = Ui.cover(this, dp(56), 0f, circle = true)
-        Artwork.load(art, ar.artworkUrl, dp(56) * 2)
+        Artwork.load(art, ar.artworkUrl, dp(56) * 2, ar.name, Artwork.Kind.ARTIST)
         row.addView(art, LinearLayout.LayoutParams(dp(56), dp(56)))
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -772,7 +776,7 @@ class MusicActivity : Activity() {
             }
             Ui.selectable(tile)
             val art = Ui.cover(this, size, dp(8).toFloat())
-            Artwork.load(art, al.artworkUrl, size * 2)
+            Artwork.load(art, al.artworkUrl, size * 2, query(al.artist, al.title), Artwork.Kind.ALBUM)
             tile.addView(art, LinearLayout.LayoutParams(size, size))
             tile.addView(Ui.text(this, al.title, 14f).apply { setPadding(0, dp(8), 0, 0) }, LinearLayout.LayoutParams(size, ViewGroup.LayoutParams.WRAP_CONTENT))
             tile.addView(Ui.text(this, listOfNotNull(al.artist.ifBlank { null }, al.year).joinToString(" · "), 12f, Ui.TEXT_2)
@@ -785,7 +789,7 @@ class MusicActivity : Activity() {
         }
     }
 
-    private fun albumHeader(title: String, artist: String, meta: String, artworkUrl: String?): View {
+    private fun albumHeader(title: String, artist: String, meta: String, artworkUrl: String?, fallbackQuery: String?): View {
         val head = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -793,7 +797,7 @@ class MusicActivity : Activity() {
         }
         val size = min(resources.displayMetrics.widthPixels - dp(96), dp(280))
         val art = Ui.cover(this, size, dp(10).toFloat())
-        Artwork.load(art, artworkUrl, size)
+        Artwork.load(art, artworkUrl, size, fallbackQuery, Artwork.Kind.ALBUM)
         head.addView(art, LinearLayout.LayoutParams(size, size))
         head.addView(Ui.text(this, title, 22f, bold = true, lines = 2).apply { gravity = Gravity.CENTER; setPadding(0, dp(16), 0, 0) },
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -835,6 +839,27 @@ class MusicActivity : Activity() {
             scaleType = ImageView.ScaleType.CENTER
         }
         row.addView(tile, LinearLayout.LayoutParams(dp(48), dp(48)))
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), 0, 0, 0)
+        }
+        texts.addView(Ui.text(this, title, 16f, lines = 2))
+        if (!sub.isNullOrBlank()) texts.addView(Ui.text(this, sub, 13f, Ui.TEXT_2).apply { setPadding(0, dp(3), 0, 0) })
+        row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        return row
+    }
+
+    private fun coverRow(title: String, sub: String?, fallbackQuery: String, onClick: () -> Unit): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, dp(6))
+            setOnClickListener { onClick() }
+        }
+        Ui.selectable(row)
+        val art = Ui.cover(this, dp(52), dp(6).toFloat())
+        Artwork.load(art, null, dp(52) * 2, fallbackQuery, Artwork.Kind.ALBUM)
+        row.addView(art, LinearLayout.LayoutParams(dp(52), dp(52)))
         val texts = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), 0, 0, 0)
@@ -911,10 +936,13 @@ class MusicActivity : Activity() {
             val icon = if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
             miniToggle.setImageResource(icon)
             fullToggle.setImageResource(icon)
-            if (t?.artworkUrl != shownArt) {
-                shownArt = t?.artworkUrl
-                Artwork.load(miniArt, t?.artworkUrl, dp(44) * 2)
-                Artwork.load(fullArt, t?.artworkUrl, min(resources.displayMetrics.widthPixels, 1000))
+            val artQuery = trackQuery(t, p.queueTitle)
+            val artKey = "${t?.artworkUrl}|$artQuery"
+            if (artKey != shownArt) {
+                shownArt = artKey
+                val kind = if (t?.artist != null) Artwork.Kind.SONG else Artwork.Kind.ALBUM
+                Artwork.load(miniArt, t?.artworkUrl, dp(44) * 2, artQuery, kind)
+                Artwork.load(fullArt, t?.artworkUrl, min(resources.displayMetrics.widthPixels, 1000), artQuery, kind)
             }
         }
         val dur = p.durationMs
@@ -1085,6 +1113,17 @@ class MusicActivity : Activity() {
 
     private fun dp(v: Int) = Ui.dp(this, v)
 
+    private fun query(vararg parts: String?): String? =
+        parts.filterNot { it.isNullOrBlank() }.joinToString(" ").ifBlank { null }
+
+    /** Fallback cover search for whatever is playing: "artist title", or the album/queue name. */
+    private fun trackQuery(t: FilePlayer.Track?, queueTitle: String?): String? = when {
+        t == null -> null
+        t.artist != null -> query(t.artist, t.title)
+        t.album != null -> coverQuery(t.album)
+        else -> queueTitle?.let { coverQuery(it) }
+    }
+
     companion object {
         private const val POLL_MS = 3000L
         private const val SEARCH_DEBOUNCE_MS = 350L
@@ -1100,6 +1139,11 @@ class MusicActivity : Activity() {
             while (v >= 1024 && u < units.lastIndex) { v /= 1024; u++ }
             return String.format(Locale.US, if (u == 0) "%.0f %s" else "%.1f %s", v, units[u])
         }
+
+        /** Search text for a torrent/album name: tags, years and punctuation removed. */
+        fun coverQuery(name: String): String =
+            cleanTorrentName(name).replace(Regex("""\(\d{4}\)|\b(19|20)\d{2}\b"""), " ")
+                .replace(Regex("""[-–—_.]+"""), " ").replace(Regex("""\s+"""), " ").trim()
 
         /** "Artist - Album (2020) [FLAC 24bit]" → "Artist - Album (2020)" for display. */
         fun cleanTorrentName(name: String): String =
