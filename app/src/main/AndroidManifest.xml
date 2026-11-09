@@ -91,7 +91,6 @@
                 <action android:name="androidx.car.app.CarAppService" />
                 <category android:name="androidx.car.app.category.MEDIA" />
                 <!-- Launched from the car's playing surface: open the playback screen. -->
-                <action android:name="androidx.car.app.media.action.SHOW_MEDIA_PLAYBACK" />
             </intent-filter>
         </service>
 
