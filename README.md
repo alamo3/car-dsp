@@ -130,6 +130,33 @@ browser search API (see below); everything else is framework-only.
 Builds are arm64 only, like every current phone. To run on an x86_64 emulator, add the ABI:
 `./gradlew installDebug -PcabinAbis=x86_64`.
 
+### Installing a local build over the CI build
+
+CI publishes `dev.alamo3.cabineq` signed with the key in the `SIGNING_KEYSTORE_B64` secret. For a
+local build to *replace* that app (rather than failing with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`
+or ending up as a second copy), it must use the same key and package:
+
+```sh
+export SIGNING_KEYSTORE_B64='<the GitHub secret value>'
+tools/import-signing-key.sh                      # -> ~/.android/cabineq-release.jks
+echo 'cabineq.storePassword=<SIGNING_PASSWORD secret>' >> local.properties   # never committed
+./gradlew installDebug -PcabinVersionCode=9999   # no -PcabinAppIdSuffix: same package
+```
+
+`app/build.gradle.kts` reads the key from `SIGNING_KEYSTORE_PATH`/`SIGNING_PASSWORD` (CI), from
+`local.properties` (`cabineq.storeFile`, `cabineq.storePassword`, optional `cabineq.keyAlias` and
+`cabineq.keyPassword`), or from `~/.android/cabineq-release.jks` — and signs **debug and release**
+with it. The gradle log line at configuration time says which key is in use.
+
+Two things to keep in mind:
+
+- **Version code.** CI sets it from the workflow run number; a local build must use a number that
+  is not lower than the installed one (`-PcabinVersionCode=9999` is a safe dev value). CI releases
+  will then refuse to install over that dev build until you bump past it.
+- **Side-by-side testing is opt-in.** `-PcabinAppIdSuffix=.aaTest` installs the build as a
+  separate package (`dev.alamo3.cabineq.aaTest`) next to the release app — useful to compare both
+  in Android Auto, but that is what creates a second icon/copy.
+
 ## How it attaches to audio
 
 Music apps broadcast `ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION` when they start a playback

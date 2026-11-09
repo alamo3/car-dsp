@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -8,10 +10,35 @@ plugins {
 val cabinVersionCode = (project.findProperty("cabinVersionCode") as String?)?.toInt() ?: 1
 val cabinVersionName = (project.findProperty("cabinVersionName") as String?) ?: "0.1.0-dev"
 
-// Release signing comes from CI secrets. Every release must use the same key, otherwise
-// Android refuses to install updates over the existing app.
-val signingKeystorePath: String? = System.getenv("SIGNING_KEYSTORE_PATH")
-val signingPassword: String? = System.getenv("SIGNING_PASSWORD")
+// Every build must use the SAME key, otherwise Android refuses to install one over the other and
+// you end up with "two copies" (or an install error). CI passes the release key through env; the
+// same key can be supplied locally through local.properties (never committed) or dropped at
+// ~/.android/cabineq-release.jks. Debug builds then use it too, so `installDebug` replaces the
+// release build in place instead of failing with a signature mismatch.
+//
+//   local.properties:
+//     cabineq.storeFile=/home/you/.android/cabineq-release.jks
+//     cabineq.storePassword=…
+//     cabineq.keyAlias=cabineq
+//     cabineq.keyPassword=…            (defaults to storePassword)
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
+fun signingSetting(env: String, prop: String): String? =
+    System.getenv(env)?.takeIf { it.isNotBlank() }
+        ?: localProps.getProperty(prop)?.takeIf { it.isNotBlank() }
+
+val signingKeystorePath: String? = signingSetting("SIGNING_KEYSTORE_PATH", "cabineq.storeFile")
+    ?: File(System.getProperty("user.home"), ".android/cabineq-release.jks")
+        .takeIf { it.exists() }?.absolutePath
+val signingPassword: String? = signingSetting("SIGNING_PASSWORD", "cabineq.storePassword")
+val signingKeyAlias: String = signingSetting("SIGNING_KEY_ALIAS", "cabineq.keyAlias") ?: "cabineq"
+val signingKeyPassword: String? =
+    signingSetting("SIGNING_KEY_PASSWORD", "cabineq.keyPassword") ?: signingPassword
+val hasSigningKey = signingKeystorePath != null && signingPassword != null &&
+    File(signingKeystorePath).exists()
 
 // Phones (Galaxy Z Fold 6 and everything current) are arm64. Emulators are x86_64, so pass
 // -PcabinAbis=x86_64 to build a test APK for one; releases keep the default.
@@ -24,6 +51,11 @@ val cabinAbis: List<String> = (project.findProperty("cabinAbis") as String?)
 // -PcabinAppIdSuffix=.aaTest installs a test build next to a release build instead of replacing
 // it (Android Auto lists media apps by package, so both show up).
 val cabinAppIdSuffix: String = (project.findProperty("cabinAppIdSuffix") as String?) ?: ""
+
+logger.lifecycle(
+    "CabinEQ: appId=dev.alamo3.cabineq$cabinAppIdSuffix, " +
+        "signing=" + (if (hasSigningKey) "the shared key ($signingKeyAlias)" else "debug key (CI builds will not update over this)")
+)
 
 android {
     namespace = "dev.alamo3.cabineq"
@@ -52,12 +84,12 @@ android {
     }
 
     signingConfigs {
-        if (signingKeystorePath != null && signingPassword != null) {
-            create("release") {
-                storeFile = file(signingKeystorePath)
+        if (hasSigningKey) {
+            create("cabineq") {
+                storeFile = file(signingKeystorePath!!)
                 storePassword = signingPassword
-                keyAlias = "cabineq"
-                keyPassword = signingPassword
+                keyAlias = signingKeyAlias
+                keyPassword = signingKeyPassword
             }
         }
     }
@@ -65,7 +97,11 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfigs.findByName("release")?.let { signingConfig = it }
+            signingConfigs.findByName("cabineq")?.let { signingConfig = it }
+        }
+        debug {
+            // Same key as CI: a dev build installs over the release build, not beside it.
+            signingConfigs.findByName("cabineq")?.let { signingConfig = it }
         }
     }
 
