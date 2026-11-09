@@ -199,7 +199,9 @@ object Artwork {
                     lastError = "HTTP $code from ${URL(url).host}"
                     return null
                 }
-                val tmp = File(dir, file.name + ".tmp")
+                // Unique per download: two requests for the same cover must not clobber one
+                // another's temp file (that made one of them return null).
+                val tmp = File(dir, file.name + "." + Thread.currentThread().id + "." + System.nanoTime() + ".tmp")
                 conn.inputStream.use { input -> tmp.outputStream().use { input.copyTo(it) } }
                 if (!tmp.renameTo(file)) { tmp.delete(); return null }
             } finally {
@@ -223,6 +225,57 @@ object Artwork {
      * MIME of artwork that is already cached for these arguments — never downloads, so the
      * content provider can answer getType() without a network round trip.
      */
+    /** The cached cover for these arguments, with no network access at all. */
+    fun cachedFileFor(context: Context, url: String?, fallbackQuery: String?, sizePx: Int): File? {
+        val dir = File(context.cacheDir, "art")
+        val candidates = ArrayList<String>(2)
+        url?.takeIf { it.isNotBlank() }?.let { candidates += resolveUrl(it, sizePx) }
+        if (!fallbackQuery.isNullOrBlank()) {
+            lookups["${Kind.SONG.entity}:${fallbackQuery.lowercase()}"]
+                ?.takeIf { it.isNotBlank() }?.let { candidates += sized(it, sizePx) }
+        }
+        for (candidate in candidates) {
+            if (candidate.isBlank()) continue
+            val file = File(dir, sha1(candidate))
+            if (file.exists() && file.length() > 0L && isImage(file)) return file
+        }
+        return null
+    }
+
+    /**
+     * A neutral tile served while the real cover downloads. The car asks for icons
+     * synchronously with a timeout, so handing it a file immediately beats a 15 s stall.
+     */
+    fun placeholderFile(context: Context, sizePx: Int): File? {
+        val size = sizePx.coerceIn(64, 1200)
+        val dir = File(context.cacheDir, "art").apply { mkdirs() }
+        val file = File(dir, "placeholder-$size.png")
+        if (file.exists() && file.length() > 0L) return file
+        return try {
+            val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(bmp)
+            canvas.drawColor(0xFF1A1F27.toInt())
+            val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xFF2F3946.toInt()
+            }
+            val w = size / 6f
+            val h = size / 3f
+            val gap = w * 0.6f
+            val left = (size - (3 * w + 2 * gap)) / 2f
+            val top = (size - h) / 2f
+            for (i in 0 until 3) {
+                val x = left + i * (w + gap)
+                canvas.drawRoundRect(x, top, x + w, top + h, w / 3f, w / 3f, paint)
+            }
+            val tmp = File(dir, file.name + "." + System.nanoTime() + ".tmp")
+            tmp.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            bmp.recycle()
+            if (tmp.renameTo(file)) file else { tmp.delete(); null }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     fun cachedMimeType(context: Context, url: String?, fallbackQuery: String?, sizePx: Int): String? {
         val dir = File(context.cacheDir, "art")
         val candidates = ArrayList<String>(2)

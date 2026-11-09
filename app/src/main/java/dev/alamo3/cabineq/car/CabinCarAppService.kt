@@ -9,6 +9,7 @@ import androidx.car.app.media.MediaPlaybackManager
 import androidx.car.app.validation.HostValidator
 import androidx.core.graphics.drawable.IconCompat
 import dev.alamo3.cabineq.PlaybackTokenHolder
+import dev.alamo3.cabineq.Radio
 import dev.alamo3.cabineq.R
 
 /**
@@ -24,6 +25,9 @@ class CabinCarAppService : CarAppService() {
     override fun onCreateSession(): Session {
         // Once per connection (not per screen): an explicit pause must survive opening the app.
         CarPlayback.resumeOnConnect(this)
+        // Build the recommendation pool off the connection thread so the "For you" shelf is
+        // ready when the first screen renders (it can take a few addon calls).
+        Thread({ runCatching { Radio.warm(this) } }, "CabinEQ-CarWarm").apply { isDaemon = true }.start()
         return CabinCarSession()
     }
 

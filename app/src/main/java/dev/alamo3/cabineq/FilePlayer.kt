@@ -218,6 +218,11 @@ class FilePlayer private constructor(private val context: Context) {
         focusPaused = false
         interrupted = false
         jumpTo = -1
+        seekToMs = -1            // a seek pending from the previous track must not apply here
+        rebuildOutput = false
+        followNewTrack = false
+        durationMs = tracks[startIndex.coerceIn(0, tracks.lastIndex)].durationMs
+        positionMs = startAtMs.coerceAtLeast(0)
         // Leave PAUSED behind: the worker stops at the top of its loop while paused, so a track
         // picked while the player was paused (focus loss, speaker guard, prior pause) would never
         // even open — it looked like "tap a song, nothing happens".
@@ -250,6 +255,8 @@ class FilePlayer private constructor(private val context: Context) {
         userPaused = true
         interrupted = false
         setState(State.PAUSED, "paused by user")
+        // No reason to hold GAIN focus while nothing is playing; resume() asks again.
+        abandonFocus()
     }
 
     fun resume() {
@@ -449,7 +456,10 @@ class FilePlayer private constructor(private val context: Context) {
             return false
         }
         // Not the user's pause: a later play press (or a recovered route) may continue.
-        if (isActive) setState(State.PAUSED, "output stalled")
+        if (isActive) {
+            setState(State.PAUSED, "output stalled")
+            abandonFocus()
+        }
         version++
         return true
     }
@@ -561,7 +571,8 @@ class FilePlayer private constructor(private val context: Context) {
         audioManager.requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
 
     private fun abandonFocus() {
-        runCatching { audioManager.abandonAudioFocusRequest(focusRequest) }
+        val ok = runCatching { audioManager.abandonAudioFocusRequest(focusRequest) }.getOrDefault(false)
+        Log.i(TAG, "abandonFocus -> $ok (state=${state.name})")
     }
 
     // ---------------------------------------------------------------- output
@@ -748,6 +759,11 @@ class FilePlayer private constructor(private val context: Context) {
             tasteReported = true
             val t = queue.getOrNull(currentIndex) ?: return
             Taste.onSkip(context, t, positionMs, durationMs)
+            // Skipped inside the first quarter: it was not really played, so drop it from
+            // history instead of offering it under "Recently played".
+            if (durationMs > 0 && positionMs < durationMs / 4) {
+                persistPool.execute { runCatching { settings.removeFromHistory(t) } }
+            }
         }
 
         private fun outputFor(rate: Int): Output {
@@ -772,7 +788,14 @@ class FilePlayer private constructor(private val context: Context) {
         private fun playTrack(item: Track): Outcome {
             // Resolving can block for minutes (TorBox caching, addon 503/Retry-After), so it runs
             // here on the player thread and publishes progress through the note.
-            val resolved = TrackResolver.resolve(context, item, onNote = { setNote(it) }, isCancelled = { !live })
+            // A pending skip must abandon a slow resolve (TorBox can wait minutes), otherwise
+            // pressing next while "preparing" does nothing until it finishes.
+            val resolved = TrackResolver.resolve(
+                context,
+                item,
+                onNote = { setNote(it) },
+                isCancelled = { !live || jumpTo >= 0 },
+            )
             if (!live) return Outcome.Cancelled
             note = null
             val url = resolved.url

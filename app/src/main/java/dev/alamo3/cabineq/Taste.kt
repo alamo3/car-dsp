@@ -70,6 +70,15 @@ object Taste {
     fun onComplete(context: Context, track: Track, atMs: Long, durationMs: Long) {
         val ratio = if (durationMs > 0) (atMs.toFloat() / durationMs).coerceIn(0f, 1f) else 1f
         if (ratio < 0.85f) return   // "finished" only when it really got to the end
+        // Repeat-one can finish the same track a dozen times an hour; one completion per 20
+        // minutes is what the listener actually told us.
+        val k = key(track)
+        val now = System.currentTimeMillis()
+        val duplicate = synchronized(store(context)) {
+            store(context).events.lastOrNull { it.key == k && it.kind == Kind.COMPLETE }
+                ?.let { now - it.at < 20 * 60_000L } == true
+        }
+        if (duplicate) return
         record(context, track, Kind.COMPLETE, ratio)
     }
 

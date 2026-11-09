@@ -304,7 +304,8 @@ class MusicActivity : Activity() {
                 override fun onStartTrackingTouch(sb: SeekBar) { seeking = true }
                 override fun onStopTrackingTouch(sb: SeekBar) {
                     seeking = false
-                    player.seekTo(sb.progress * 1000L)
+                    // A stream with no known duration has max=1 here; seeking would jump to 0.
+                    if (player.durationMs > 0) player.seekTo(sb.progress * 1000L)
                 }
             })
         }
@@ -833,7 +834,8 @@ class MusicActivity : Activity() {
         val dur = p.durationMs
         miniProgress.progress = if (dur > 0) ((p.positionMs * 1000) / dur).toInt() else 0
         if (full.visibility == View.VISIBLE) {
-            if (!seeking) {
+            fullSeek.isEnabled = dur > 0
+            if (!seeking && dur > 0) {
                 fullSeek.max = (dur / 1000).toInt().coerceAtLeast(1)
                 fullSeek.progress = (p.positionMs / 1000).toInt()
                 fullPos.text = Ui.mmss(p.positionMs)

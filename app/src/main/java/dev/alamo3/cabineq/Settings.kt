@@ -194,6 +194,15 @@ class Settings(context: Context) {
         prefs.edit().putString(KEY_HISTORY, json.toString()).apply()
     }
 
+    /** Drops a track from "Recently played" (e.g. it was skipped after two seconds). */
+    fun removeFromHistory(track: Track) = synchronized(historyLock) {
+        val history = playHistory()
+        val kept = history.filterNot { sameRecording(it, track) }
+        if (kept.size == history.size) return@synchronized
+        val json = JSONArray().apply { kept.forEach { put(it.toJson()) } }
+        prefs.edit().putString(KEY_HISTORY, json.toString()).apply()
+    }
+
     fun resetEq() {
         val e = prefs.edit()
         for (i in 0 until Bands.COUNT) e.putFloat(bandKey(i), 0f)

@@ -149,9 +149,22 @@ object Radio {
             .sortedByDescending { it.second }
     }
 
+    /**
+     * Builds the pool ahead of time (called when a car session starts), so the first "For you"
+     * render does not spend a few seconds on a dozen addon calls.
+     */
+    fun warm(context: Context) {
+        val seedArtist = Settings(context).radioSeed?.let { primaryArtist(it.artist) }
+            ?: Taste.profile(context).topArtists(1).firstOrNull()?.let { primaryArtist(it.first) }
+            ?: return
+        runCatching { poolFor(context, seedArtist) }
+    }
+
     // ---------------------------------------------------------------- pool
 
-    private fun poolFor(context: Context, artist: String): List<Candidate>? {
+    private val buildLock = Any()
+
+    private fun poolFor(context: Context, artist: String): List<Candidate>? = synchronized(buildLock) {
         val now = SystemClock.elapsedRealtime()
         pool?.let {
             if (it.artist.equals(artist, true) && now - it.at < CACHE_TTL_MS) return it.candidates

@@ -488,6 +488,23 @@ class NowPlayingScreen(carContext: CarContext) : Screen(carContext) {
         // A silent failure is the worst outcome in a car: if the last attempt broke, say why
         // instead of showing a media panel that refuses to start.
         val player = dev.alamo3.cabineq.FilePlayer.peek()
+        // A pause with a reason (stalled output, focus refused) used to look like a dead panel.
+        val reason = dev.alamo3.cabineq.EngineState.playerMessage
+        if (player != null && player.state == dev.alamo3.cabineq.FilePlayer.State.PAUSED && reason != null) {
+            return MessageTemplate.Builder(reason)
+                .setTitle("Playback paused")
+                .setHeaderAction(Action.BACK)
+                .addAction(
+                    Action.Builder()
+                        .setTitle("Play")
+                        .setOnClickListener {
+                            player.resume()
+                            runCatching { invalidate() }
+                        }
+                        .build()
+                )
+                .build()
+        }
         val error = player?.takeIf { it.state == dev.alamo3.cabineq.FilePlayer.State.ERROR }?.lastError
         if (error != null) {
             return MessageTemplate.Builder(error.ifBlank { "Can't play this right now." })

@@ -22,6 +22,26 @@ import dev.alamo3.cabineq.music.Artwork
  */
 class ArtworkProvider : ContentProvider() {
 
+    /** Downloads run here, never on the caller's (binder) thread. */
+    private val warm = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+        Thread(r, "CabinEQ-ArtWarm").apply { isDaemon = true }
+    }
+    private val warming = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun warmArtwork(ctx: android.content.Context, url: String?, query: String?, size: Int) {
+        val key = "$url|$query|$size"
+        if (!warming.add(key)) return
+        warm.execute {
+            try {
+                Artwork.fileFor(ctx, url, query, size)
+            } catch (e: Exception) {
+                // Best effort: the next request will try again.
+            } finally {
+                warming.remove(key)
+            }
+        }
+    }
+
     override fun onCreate(): Boolean = true
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor? {
@@ -37,18 +57,25 @@ class ArtworkProvider : ContentProvider() {
         val query = uri.getQueryParameter("q")
         if (url == null && query.isNullOrBlank()) return null
         val size = uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(64, 1200) ?: 512
-        val file = Artwork.fileFor(ctx, url, query, size) ?: return null
-        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+        // Cached cover: serve it. Otherwise hand over a placeholder now and fetch in the
+        // background — the car opens icons synchronously, and a 15 s network wait paints a
+        // blank tile (or stalls the row) while it works.
+        val cached = Artwork.cachedFileFor(ctx, url, query, size)
+        if (cached != null) return ParcelFileDescriptor.open(cached, ParcelFileDescriptor.MODE_READ_ONLY)
+        warmArtwork(ctx, url, query, size)
+        val placeholder = Artwork.placeholderFile(ctx, size) ?: return null
+        return ParcelFileDescriptor.open(placeholder, ParcelFileDescriptor.MODE_READ_ONLY)
     }
 
     override fun getType(uri: Uri): String {
         if (uri.getQueryParameter("qr") != null) return "image/png"
-        // The cache has no extensions: report what the bytes (or the known source) actually are.
-        val ctx = context ?: return "image/jpeg"
+        // The cache has no extensions: report what the bytes actually are. Not cached yet means
+        // openFile() will hand out the placeholder, which is a PNG.
+        val ctx = context ?: return "image/png"
         val url = uri.getQueryParameter("u")?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
         val query = uri.getQueryParameter("q")
         val size = uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(64, 1200) ?: 512
-        return Artwork.cachedMimeType(ctx, url, query, size) ?: "image/jpeg"
+        return Artwork.cachedMimeType(ctx, url, query, size) ?: "image/png"
     }
 
     override fun query(

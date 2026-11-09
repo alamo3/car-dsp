@@ -844,16 +844,28 @@ class EqService : MediaBrowserServiceCompat() {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "EQ running", NotificationManager.IMPORTANCE_LOW)
         )
+        // Music is the app; the EQ screen is secondary.
         val openApp = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+            this, 0, Intent(this, MusicActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         val stop = PendingIntent.getService(
             this, 1, Intent(this, EqService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE
         )
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_cabineq)
-            .setContentTitle("CabinEQ is running")
-            .setContentText(if (capture != null) "Native DSP active" else "Android EQ active")
+            .setContentTitle(
+                when {
+                    capture != null -> "CabinEQ is running"
+                    FilePlayer.peek()?.isActive == true -> "CabinEQ player"
+                    else -> "CabinEQ is idle"
+                }
+            )
+            .setContentText(
+                when {
+                    capture != null -> "Native DSP active"
+                    else -> "Nothing playing"
+                }
+            )
             .setContentIntent(openApp)
             .setOngoing(true)
 
