@@ -23,7 +23,7 @@ import dev.alamo3.cabineq.music.Artwork
 class ArtworkProvider : ContentProvider() {
 
     /** Downloads run here, never on the caller's (binder) thread. */
-    private val warm = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+    private val warm = java.util.concurrent.Executors.newFixedThreadPool(4) { r ->
         Thread(r, "CabinEQ-ArtWarm").apply { isDaemon = true }
     }
     private val warming = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -43,6 +43,7 @@ class ArtworkProvider : ContentProvider() {
     }
 
     override fun onCreate(): Boolean = true
+
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor? {
         if (mode != "r" || uri.pathSegments.firstOrNull() != "art") return null
@@ -65,6 +66,15 @@ class ArtworkProvider : ContentProvider() {
         // blank tile (or stalls the row) while it works.
         val cached = Artwork.cachedFileFor(ctx, url, query, size)
         if (cached != null) return ParcelFileDescriptor.open(cached, ParcelFileDescriptor.MODE_READ_ONLY)
+        // The car host fetches an icon once and keeps whatever it gets, so a placeholder handed
+        // out here tends to stay a placeholder. Wait a moment for the real image instead — the
+        // host calls this off its main thread — and fall back to the placeholder if it is slow
+        // or the network is down.
+        val fetched = runCatching {
+            warm.submit<java.io.File?> { runCatching { Artwork.fileFor(ctx, url, query, size) }.getOrNull() }
+                .get(ICON_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }.getOrNull()
+        if (fetched != null) return ParcelFileDescriptor.open(fetched, ParcelFileDescriptor.MODE_READ_ONLY)
         warmArtwork(ctx, url, query, size)
         val placeholder = Artwork.placeholderFile(ctx, size) ?: return null
         return ParcelFileDescriptor.open(placeholder, ParcelFileDescriptor.MODE_READ_ONLY)
@@ -104,6 +114,9 @@ class ArtworkProvider : ContentProvider() {
     ): Int = 0
 
     companion object {
+        /** How long an icon request may wait for the real image before the placeholder. */
+        private const val ICON_WAIT_MS = 1200L
+
         /**
          * Declared in the manifest as `${applicationId}.art`, so a test build installed next to a
          * release build gets its own authority instead of fighting over one.
