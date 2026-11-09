@@ -203,12 +203,15 @@ class MusicActivity : Activity() {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
                 override fun afterTextChanged(s: Editable?) {
-                    handler.removeCallbacks(searchRunnable)
+                    // Qualified on purpose: inside this apply block `handler` would resolve to
+                    // TextView.getHandler(), which is null until the view is attached.
+                    this@MusicActivity.handler.removeCallbacks(searchRunnable)
                     val q = s?.toString()?.trim().orEmpty()
                     when {
                         q.isEmpty() -> if (searchPageOnTop) onBackPressedCompat()
                         q.startsWith("magnet:") -> Unit       // added on the Search key, not while typing
-                        q.length >= 2 -> handler.postDelayed(searchRunnable, SEARCH_DEBOUNCE_MS)
+                        q.length >= 2 -> this@MusicActivity.handler
+                        .postDelayed(searchRunnable, SEARCH_DEBOUNCE_MS)
                     }
                 }
             })
