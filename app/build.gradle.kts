@@ -13,20 +13,35 @@ val cabinVersionName = (project.findProperty("cabinVersionName") as String?) ?: 
 val signingKeystorePath: String? = System.getenv("SIGNING_KEYSTORE_PATH")
 val signingPassword: String? = System.getenv("SIGNING_PASSWORD")
 
+// Phones (Galaxy Z Fold 6 and everything current) are arm64. Emulators are x86_64, so pass
+// -PcabinAbis=x86_64 to build a test APK for one; releases keep the default.
+val cabinAbis: List<String> = (project.findProperty("cabinAbis") as String?)
+    ?.split(',')
+    ?.map { it.trim() }
+    ?.filter { it.isNotEmpty() }
+    ?: listOf("arm64-v8a")
+
+// -PcabinAppIdSuffix=.aaTest installs a test build next to a release build instead of replacing
+// it (Android Auto lists media apps by package, so both show up).
+val cabinAppIdSuffix: String = (project.findProperty("cabinAppIdSuffix") as String?) ?: ""
+
 android {
     namespace = "dev.alamo3.cabineq"
     compileSdk = 35
 
+    buildFeatures {
+        buildConfig = true   // BuildConfig.APPLICATION_ID: the art provider authority follows it
+    }
+
     defaultConfig {
-        applicationId = "dev.alamo3.cabineq"
+        applicationId = "dev.alamo3.cabineq" + cabinAppIdSuffix
         minSdk = 29
         targetSdk = 35
         versionCode = cabinVersionCode
         versionName = cabinVersionName
 
         ndk {
-            // Galaxy Z Fold 6 (and every current phone) is arm64.
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += cabinAbis
         }
     }
 
@@ -64,7 +79,15 @@ android {
     }
 }
 
-// Framework-only app (no AndroidX), so there is nothing to resolve beyond the build plugins.
+// The app is otherwise framework-only. androidx.media is here for one thing the framework is
+// missing: MediaBrowserServiceCompat.onSearch, which is how a car's media UI searches a source
+// (the framework MediaBrowserService has no search API at all).
 // Native DSP lives in src/main/cpp and is built with CMake + the NDK.
 dependencies {
+    implementation("androidx.media:media:1.7.0")
+    // QR codes for the jam session (pure Java, no Android code): the car shows one to scan.
+    implementation("com.google.zxing:core:3.5.3")
+    // Car App Library: the media templates Android Auto/AAOS render for YT Music and Spotify
+    // (sections of tiles, tabs). 1.8 adds CATEGORY_MEDIA + MediaPlaybackManager.
+    implementation("androidx.car.app:app:1.9.0-alpha03")
 }

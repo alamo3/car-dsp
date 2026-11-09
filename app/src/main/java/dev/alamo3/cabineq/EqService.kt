@@ -20,8 +20,11 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.MediaDescription
 import android.media.MediaMetadata
+import android.media.Rating
 import android.media.audiofx.AudioEffect
+import android.media.browse.MediaBrowser
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.media.projection.MediaProjection
@@ -29,9 +32,13 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
-import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.support.v4.media.MediaBrowserCompat
+import android.support.v4.media.MediaDescriptionCompat
+import android.support.v4.media.session.MediaSessionCompat
+import android.view.KeyEvent
+import androidx.media.MediaBrowserServiceCompat
 import android.util.Log
 import kotlin.math.abs
 import kotlin.math.log10
@@ -53,7 +60,7 @@ import kotlin.math.pow
  * itself and runs them through its own native engine, so it needs no capture at all. The
  * service gives it a MediaSession (steering-wheel / Bluetooth controls) and notification controls.
  */
-class EqService : Service() {
+class EqService : MediaBrowserServiceCompat() {
 
     private lateinit var settings: Settings
     private lateinit var audioManager: AudioManager
@@ -80,14 +87,13 @@ class EqService : Service() {
 
     private var lastGpsKmh = 0f
     private var lastGpsFixElapsed = 0L
-    private var speakerSince = 0L
     private var stoppedForProjection = false
 
     // In-app file player (TorBox)
     private var mediaSession: MediaSession? = null
     private var lastPlayerVersion = -1
+    private var queueSignature: String? = null
     private var lastPlayerActive = false
-    private var playerSpeakerSince = 0L
     private var sessionArtUrl: String? = null
     private var sessionArt: android.graphics.Bitmap? = null
 
@@ -152,17 +158,141 @@ class EqService : Service() {
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         settings = Settings(this)
         audioManager = getSystemService(AudioManager::class.java)
+        // The session exists from the start, but stays inactive until we actually play or a
+        // browse client connects: running the EQ on someone else's music must not take the
+        // media buttons away from their music app.
+        val session = ensureMediaSession()
+        // Publish the *framework* token, wrapped only so MediaBrowserServiceCompat can hold it.
+        // A MediaSessionCompat wrapper here made the car's controller report a null PlaybackState
+        // (metadata still arrived), which left the now-playing screen without controls/progress.
+        setSessionToken(MediaSessionCompat.Token.fromToken(session.sessionToken))
+        PlaybackTokenHolder.publish(session.sessionToken)
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Browsing: Android Auto and Android Automotive
+
+    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): MediaBrowserServiceCompat.BrowserRoot {
+        mediaSession?.isActive = true
+        // Tell the car what we can do beyond a plain list:
+        //  - SEARCH_SUPPORTED: show its search UI and call onSearch
+        //  - CONTENT_STYLE_SUPPORTED: honour the per-item GRID/LIST hints below
+        // Both are AA's own bundle keys (the framework/androidx don't expose constants).
+        val extras = Bundle().apply {
+            putBoolean(androidx.media.utils.MediaConstants.BROWSER_SERVICE_EXTRAS_KEY_SEARCH_SUPPORTED, true)
+            putBoolean("android.media.browse.CONTENT_STYLE_SUPPORTED", true)
+        }
+        return MediaBrowserServiceCompat.BrowserRoot(MediaBrowse.ROOT, extras)
+    }
+
+    override fun onLoadChildren(
+        parentId: String,
+        result: MediaBrowserServiceCompat.Result<MutableList<MediaBrowserCompat.MediaItem>>,
+    ) {
+        result.detach()
+        Thread({
+            val items = runCatching { MediaBrowse.children(this, parentId) }.getOrElse {
+                Log.w(TAG, "Browse $parentId failed: ${it.message}")
+                emptyList()
+            }
+            Log.d(TAG, "Browse $parentId -> ${items.size} items")
+            result.sendResult(items.map(::toCompat).toMutableList())
+        }, "CabinEQ-Browse").start()
+    }
+
+    /** The car's search (Android Auto and Automotive both call this). */
+    override fun onSearch(
+        query: String,
+        extras: Bundle?,
+        result: MediaBrowserServiceCompat.Result<MutableList<MediaBrowserCompat.MediaItem>>,
+    ) {
+        result.detach()
+        Thread({
+            val items = runCatching { MediaBrowse.search(this, query) }.getOrElse {
+                Log.w(TAG, "Search \"$query\" failed: ${it.message}")
+                emptyList()
+            }
+            Log.d(TAG, "Search \"$query\" -> ${items.size} items")
+            if (items.isNotEmpty()) settings.addRecentSearch(query)   // feeds the car's Search tab
+            result.sendResult(items.map(::toCompat).toMutableList())
+        }, "CabinEQ-Search").start()
+    }
+
+    /** MediaBrowse speaks framework types; the compat service needs its own copies. */
+    private fun toCompat(item: MediaBrowser.MediaItem): MediaBrowserCompat.MediaItem {
+        val d = item.description
+        val description = MediaDescriptionCompat.Builder()
+            .setMediaId(d.mediaId)
+            .setTitle(d.title)
+            .setSubtitle(d.subtitle)
+            .setIconUri(d.iconUri)
+            .setExtras(d.extras)
+            .build()
+        return MediaBrowserCompat.MediaItem(description, item.flags)
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Swiping the app away must not stop what the car is playing.
+        if (FilePlayer.peek()?.isActive != true) super.onTaskRemoved(rootIntent)
+    }
+
+    /** Plays a browse selection: the queue comes from the id, the position from the child id. */
+    private fun playFromBrowse(mediaId: String) {
+        startEngine()
+        startForegroundSafely()
+        mediaSession?.isActive = true
+        Thread({
+            val spec = runCatching { MediaBrowse.playback(this, mediaId) }.getOrElse {
+                Log.w(TAG, "Can't resolve $mediaId: ${it.message}")
+                null
+            }
+            if (spec == null) {
+                Log.w(TAG, "Nothing playable for $mediaId")
+                return@Thread
+            }
+            FilePlayer.get(this).play(spec.tracks, spec.index, spec.title, radio = spec.radio)
+        }, "CabinEQ-CarPlay").start()
+    }
+
+    /** "Play <something>" from the car's assistant. */
+    private fun playFromSearchQuery(query: String) {
+        if (query.isBlank()) return
+        startEngine()
+        startForegroundSafely()
+        mediaSession?.isActive = true
+        Thread({
+            val spec = runCatching { MediaBrowse.searchPlayback(this, query) }.getOrNull()
+            if (spec == null) {
+                Log.w(TAG, "No search results for \"$query\"")
+                return@Thread
+            }
+            FilePlayer.get(this).play(spec.tracks, spec.index, spec.title, radio = spec.radio)
+        }, "CabinEQ-CarSearch").start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             stopSelf()
+            return START_NOT_STICKY
+        }
+        // A media button when we have no session yet (process was killed, car wants to start
+        // playing): come up, then hand the key to the session like the system would.
+        if (intent?.action == ACTION_MEDIA_BUTTON) {
+            startEngine()
+            startForegroundSafely()
+            val session = ensureMediaSession()
+            session.isActive = true
+            val key = if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+            } else {
+                @Suppress("DEPRECATION") intent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+            }
+            if (key != null) session.controller.dispatchMediaButtonEvent(key)
             return START_NOT_STICKY
         }
         // Notification media buttons. Only meaningful while we're already running.
@@ -193,23 +323,11 @@ class EqService : Service() {
         // Every startForegroundService() needs a matching startForeground(). The
         // mediaProjection type is only allowed once the user has granted the projection.
         val hasLocation = hasLocationPermission()
-        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-        if (hasLocation) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-        if (wantsDsp || projection != null) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-        startForeground(NOTIF_ID, buildNotification(), type)
+        val projectionType = if (wantsDsp || projection != null) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION else 0
+        startForegroundSafely(projectionType)
 
         val wasRunning = EngineState.running
-        if (!EngineState.running) {
-            val filter = IntentFilter().apply {
-                addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
-                addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
-            }
-            registerSessionReceiver(filter)
-            settings.prefs.registerOnSharedPreferenceChangeListener(prefsListener)
-            if (hasLocation) startLocation()
-            EngineState.running = true
-            handler.post(ticker)
-        }
+        startEngine(hasLocation)
 
         if (intent?.action == ACTION_PLAYER_ATTACH) {
             ensureMediaSession()
@@ -235,6 +353,32 @@ class EqService : Service() {
         return START_NOT_STICKY
     }
 
+    /**
+     * Registers the session receiver, the prefs listener, GPS and the 10 Hz ticker exactly once.
+     * [onStartCommand] and the car's first "play" both come through here.
+     */
+    private fun startEngine(hasLocation: Boolean = hasLocationPermission()) {
+        if (EngineState.running) return
+        val filter = IntentFilter().apply {
+            addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
+            addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
+        }
+        registerSessionReceiver(filter)
+        settings.prefs.registerOnSharedPreferenceChangeListener(prefsListener)
+        if (hasLocation) startLocation()
+        EngineState.running = true
+        handler.post(ticker)
+    }
+
+    /** Foreground with the types we actually qualify for, from a start command or from the car. */
+    private fun startForegroundSafely(extraTypes: Int = 0) {
+        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        if (hasLocationPermission()) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        type = type or extraTypes
+        runCatching { startForeground(NOTIF_ID, buildNotification(), type) }
+            .onFailure { Log.w(TAG, "startForeground failed: ${it.message}") }
+    }
+
     override fun onDestroy() {
         handler.removeCallbacks(ticker)
         runCatching { unregisterReceiver(sessionReceiver) }
@@ -248,6 +392,7 @@ class EqService : Service() {
         FilePlayer.peek()?.stop()
         mediaSession?.release()
         mediaSession = null
+        queueSignature = null
         muter.unmuteAll()
         effects.releaseAll()
         sessionPackages.clear()
@@ -457,27 +602,11 @@ class EqService : Service() {
     }
 
     /**
-     * Two safety nets for the DSP path:
-     *  1. Speaker safety: our output landing on the phone speaker (the RootlessJamesDSP +
-     *     Android Auto failure) -> fall back to Android EQ.
-     *  2. Capture blocked: media is playing, apps are muted, yet the capture is silent.
-     *     The muted app(s) opted out of capture -> remember them and send them to Android EQ.
+     * Capture blocked: media is playing, apps are muted, yet the capture is silent. The muted
+     * app(s) opted out of capture -> remember them and send them to Android EQ.
      */
     private fun checkDspHealth(engine: CaptureEngine) {
         val nowMs = SystemClock.elapsedRealtime()
-
-        if (!settings.allowSpeakerOutput && engine.isRoutedToPhoneSpeaker()) {
-            if (speakerSince == 0L) speakerSince = nowMs
-            if (nowMs - speakerSince > SPEAKER_GRACE_MS) {
-                speakerSince = 0L
-                stopDsp("DSP output went to the phone speaker — switched to Android EQ. " +
-                    "(Allow it under Testing if that's intended.)")
-                return
-            }
-        } else {
-            speakerSince = 0L
-        }
-
         val dspPackages = muter.sessionIds.mapNotNull { sessionPackages[it] }.toSet()
         if (dspPackages.isNotEmpty() && engine.outputPaused &&
             nowMs - engine.lastSignalAt > BLOCKED_SILENCE_MS &&
@@ -494,26 +623,19 @@ class EqService : Service() {
     // File player
 
     private fun tickPlayer(player: FilePlayer) {
-        val nowMs = SystemClock.elapsedRealtime()
         val active = player.isActive
         if (active != lastPlayerActive) {
             lastPlayerActive = active
             applyGlobalMode()
         }
 
-        // Same speaker safety as the DSP path, but pause instead of falling back.
-        if (!settings.allowSpeakerOutput && player.isRoutedToPhoneSpeaker()) {
-            if (playerSpeakerSince == 0L) playerSpeakerSince = nowMs
-            if (nowMs - playerSpeakerSince > SPEAKER_GRACE_MS) {
-                playerSpeakerSince = 0L
-                player.pause()
-                EngineState.playerMessage = "Player paused: output went to the phone speaker. " +
-                    "(Allow it under Testing if that's intended.)"
-            }
-        } else {
-            playerSpeakerSince = 0L
-            if (player.state == FilePlayer.State.PLAYING) EngineState.playerMessage = null
+        // A silent output sink would otherwise freeze the UI at 0:00 with no explanation.
+        if (player.recoverStalledOutput()) {
+            EngineState.playerMessage = "Audio output stalled — paused. " +
+                "The output device stopped consuming audio."
         }
+
+        if (player.state == FilePlayer.State.PLAYING) EngineState.playerMessage = null
 
         player.readMeters()?.let { m ->
             EngineState.playerInPeakDb = toDb(m[0])
@@ -532,6 +654,26 @@ class EqService : Service() {
     private fun ensureMediaSession(): MediaSession {
         mediaSession?.let { return it }
         val session = MediaSession(this, "CabinEQ")
+        // What the car and the lock screen open when the user taps Now Playing.
+        session.setSessionActivity(
+            PendingIntent.getActivity(
+                this, 6,
+                Intent(this, MusicActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+        )
+        // Where the system sends media keys / "play" when no session is alive yet.
+        // Mutable on purpose: the media session service fills in the KeyEvent, and an immutable
+        // PendingIntent makes that send fail with PendingIntent.CanceledException.
+        val mediaButtonFlags = PendingIntent.FLAG_UPDATE_CURRENT or
+            (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
+        session.setMediaButtonReceiver(
+            PendingIntent.getBroadcast(
+                this, 2,
+                Intent(this, MediaButtonReceiver::class.java).setAction(Intent.ACTION_MEDIA_BUTTON),
+                mediaButtonFlags,
+            )
+        )
         session.setCallback(object : MediaSession.Callback() {
             override fun onPlay() = FilePlayer.get(this@EqService).resume()
             override fun onPause() = FilePlayer.get(this@EqService).pause()
@@ -539,11 +681,51 @@ class EqService : Service() {
             override fun onSkipToPrevious() = FilePlayer.get(this@EqService).previous()
             override fun onStop() = FilePlayer.get(this@EqService).stop()
             override fun onSeekTo(pos: Long) = FilePlayer.get(this@EqService).seekTo(pos)
+            override fun onSkipToQueueItem(id: Long) {
+                val player = FilePlayer.get(this@EqService)
+                val index = player.queue.indexOfFirst { queueItemId(it) == id }
+                if (index >= 0) player.skipTo(index)
+            }
+            /** Android Auto / the lock screen show thumbs up/down when the session offers it. */
+            override fun onSetRating(rating: Rating) {
+                val track = FilePlayer.get(this@EqService).currentTrack ?: return
+                if (!rating.isRated) return
+                if (rating.isThumbUp) Taste.like(this@EqService, track)
+                else Taste.dislike(this@EqService, track)
+                Log.i(TAG, "rating: thumbUp=${rating.isThumbUp} for ${track.title}")
+            }
+
+            override fun onPlayFromMediaId(mediaId: String, extras: Bundle?) = playFromBrowse(mediaId)
+            override fun onPlayFromSearch(query: String?, extras: Bundle?) {
+                query?.let { playFromSearchQuery(it) }
+            }
         })
-        session.isActive = true
         mediaSession = session
         lastPlayerVersion = -1  // force a state push on the next tick
         return session
+    }
+
+    /** The car's "up next" list, which it can also skip within. Ids are queue positions. */
+    /** Identity of a queue entry for MediaSession clients (see [pushQueue]). */
+    private fun queueItemId(track: Track): Long = track.mediaId.hashCode().toLong() and 0xFFFFFFFFL
+
+    private fun pushQueue(session: MediaSession, player: FilePlayer) {
+        val queue = player.queue
+        val signature = "${queue.size}|${player.queueTitle}|${queue.hashCode()}"
+        if (signature == queueSignature) return
+        queueSignature = signature
+        session.setQueue(queue.map { track ->
+            MediaSession.QueueItem(
+                MediaDescription.Builder()
+                    .setMediaId("qi:${track.mediaId}")
+                    .setTitle(track.title)
+                    .setSubtitle(track.artist ?: track.album)
+                    .build(),
+                // Stable across queue edits: a Jam add/remove shifts indices, and a client that
+                // cached the old queue would otherwise skip to the wrong song.
+                queueItemId(track),
+            )
+        })
     }
 
     private fun updateMediaSession(player: FilePlayer) {
@@ -555,15 +737,25 @@ class EqService : Service() {
             FilePlayer.State.ERROR -> PlaybackState.STATE_ERROR
             FilePlayer.State.IDLE -> PlaybackState.STATE_STOPPED
         }
+        val speed = if (state == PlaybackState.STATE_PLAYING) 1f else 0f
         val playback = PlaybackState.Builder()
             .setActions(
                 PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
                     PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_STOP or
-                    PlaybackState.ACTION_SEEK_TO
+                    PlaybackState.ACTION_SEEK_TO or PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM or
+                    PlaybackState.ACTION_PLAY_FROM_MEDIA_ID or PlaybackState.ACTION_PLAY_FROM_SEARCH or
+                    PlaybackState.ACTION_SET_RATING
             )
-            .setState(state, player.positionMs, if (state == PlaybackState.STATE_PLAYING) 1f else 0f)
+            .setState(state, player.positionMs, speed)
+            // Our buffer is the AudioTrack's (~200 ms), so "buffered" is the play head.
+            .setBufferedPosition(player.positionMs)
+            .setActiveQueueItemId(
+                player.currentTrack?.let(::queueItemId) ?: -1L
+            )
         if (state == PlaybackState.STATE_ERROR) playback.setErrorMessage(player.lastError ?: "Playback error")
         session.setPlaybackState(playback.build())
+        session.isActive = true
+        pushQueue(session, player)
 
         val track = player.currentTrack
         val info = player.currentInfo
@@ -599,14 +791,28 @@ class EqService : Service() {
         }
     }
 
-    private fun buildMetadata(player: FilePlayer, track: FilePlayer.Track?, art: android.graphics.Bitmap?): MediaMetadata {
+    private fun buildMetadata(player: FilePlayer, track: Track?, art: android.graphics.Bitmap?): MediaMetadata {
         val b = MediaMetadata.Builder()
             .putString(MediaMetadata.METADATA_KEY_TITLE,
                 (if (track?.artist == null) player.currentInfo?.title else null) ?: track?.title ?: player.currentTitle ?: "")
             .putString(MediaMetadata.METADATA_KEY_ARTIST, track?.artist ?: player.currentInfo?.artist ?: player.formatInfo ?: "CabinEQ")
             .putString(MediaMetadata.METADATA_KEY_ALBUM, track?.album ?: player.queueTitle ?: "")
             .putLong(MediaMetadata.METADATA_KEY_DURATION, player.durationMs)
-        track?.artworkUrl?.let { b.putString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, it) }
+        // The car draws its own artwork from a URI it can open itself; the bitmap below is for
+        // the lock screen / notification. Covers resolved here also work for streamed files with
+        // no embedded art (the iTunes fallback query).
+        val fallbackQuery = when {
+            track == null -> null
+            track.artist != null -> "${track.artist} ${track.title}"
+            player.currentInfo?.artist != null ->
+                "${player.currentInfo?.artist} ${player.currentInfo?.title ?: track.title}"
+            else -> player.currentInfo?.title ?: track.title
+        }
+        ArtworkProvider.uriFor(
+            url = track?.artworkUrl,
+            query = if (track?.artworkUrl == null) fallbackQuery else null,
+            sizePx = ART_PX,
+        )?.let { b.putString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, it.toString()) }
         art?.let { b.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) }
         return b.build()
     }
@@ -645,7 +851,7 @@ class EqService : Service() {
             this, 1, Intent(this, EqService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE
         )
         val builder = Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
+            .setSmallIcon(R.drawable.ic_stat_cabineq)
             .setContentTitle("CabinEQ is running")
             .setContentText(if (capture != null) "Native DSP active" else "Android EQ active")
             .setContentIntent(openApp)
@@ -684,6 +890,7 @@ class EqService : Service() {
         const val ACTION_STOP = "dev.alamo3.cabineq.STOP"
         /** Sent when the in-app player starts, so the service runs (EQ updates, MediaSession). */
         const val ACTION_PLAYER_ATTACH = "dev.alamo3.cabineq.PLAYER_ATTACH"
+        const val ACTION_MEDIA_BUTTON = "dev.alamo3.cabineq.MEDIA_BUTTON"
         const val ACTION_PLAYER_PREV = "dev.alamo3.cabineq.PLAYER_PREV"
         const val ACTION_PLAYER_TOGGLE = "dev.alamo3.cabineq.PLAYER_TOGGLE"
         const val ACTION_PLAYER_NEXT = "dev.alamo3.cabineq.PLAYER_NEXT"
@@ -700,7 +907,6 @@ class EqService : Service() {
         private const val HEADROOM_SHARE_FOR_SPEED = 0.5f
         private const val LIMITER_THRESHOLD_LIN = 0.891f  // -1 dBFS
 
-        private const val SPEAKER_GRACE_MS = 1500L
         private const val BLOCKED_SILENCE_MS = 2500L
 
         private const val GPS_INTERVAL_MS = 1000L

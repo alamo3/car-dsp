@@ -23,6 +23,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
+import dev.alamo3.cabineq.music.Ui
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -86,22 +87,30 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(32))
         }
+        // Secondary screen: reachable from Music's settings, so give it a way back when it is
+        // not the task root (system back works too, this is just visible).
+        if (!isTaskRoot) {
+            root.addView(TextView(this).apply {
+                text = "‹  Music"
+                textSize = 15f
+                setTextColor(Ui.ACCENT)
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setPadding(0, dp(4), 0, dp(10))
+                setOnClickListener { finish() }
+            })
+        }
         root.addView(TextView(this).apply {
-            text = "CabinEQ"
+            text = "Equalizer & DSP"
             textSize = 26f
             setPadding(0, dp(4), 0, dp(12))
         })
 
-        startStopButton = Button(this).apply {
-            textSize = 18f
-            minHeight = dp(56)
-            setOnClickListener { toggleService() }
-        }
-        root.addView(startStopButton)
-        root.addView(Button(this).apply {
-            text = "Music — search & play through the EQ"
-            minHeight = dp(48)
-            setOnClickListener { startActivity(Intent(this@MainActivity, MusicActivity::class.java)) }
+        root.addView(TextView(this).apply {
+            text = "Shapes everything CabinEQ plays — search, Android Auto and Jam. " +
+                "Capturing other apps is optional, at the bottom."
+            textSize = 13f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(12))
         })
 
         // --- EQ ---
@@ -175,14 +184,47 @@ class MainActivity : Activity() {
         }
         root.addView(statusText)
 
-        dspButton = Button(this).apply {
-            text = "Start native DSP for other apps"
-            setOnClickListener { requestDspStart() }
-        }
-        root.addView(dspButton)
+        // --- Speed compensation ---
+        root.addView(header("Speed compensation"))
+        root.addView(switch("Enabled", settings.speedCompEnabled) { settings.speedCompEnabled = it })
+        slider(
+            root, format = { "Max boost  ${fmt(it)} dB" },
+            min = 0f, max = 12f, step = 0.5f, initial = settings.speedMaxBoostDb,
+        ) { settings.speedMaxBoostDb = it }
+        slider(
+            root, format = { "Starts at  ${it.roundToInt()} km/h" },
+            min = 0f, max = 100f, step = 5f, initial = settings.speedStartKmh,
+        ) { settings.speedStartKmh = it }
+        slider(
+            root, format = { "Full at  ${it.roundToInt()} km/h" },
+            min = 40f, max = 160f, step = 5f, initial = settings.speedFullKmh,
+        ) { settings.speedFullKmh = it }
 
-        // --- Engine ---
-        root.addView(header("Engine"))
+        // --- Other apps (optional) ---
+        // The player has its own DSP: none of this is needed to play music through CabinEQ.
+        root.addView(header("Eq other apps (optional)"))
+        root.addView(TextView(this).apply {
+            text = "Only for audio played by other apps (Spotify, podcasts, …). CabinEQ's own playback " +
+                "always runs through the same DSP with or without this."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(8))
+        })
+        startStopButton = Button(this).apply {
+            textSize = 16f
+            minHeight = dp(48)
+            setOnClickListener { toggleService() }
+        }
+        root.addView(startStopButton)
+        if (settings.captureBlockedPackages.isNotEmpty()) {
+            root.addView(TextView(this).apply {
+                text = "Some apps block capture: ${settings.captureBlockedPackages.joinToString()} — they get " +
+                    "Android's own EQ instead."
+                textSize = 12f
+                alpha = 0.7f
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
         root.addView(switch("Native DSP (captures app audio)", settings.dspEngine) { settings.dspEngine = it })
         root.addView(TextView(this).apply {
             text = "On: CabinEQ captures your music app's audio, processes it in its own DSP engine and plays " +
@@ -200,22 +242,11 @@ class MainActivity : Activity() {
         }
         root.addView(blockedButton)
         refreshBlockedButton()
-
-        // --- Speed compensation ---
-        root.addView(header("Speed compensation"))
-        root.addView(switch("Enabled", settings.speedCompEnabled) { settings.speedCompEnabled = it })
-        slider(
-            root, format = { "Max boost  ${fmt(it)} dB" },
-            min = 0f, max = 12f, step = 0.5f, initial = settings.speedMaxBoostDb,
-        ) { settings.speedMaxBoostDb = it }
-        slider(
-            root, format = { "Starts at  ${it.roundToInt()} km/h" },
-            min = 0f, max = 100f, step = 5f, initial = settings.speedStartKmh,
-        ) { settings.speedStartKmh = it }
-        slider(
-            root, format = { "Full at  ${it.roundToInt()} km/h" },
-            min = 40f, max = 160f, step = 5f, initial = settings.speedFullKmh,
-        ) { settings.speedFullKmh = it }
+        dspButton = Button(this).apply {
+            text = "Start native DSP for other apps"
+            setOnClickListener { requestDspStart() }
+        }
+        root.addView(dspButton)
 
         // --- Testing ---
         root.addView(header("Testing"))
@@ -224,7 +255,6 @@ class MainActivity : Activity() {
             root, format = { "Simulated  ${it.roundToInt()} km/h" },
             min = 0f, max = 160f, step = 5f, initial = settings.simulatedKmh,
         ) { settings.simulatedKmh = it }
-        root.addView(switch("Allow DSP output on phone speaker", settings.allowSpeakerOutput) { settings.allowSpeakerOutput = it })
         root.addView(switch("Global mode (session 0, fallback)", settings.globalMode) { settings.globalMode = it })
         root.addView(TextView(this).apply {
             text = "Use global mode only if your music app never shows up in the session list. " +
@@ -333,7 +363,7 @@ class MainActivity : Activity() {
 
     private fun refreshStatus() {
         val s = EngineState
-        startStopButton.text = if (s.running) "Stop CabinEQ" else "Start CabinEQ"
+        startStopButton.text = if (s.running) "Stop eq for other apps" else "Start eq for other apps"
         refreshBlockedButton()
         dspButton.visibility = if (s.running && !s.dspActive && settings.dspEngine) View.VISIBLE else View.GONE
         eqView.setApplied(if (s.running) s.appliedBands else null)

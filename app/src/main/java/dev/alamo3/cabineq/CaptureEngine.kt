@@ -147,11 +147,6 @@ class CaptureEngine(private val context: Context, private val projection: MediaP
         return track?.routedDevice?.type
     }
 
-    fun isRoutedToPhoneSpeaker(): Boolean {
-        val t = routedDeviceType() ?: return false
-        return t == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER || t == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE
-    }
-
     private fun loop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
         val rec = record ?: return

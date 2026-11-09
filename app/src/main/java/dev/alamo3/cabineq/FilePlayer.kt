@@ -13,6 +13,8 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
 import android.util.Log
@@ -38,19 +40,10 @@ import kotlin.math.max
  */
 class FilePlayer private constructor(private val context: Context) {
 
-    /**
-     * One queue entry. [resolveUrl] runs on the player thread right before the track starts
-     * (links can expire). The other fields are display metadata (UI, MediaSession, car screen).
-     */
-    class Track(
-        val title: String,
-        val artist: String? = null,
-        val album: String? = null,
-        val artworkUrl: String? = null,
-        val resolveUrl: () -> String,
-    )
-
     enum class State { IDLE, LOADING, PLAYING, PAUSED, ERROR }
+
+    /** What happens when a track — or the queue — ends. */
+    enum class Repeat { OFF, ALL, ONE }
 
     @Volatile var state = State.IDLE
         private set
@@ -60,13 +53,20 @@ class FilePlayer private constructor(private val context: Context) {
         private set
     @Volatile var currentIndex = -1
         private set
+    /** Stable per-entry ids for the queue, aligned with [queue]; used by the Jam session. */
+    @Volatile private var queueKeys: List<String> = emptyList()
     @Volatile var positionMs = 0L
+        private set
+    /** When the decode loop last moved the play head; used to detect a dead output sink. */
+    @Volatile var lastProgressAt = 0L
         private set
     @Volatile var durationMs = 0L
         private set
-    /** e.g. "FLAC 44.1 kHz / 16-bit" */
+    /** e.g. "FLAC 44.1 kHz / 16-bit · lossless" */
     @Volatile var formatInfo: String? = null
         private set
+    /** What the source claims about quality ("lossless"), appended to the decoder's line. */
+    @Volatile private var declaredQuality: String? = null
     @Volatile var lastError: String? = null
         private set
     /** Tags and cover embedded in the current file (read in the background; null until known). */
@@ -74,13 +74,24 @@ class FilePlayer private constructor(private val context: Context) {
 
     @Volatile var currentInfo: FileInfo? = null
         private set
-    private val infoPool = Executors.newSingleThreadExecutor { r -> Thread(r, "CabinEQ-Tags").apply { isDaemon = true } }
+    // Two threads: a stalled HTTP retriever must not hold up the next track's tags forever.
+    private val infoPool = Executors.newFixedThreadPool(2) { r -> Thread(r, "CabinEQ-Tags").apply { isDaemon = true } }
+    private val infoBusy = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    // The queue is persisted so a relaunch can pick up where it stopped (and, later, so the
+    // car can browse and resume it). Kept off the player thread: this pool never touches audio.
+    private val settings = Settings(context)
+    private val persistPool = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "CabinEQ-Queue").apply { isDaemon = true }
+    }
+    private val saveHandler = Handler(Looper.getMainLooper())
+    private val saveRunnable = Runnable { saveQueue() }
 
     /** Transient status from the track source, e.g. "Waiting on TorBox: caching" (cleared on play). */
     @Volatile var note: String? = null
         private set
 
-    /** Called from a [Track.resolveUrl] while it waits on its source. */
+    /** Called from [TrackResolver] while it waits on its source. */
     fun setNote(text: String?) {
         note = text
         version++
@@ -90,15 +101,46 @@ class FilePlayer private constructor(private val context: Context) {
     @Volatile var version = 0
         private set
 
+    /**
+     * Brings back the last queue, paused at the saved position. State stays IDLE: nothing plays,
+     * no notification appears, and no audio is touched until the user presses play ([resume]
+     * starts the worker at [positionMs]).
+     */
+    private fun restoreQueue() {
+        val snap = settings.queueSnapshot ?: return
+        queue = snap.tracks
+        queueKeys = snap.tracks.map { newKey() }
+        radioSeed = settings.radioSeed      // the one-ahead refill survives a restart
+        queueTitle = snap.title
+        currentIndex = snap.index
+        positionMs = snap.positionMs
+        durationMs = snap.tracks.getOrNull(snap.index)?.durationMs ?: 0
+        version++
+        Log.i(TAG, "Restored ${snap.tracks.size} tracks at ${snap.index}, ${snap.positionMs} ms")
+    }
+
+    /** Advances OFF -> ALL -> ONE -> OFF (the phone's repeat button). */
+    fun cycleRepeat(): Repeat {
+        setRepeat(
+            when (repeat) {
+                Repeat.OFF -> Repeat.ALL
+                Repeat.ALL -> Repeat.ONE
+                Repeat.ONE -> Repeat.OFF
+            }
+        )
+        return repeat
+    }
+
+    /** Also called by the car: its media UI sends SET_REPEAT_MODE on the session. */
+    fun setRepeat(mode: Repeat) {
+        if (repeat == mode) return
+        repeat = mode
+        version++
+        persistPool.execute { runCatching { settings.repeatMode = mode.name } }
+    }
+
     val currentTitle: String? get() = queue.getOrNull(currentIndex)?.title
     val currentTrack: Track? get() = queue.getOrNull(currentIndex)
-
-    /**
-     * Identifies the current queue/skip. A [Track.resolveUrl] that waits (e.g. on TorBox caching)
-     * captures it at start and gives up once [isStale] says playback moved on.
-     */
-    val ticket: Int get() = generation * 100_000 + (if (jumpTo >= 0) -1 else currentIndex)
-    fun isStale(ticket: Int): Boolean = ticket != this.ticket
     val isActive: Boolean get() = state == State.LOADING || state == State.PLAYING || state == State.PAUSED
 
     private val audioManager = context.getSystemService(AudioManager::class.java)
@@ -107,8 +149,29 @@ class FilePlayer private constructor(private val context: Context) {
     @Volatile private var generation = 0          // incremented to retire the current worker
     @Volatile private var jumpTo = -1             // pending skip target
     @Volatile private var seekToMs = -1L          // pending seek within the current track
-    @Volatile private var userPaused = false
+    /** True when the pause came from the user (button/car), not from focus or a stall. */
+    @Volatile var userPaused = false
+        private set
+    @Volatile var repeat = Repeat.OFF
+        private set
+
+    init {
+        repeat = runCatching { Repeat.valueOf(settings.repeatMode) }.getOrDefault(Repeat.OFF)
+        restoreQueue()
+    }
     @Volatile private var focusPaused = false
+    /** Artist-radio seed: one more track is queued when this one becomes the last entry. */
+    /** Set by the stall watchdog: the worker should recreate its AudioTrack and continue. */
+    @Volatile private var rebuildOutput = false
+    /** A "next" pressed at the end of the queue: jump to the track the radio is fetching. */
+    @Volatile private var followNewTrack = false
+    private var lastStallRebuildAt = 0L
+
+    @Volatile private var radioSeed: Track? = null
+    @Volatile private var radioBusy = false
+    private val radioPool = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "CabinEQ-Radio").apply { isDaemon = true }
+    }
 
     // EQ state and the active output's native engine, guarded by [eqLock].
     private val eqLock = Any()
@@ -121,24 +184,61 @@ class FilePlayer private constructor(private val context: Context) {
 
     // ---------------------------------------------------------------- controls
 
-    fun play(tracks: List<Track>, startIndex: Int = 0, title: String? = null) {
+    fun play(
+        tracks: List<Track>,
+        startIndex: Int = 0,
+        title: String? = null,
+        startAtMs: Long = 0,
+        /** When set, the queue is topped up one track at a time from this seed's artist. */
+        radio: Track? = null,
+    ) {
         if (tracks.isEmpty()) return
+        // Playing something else while a track was underway is a skip (but a resume from IDLE is
+        // not: state IDLE/ERROR never reaches this branch).
+        val wasPlaying = currentTrack
+        if (wasPlaying != null && (state == State.PLAYING || state == State.PAUSED || state == State.LOADING)) {
+            Log.i(TAG, "play() replaces ${wasPlaying.title} at ${positionMs}ms (state=$state) — counted as a skip")
+            Taste.onSkip(context, wasPlaying, positionMs, durationMs)
+        }
         stopWorker()
         seedEqFromSettings()
-        queue = tracks
+        synchronized(eqLock) {
+            if (tracks !== queue || queueKeys.size != tracks.size) {
+                queue = tracks
+                queueKeys = tracks.map { newKey() }
+            }
+            // else: resuming the queue we already have (e.g. after it ran out) — keep the entry
+            // keys, or every guest's "up next" would refer to a track that no longer exists.
+        }
         queueTitle = title
+        radioSeed = radio
+        persistPool.execute { runCatching { settings.radioSeed = radio } }
         lastError = null
         userPaused = false
         focusPaused = false
+        interrupted = false
         jumpTo = -1
-        if (!requestFocus()) {
-            lastError = "Another app holds audio focus"
-            setState(State.ERROR)
-            return
-        }
+        // Leave PAUSED behind: the worker stops at the top of its loop while paused, so a track
+        // picked while the player was paused (focus loss, speaker guard, prior pause) would never
+        // even open — it looked like "tap a song, nothing happens".
+        if (state != State.LOADING) setState(State.LOADING)
         val gen = ++generation
-        val worker = Worker(gen, startIndex.coerceIn(0, tracks.lastIndex))
-        thread = Thread(worker, "CabinEQ-Player").apply { start() }
+        val worker = Worker(gen, startIndex.coerceIn(0, tracks.lastIndex), startAtMs.coerceAtLeast(0))
+        val begin = {
+            if (gen != generation) Unit
+            else {
+                Log.i(TAG, "play: ${tracks.size} tracks from $startIndex at ${startAtMs}ms, title=$title")
+                thread = Thread(worker, "CabinEQ-Player").apply { start() }
+            }
+        }
+        if (requestFocus()) {
+            begin()
+        } else {
+            // A momentary refusal (the car host or a nav prompt shuffling focus) must not turn a
+            // tap into "nothing happens": retry briefly, then start when focus is granted.
+            Log.w(TAG, "play: focus refused, retrying (${tracks.size} tracks, index=$startIndex)")
+            requestFocusForUser { begin() }
+        }
     }
 
     fun togglePause() {
@@ -148,23 +248,46 @@ class FilePlayer private constructor(private val context: Context) {
     fun pause() {
         if (!isActive) return
         userPaused = true
-        setState(State.PAUSED)
+        interrupted = false
+        setState(State.PAUSED, "paused by user")
     }
 
     fun resume() {
         if (state == State.IDLE || state == State.ERROR) {
-            if (queue.isNotEmpty()) play(queue, max(0, currentIndex), queueTitle)
+            // Includes a queue restored from the last session: start where it left off.
+            if (queue.isNotEmpty()) {
+                play(queue, max(0, currentIndex), queueTitle, startAtMs = positionMs, radio = radioSeed)
+            }
             return
         }
-        if (!requestFocus()) return
         userPaused = false
         focusPaused = false
-        if (state == State.PAUSED) setState(State.PLAYING)
+        requestFocusForUser {
+            Log.i(TAG, "resume: focus granted")
+            if (state == State.PAUSED) setState(State.PLAYING, "resume")
+        }
     }
 
     fun next() {
         if (queue.isEmpty()) return
-        if (currentIndex < queue.lastIndex) skipTo(currentIndex + 1) else stop()
+        if (currentIndex < queue.lastIndex) {
+            skipTo(currentIndex + 1)
+            return
+        }
+        when (repeat) {
+            Repeat.ALL -> { skipTo(0); return }
+            Repeat.ONE -> { skipTo(currentIndex); return }
+            Repeat.OFF -> Unit
+        }
+        // Last track and no loop: don't tear the session down. Ask the radio for one more and
+        // follow it when it lands; without a seed just pause, keeping the queue and the session.
+        if (radioSeed != null) {
+            followNewTrack = true
+            Log.i(TAG, "next at the end of the queue: asking the radio for one more")
+            extendRadioIfNeeded(force = true)
+        } else {
+            pause()
+        }
     }
 
     /** Restarts the current track if more than 3 s in, otherwise goes to the previous one. */
@@ -180,7 +303,7 @@ class FilePlayer private constructor(private val context: Context) {
             jumpTo = index
             if (state == State.PAUSED) setState(State.LOADING)
         } else {
-            play(queue, index, queueTitle)
+            play(queue, index, queueTitle, radio = radioSeed)
         }
     }
 
@@ -191,13 +314,144 @@ class FilePlayer private constructor(private val context: Context) {
         seekToMs = target
         positionMs = target
         version++
+        scheduleSave()
+    }
+
+    // ---------------------------------------------------------------- queue editing
+
+    /** A queue entry with its stable key (the Jam session addresses entries by key). */
+    class QueuedTrack(val key: String, val track: Track)
+
+    fun queuedTracks(): List<QueuedTrack> = synchronized(eqLock) {
+        val q = queue
+        val keys = queueKeys
+        q.mapIndexed { i, t -> QueuedTrack(keys.getOrElse(i) { "" }, t) }
+    }
+
+    private fun newKey(): String =
+        "k" + java.lang.Long.toHexString(System.nanoTime() and 0xFFFFFFFFL) +
+            java.util.concurrent.ThreadLocalRandom.current().nextInt(0x10000).toString(16)
+
+    /**
+     * Appends to the end of the queue. Only the tail changes, so a running worker — which reads
+     * [queue] per track — never sees an index shift.
+     */
+    fun enqueue(tracks: List<Track>): List<String> {
+        if (tracks.isEmpty()) return emptyList()
+        val keys = tracks.map { newKey() }
+        synchronized(eqLock) {
+            queue = queue + tracks
+            queueKeys = queueKeys + keys
+        }
+        version++
+        saveQueue()
+        return keys
+    }
+
+    /** Removes an upcoming entry. Refuses to touch the current or already-played entries. */
+    fun removeUpcoming(key: String): Boolean {
+        synchronized(eqLock) {
+            val i = queueKeys.indexOf(key)
+            if (i <= currentIndex) return false
+            queue = queue.toMutableList().also { it.removeAt(i) }
+            queueKeys = queueKeys.toMutableList().also { it.removeAt(i) }
+        }
+        version++
+        saveQueue()
+        return true
+    }
+
+    /** Moves an upcoming entry to [to] (an index in the queue, never at or before current). */
+    fun moveUpcoming(key: String, to: Int): Boolean {
+        synchronized(eqLock) {
+            val from = queueKeys.indexOf(key)
+            if (from <= currentIndex) return false
+            val target = to.coerceIn(currentIndex + 1, queue.lastIndex)
+            if (from == target) return true
+            val q = queue.toMutableList()
+            val k = queueKeys.toMutableList()
+            val track = q.removeAt(from)
+            val keyAt = k.removeAt(from)
+            q.add(target, track)
+            k.add(target, keyAt)
+            queue = q
+            queueKeys = k
+        }
+        version++
+        saveQueue()
+        return true
+    }
+
+    /**
+     * Keeps exactly one track ahead: when the song that just started is the last one queued,
+     * fetch the artist's next track in the background and append it. Never blocks playback.
+     */
+    private fun extendRadioIfNeeded(force: Boolean = false) {
+        val seed = radioSeed ?: return
+        if (radioBusy) return
+        if (repeat != Repeat.OFF) return                   // looping is the user's chosen queue
+        if (!force && currentIndex != queue.lastIndex) return   // something is already queued ahead
+        if (!force && state != State.PLAYING && state != State.LOADING) return
+        radioBusy = true
+        val gen = generation
+        radioPool.execute {
+            val queued = runCatching { queuedTracks() }.getOrDefault(emptyList())
+            val exclude = queued.flatMap { Radio.identity(it.track) }.toHashSet()
+            val session = queued.takeLast(5).mapNotNull { it.track.artist?.trim()?.lowercase() }.toSet()
+            val currentArtist = queued.getOrNull(currentIndex)?.track?.artist
+            val next = runCatching { Radio.next(context, seed, exclude, session, currentArtist) }.getOrNull()
+            radioBusy = false
+            if (next == null || gen != generation || radioSeed !== seed) return@execute
+            Log.i(TAG, "Radio: queuing \"${next.title}\" — ${next.artist}")
+            enqueue(listOf(next))
+            if (followNewTrack) {
+                // The user pressed "next" at the end of the queue: jump to what just arrived.
+                followNewTrack = false
+                skipTo(queue.lastIndex)
+            } else if (state == State.IDLE) {
+                // Playback ran dry while we were fetching: pick the new track up.
+                skipTo(queue.lastIndex)
+            }
+        }
     }
 
     fun stop() {
+        followNewTrack = false
+        radioSeed = null
+        persistPool.execute { runCatching { settings.radioSeed = null } }
         stopWorker()
         abandonFocus()
         positionMs = 0
         setState(State.IDLE)
+        saveQueue()   // a stop may be the last thing before the process goes away
+    }
+
+    /**
+     * A dead output sink (route changed, the car bus stopped consuming, a HAL bug) blocks
+     * AudioTrack.write forever, and that looks exactly like "it just doesn't play". Detect it,
+     * unblock the worker and pause with a message the user can act on.
+     */
+    fun recoverStalledOutput(): Boolean {
+        if (state != State.PLAYING) return false
+        val last = lastProgressAt
+        val now = SystemClock.elapsedRealtime()
+        if (last == 0L || now - last < STALL_MS) return false
+        Log.w(TAG, "No progress for ${now - last} ms; output sink looks dead")
+        // Flushing a blocked write makes it return so the worker can react at all.
+        current?.let { runCatching { it.track.pause(); it.track.flush() } }
+        lastProgressAt = now
+        if (now - lastStallRebuildAt > STALL_REBUILD_WINDOW_MS) {
+            // First stall in a while: rebuild the AudioTrack and keep playing from here. The sink
+            // (not the decoder) is what died, so nothing else has to be thrown away.
+            lastStallRebuildAt = now
+            rebuildOutput = true
+            version++
+            return false
+        }
+        // Not the user's pause: a later play press (or a recovered route) may continue.
+        if (isActive) setState(State.PAUSED, "output stalled")
+        version++
+        return true
     }
 
     /** Called by EqService at 10 Hz with the smoothed EQ (user EQ + speed compensation). */
@@ -230,32 +484,73 @@ class FilePlayer private constructor(private val context: Context) {
 
     fun routedDeviceType(): Int? = if (state == State.PLAYING) current?.track?.routedDevice?.type else null
 
-    fun isRoutedToPhoneSpeaker(): Boolean {
-        val t = routedDeviceType() ?: return false
-        return t == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER || t == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER_SAFE
-    }
-
     // ---------------------------------------------------------------- audio focus
 
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        Log.i(TAG, "focus change $change (state=${state.name}, userPaused=$userPaused)")
         when (change) {
             AudioManager.AUDIOFOCUS_LOSS -> {
-                // Another music app started: pause and stay paused.
-                userPaused = true
-                if (isActive) setState(State.PAUSED)
+                // Another app took over. Not a user pause: in Android Auto the projection host
+                // grabs focus around the media panel, so when focus comes back we resume by
+                // ourselves. Never grab it back on a timer — that would fight a real player.
+                interrupted = state == State.PLAYING || state == State.LOADING
+                if (isActive) setState(State.PAUSED, "audio focus lost")
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
                 // Phone call etc.: pause, resume when it ends.
                 focusPaused = true
-                if (state == State.PLAYING || state == State.LOADING) setState(State.PAUSED)
+                if (state == State.PLAYING || state == State.LOADING) {
+                    setState(State.PAUSED, "audio focus transient loss")
+                }
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
-                if (focusPaused && !userPaused && state == State.PAUSED) setState(State.PLAYING)
+                val resume = interrupted && !userPaused && state == State.PAUSED
+                interrupted = false
                 focusPaused = false
+                if (resume) setState(State.PLAYING, "audio focus back")
             }
             // LOSS_TRANSIENT_CAN_DUCK (navigation prompts): the system ducks us automatically.
         }
     }
+
+    /**
+     * The user (or the car's transport controls) asked for playback: if focus is momentarily
+     * refused, try again a few times instead of failing immediately. Bounded, so a genuine
+     * takeover by another app still wins.
+     */
+    private fun requestFocusForUser(then: () -> Unit) {
+        val genAtRequest = generation
+        if (requestFocus()) {
+            then()
+            return
+        }
+        var tries = 0
+        fun attempt() {
+            // The user may have paused (or started something else) while we were waiting: never
+            // resurrect playback they cancelled.
+            if (userPaused || generation != genAtRequest) return
+            if (tries >= FOCUS_RETRIES) {
+                Log.w(TAG, "focus refused ${tries + 1} times, giving up")
+                lastError = "Another app holds audio focus"
+                setState(State.ERROR)
+                return
+            }
+            tries++
+            focusHandler.postDelayed({
+                if (userPaused || generation != genAtRequest) return@postDelayed
+                if (requestFocus()) {
+                    Log.i(TAG, "focus granted on retry $tries")
+                    then()
+                } else {
+                    attempt()
+                }
+            }, FOCUS_RETRY_MS)
+        }
+        attempt()
+    }
+
+    private val focusHandler = Handler(Looper.getMainLooper())
+    @Volatile private var interrupted = false
 
     private val focusRequest: AudioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
         .setAudioAttributes(ATTRIBUTES)
@@ -339,26 +634,48 @@ class FilePlayer private constructor(private val context: Context) {
         class Failed(val message: String) : Outcome()
     }
 
-    private inner class Worker(private val gen: Int, private val start: Int) : Runnable {
+    private inner class Worker(private val gen: Int, private val start: Int, private var startAtMs: Long) : Runnable {
         private var output: Output? = null
         private var stereo = FloatArray(0)
+        private var lastSavedAt = 0L
 
         private val live: Boolean get() = gen == generation
+
+        /** True once audio for the current track actually reached the speaker. */
+        private var startedAny = false
+        private var beganThisTrack = false
+        /** One taste event per track: finished or skipped, never both. */
+        private var tasteReported = false
 
         override fun run() {
             Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
             var index = start
             var consecutiveFailures = 0
+            var lastOutcomeFailed = false
             try {
-                while (live && index in queue.indices) {
+                while (live) {
+                    if (index !in queue.indices) {
+                        // End of the queue: loop it, or stop.
+                        if (repeat == Repeat.ALL && queue.isNotEmpty() && !lastOutcomeFailed) {
+                            index = 0
+                            continue
+                        }
+                        break
+                    }
                     currentIndex = index
+                    beganThisTrack = false
+                    tasteReported = false
+                    declaredQuality = null
                     currentInfo = null
                     note = null
                     seekToMs = -1
                     positionMs = 0
-                    durationMs = 0
+                    lastProgressAt = SystemClock.elapsedRealtime()
+                    // Known length from the source until the decoder reports the real one.
+                    durationMs = queue.getOrNull(index)?.durationMs ?: 0
                     formatInfo = null
                     if (state != State.PAUSED) setState(State.LOADING) else version++
+                    extendRadioIfNeeded()
                     val outcome = try {
                         playTrack(queue[index])
                     } catch (e: Exception) {
@@ -371,13 +688,19 @@ class FilePlayer private constructor(private val context: Context) {
                     if (pendingJump >= 0 && outcome !is Outcome.Jump && outcome !is Outcome.Cancelled) {
                         jumpTo = -1
                         consecutiveFailures = 0
+                        reportSkip()
                         index = pendingJump
                         continue
                     }
+                    lastOutcomeFailed = outcome is Outcome.Failed
                     when (outcome) {
-                        Outcome.Finished -> { consecutiveFailures = 0; index++ }
+                        Outcome.Finished -> {
+                            consecutiveFailures = 0
+                            reportComplete()
+                            if (repeat != Repeat.ONE) index++   // ONE: replay the same track
+                        }
                         Outcome.Cancelled -> return
-                        is Outcome.Jump -> { consecutiveFailures = 0; index = outcome.index }
+                        is Outcome.Jump -> { consecutiveFailures = 0; reportSkip(); index = outcome.index }
                         is Outcome.Failed -> {
                             lastError = "${queue.getOrNull(index)?.title}: ${outcome.message}"
                             if (++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -392,6 +715,16 @@ class FilePlayer private constructor(private val context: Context) {
                 output?.let { drain(it) }
                 if (live) {
                     abandonFocus()
+                    if (lastOutcomeFailed) {
+                        if (!startedAny) {
+                            // Nothing in this queue produced audio. Retrying the same entry
+                            // forever looks like "the buttons do nothing" — say what broke.
+                            setState(State.ERROR)
+                            return
+                        }
+                        currentIndex = -1   // never retry a track that just failed
+                    }
+                    positionMs = 0   // a restored queue should start at the top, not at the end
                     setState(State.IDLE)
                 }
             } finally {
@@ -401,6 +734,22 @@ class FilePlayer private constructor(private val context: Context) {
         }
 
         /** Returns an output at [rate], reusing the current one if the rate matches (gapless). */
+        /** A finished track is the strongest positive signal we get without a like button. */
+        private fun reportComplete() {
+            if (tasteReported || !beganThisTrack) return
+            tasteReported = true
+            val t = queue.getOrNull(currentIndex) ?: return
+            Taste.onComplete(context, t, positionMs, durationMs)
+        }
+
+        /** Skipped: where they gave up on it is the signal (early = strongly negative). */
+        private fun reportSkip() {
+            if (tasteReported || !beganThisTrack) return
+            tasteReported = true
+            val t = queue.getOrNull(currentIndex) ?: return
+            Taste.onSkip(context, t, positionMs, durationMs)
+        }
+
         private fun outputFor(rate: Int): Output {
             output?.let { if (it.rate == rate) return it }
             output?.let { drain(it); it.release() }
@@ -421,9 +770,13 @@ class FilePlayer private constructor(private val context: Context) {
         }
 
         private fun playTrack(item: Track): Outcome {
-            val url = item.resolveUrl()
+            // Resolving can block for minutes (TorBox caching, addon 503/Retry-After), so it runs
+            // here on the player thread and publishes progress through the note.
+            val resolved = TrackResolver.resolve(context, item, onNote = { setNote(it) }, isCancelled = { !live })
             if (!live) return Outcome.Cancelled
             note = null
+            val url = resolved.url
+            declaredQuality = resolved.quality
             // Files without source artwork (e.g. TorBox library tracks): read the cover and tags
             // embedded in the file itself, which is exact per song even on compilations.
             if (item.artworkUrl == null) readFileInfo(url, gen, currentIndex)
@@ -452,11 +805,43 @@ class FilePlayer private constructor(private val context: Context) {
                 var out = outputFor(inFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE))
                 updateFormatInfo(mime, out.rate, sourceBits, channels)
 
+                // Resuming a saved queue: enter the stream at the sync point at or before the
+                // saved position. Only the first track of a worker starts here.
+                //
+                // Read one sample first: an extractor backed by a URL ignores a seek that
+                // arrives before its connection is open, which silently restarted resumed
+                // tracks at 0:00. The sample is thrown away, never sent to the decoder.
+                if (startAtMs > 0) {
+                    val probeSize = if (inFormat.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE))
+                        inFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).coerceIn(1 shl 12, 1 shl 20) else 1 shl 16
+                    val probe = ByteBuffer.allocateDirect(probeSize)
+                    if (extractor.readSampleData(probe, 0) >= 0) extractor.advance()
+                    extractor.seekTo(startAtMs * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                    positionMs = startAtMs
+                    Log.i(TAG, "Resuming at ${positionMs}ms")
+                    startAtMs = 0
+                }
+
                 val info = MediaCodec.BufferInfo()
                 var inputDone = false
 
                 while (true) {
                     if (!live) return Outcome.Cancelled
+                    if (rebuildOutput) {
+                        rebuildOutput = false
+                        val resumeAt = positionMs
+                        val rate = out.rate
+                        out.release()
+                        output = null
+                        out = outputFor(rate)
+                        out.pauseAndFlush()
+                        extractor.seekTo(resumeAt * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+                        dec.flush()
+                        inputDone = false
+                        positionMs = resumeAt
+                        Log.i(TAG, "Rebuilt the output sink, resuming at ${resumeAt}ms")
+                        continue
+                    }
                     val jump = jumpTo
                     if (jump >= 0) {
                         jumpTo = -1
@@ -528,7 +913,25 @@ class FilePlayer private constructor(private val context: Context) {
                         if (written < 0) return Outcome.Failed("AudioTrack.write error $written")
                         out.framesWritten += written / 2
                         positionMs = info.presentationTimeUs / 1000
+                        lastProgressAt = SystemClock.elapsedRealtime()
                         if (state == State.LOADING) setState(State.PLAYING)
+                        if (!beganThisTrack) {
+                            beganThisTrack = true
+                            startedAny = true
+                            // History/recommendations should reflect what was really heard, not
+                            // what was merely requested (some source ids have no stream at all).
+                            queue.getOrNull(currentIndex)?.let { began ->
+                                persistPool.execute { runCatching { settings.recordPlayed(began) } }
+                                runCatching { Taste.onPlay(context, began) }
+                            }
+                        }
+                        // Keep the saved position roughly current without touching the disk
+                        // from the audio thread on every buffer.
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastSavedAt > SAVE_INTERVAL_MS) {
+                            lastSavedAt = now
+                            scheduleSave()
+                        }
                     } else {
                         dec.releaseOutputBuffer(outIdx, false)
                     }
@@ -558,8 +961,14 @@ class FilePlayer private constructor(private val context: Context) {
     }
 
     private fun readFileInfo(url: String, gen: Int, index: Int) {
+        val key = "$gen:$index"
+        if (infoBusy.size > 32) infoBusy.clear()   // abandoned generations never clean themselves
+        if (!infoBusy.add(key)) return
         infoPool.execute {
-            if (gen != generation || index != currentIndex) return@execute
+            if (gen != generation || index != currentIndex) {
+                infoBusy.remove(key)
+                return@execute
+            }
             val r = MediaMetadataRetriever()
             val info = try {
                 r.setDataSource(url, HashMap<String, String>())
@@ -575,6 +984,7 @@ class FilePlayer private constructor(private val context: Context) {
             } finally {
                 runCatching { r.release() }
             }
+            infoBusy.remove(key)
             if (gen == generation && index == currentIndex) {
                 currentInfo = info
                 version++
@@ -615,9 +1025,33 @@ class FilePlayer private constructor(private val context: Context) {
         synchronized(eqLock) { current = null }
     }
 
-    private fun setState(s: State) {
+    private fun setState(s: State, reason: String? = null) {
+        if (s != state) {
+            Log.i(TAG, "State ${state.name} -> ${s.name}" + (reason?.let { " ($it)" } ?: ""))
+        }
         state = s
         version++
+        scheduleSave()
+    }
+
+    /** Coalesces saves: many state changes in a row land as one write. */
+    private fun scheduleSave() {
+        saveHandler.removeCallbacks(saveRunnable)
+        saveHandler.postDelayed(saveRunnable, SAVE_DELAY_MS)
+    }
+
+    private fun saveQueue() {
+        // Snapshot on the caller's thread, serialize and write on the persist thread.
+        val tracks = queue
+        val title = queueTitle
+        val index = currentIndex
+        val pos = positionMs
+        persistPool.execute {
+            val snap = if (tracks.isEmpty()) null
+            else QueueSnapshot(title, tracks, index.coerceIn(0, tracks.lastIndex), pos)
+            runCatching { settings.queueSnapshot = snap }
+                .onFailure { Log.w(TAG, "Couldn't save the queue: ${it.message}") }
+        }
     }
 
     private fun updateFormatInfo(mime: String, rate: Int, bits: Int, channels: Int) {
@@ -633,15 +1067,25 @@ class FilePlayer private constructor(private val context: Context) {
         }
         val bitsPart = if (bits > 0) " / $bits-bit" else ""
         val chPart = if (channels > 2) " / $channels ch → stereo" else ""
-        formatInfo = String.format(Locale.US, "%s %.1f kHz%s%s", codecName, rate / 1000.0, bitsPart, chPart)
+        val qualityPart = declaredQuality?.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()
+        formatInfo = String.format(Locale.US, "%s %.1f kHz%s%s%s", codecName, rate / 1000.0, bitsPart, chPart, qualityPart)
         version++
     }
 
     companion object {
+        /** Full focus loss retries: enough to survive the car host grabbing the panel. */
+        private const val FOCUS_RETRIES = 4
+        private const val FOCUS_RETRY_MS = 1500L
+
         private const val TAG = "CabinEQ/Player"
         private const val TIMEOUT_US = 10_000L
         private const val MAX_CONSECUTIVE_FAILURES = 3
         private const val KEY_BITS_PER_SAMPLE = "bits-per-sample"
+        private const val SAVE_DELAY_MS = 1_500L
+        private const val SAVE_INTERVAL_MS = 10_000L
+        private const val STALL_MS = 4_000L
+        /** A rebuilt sink gets this long before another stall is treated as fatal. */
+        private const val STALL_REBUILD_WINDOW_MS = 30_000L
 
         // Same policy as the capture output: system components (Android Auto) may capture it.
         private val ATTRIBUTES: AudioAttributes = AudioAttributes.Builder()

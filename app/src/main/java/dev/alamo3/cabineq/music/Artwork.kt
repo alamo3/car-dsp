@@ -170,40 +170,110 @@ object Artwork {
     }
 
     private fun fetch(context: Context, url: String, sizePx: Int): Bitmap? {
+        val file = fileAt(context, url) ?: return null
+        return decode(file, sizePx) ?: run {
+            lastError = "Not an image from ${URL(url).host}"
+            null
+        }
+    }
+
+    /**
+     * The cached file for [url], downloading it first if needed. Split out of [fetch] because
+     * [ArtworkProvider] has to hand the car a file rather than a bitmap.
+     */
+    private fun fileAt(context: Context, url: String): File? {
         val dir = File(context.cacheDir, "art").apply { mkdirs() }
         val file = File(dir, sha1(url))
+        if (file.exists() && file.length() > 0L) return file
         try {
-            if (!file.exists() || file.length() == 0L) {
-                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 10_000
-                    readTimeout = 15_000
-                    instanceFollowRedirects = true
-                    setRequestProperty("User-Agent", "Mozilla/5.0 (Android) CabinEQ")
-                    setRequestProperty("Accept", "image/*")
-                }
-                try {
-                    val code = conn.responseCode
-                    if (code !in 200..299) {
-                        lastError = "HTTP $code from ${URL(url).host}"
-                        return null
-                    }
-                    val tmp = File(dir, file.name + ".tmp")
-                    conn.inputStream.use { input -> tmp.outputStream().use { input.copyTo(it) } }
-                    if (!tmp.renameTo(file)) { tmp.delete(); return null }
-                } finally {
-                    conn.disconnect()
-                }
-                trimDisk(dir)
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10_000
+                readTimeout = 15_000
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Android) CabinEQ")
+                setRequestProperty("Accept", "image/*")
             }
-            return decode(file, sizePx) ?: run {
-                lastError = "Not an image from ${URL(url).host}"
-                null
+            try {
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    lastError = "HTTP $code from ${URL(url).host}"
+                    return null
+                }
+                val tmp = File(dir, file.name + ".tmp")
+                conn.inputStream.use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                if (!tmp.renameTo(file)) { tmp.delete(); return null }
+            } finally {
+                conn.disconnect()
             }
+            trimDisk(dir)
+            return file.takeIf { it.length() > 0L }
         } catch (e: Exception) {
             lastError = "${e.javaClass.simpleName}: ${e.message} (${runCatching { URL(url).host }.getOrDefault("?")})"
             Log.w(TAG, "Artwork failed: $lastError")
             return null
         }
+    }
+
+    /**
+     * Resolves [url], else an iTunes match for [fallbackQuery], to a cached image file, and
+     * checks that it really is an image. Called from [ArtworkProvider] on a binder thread, so it
+     * may block on the network; the car fetches icons one by one and caches them per screen.
+     */
+    /**
+     * MIME of artwork that is already cached for these arguments — never downloads, so the
+     * content provider can answer getType() without a network round trip.
+     */
+    fun cachedMimeType(context: Context, url: String?, fallbackQuery: String?, sizePx: Int): String? {
+        val dir = File(context.cacheDir, "art")
+        val candidates = ArrayList<String>(2)
+        url?.takeIf { it.isNotBlank() }?.let { candidates += resolveUrl(it, sizePx) }
+        if (!fallbackQuery.isNullOrBlank()) {
+            // Only an already-resolved iTunes match counts: never do the lookup just to answer.
+            lookups["${Kind.SONG.entity}:${fallbackQuery.lowercase()}"]
+                ?.takeIf { it.isNotBlank() }?.let { candidates += sized(it, sizePx) }
+        }
+        for (candidate in candidates) {
+            if (candidate.isBlank()) continue
+            val file = File(dir, sha1(candidate))
+            if (file.exists() && file.length() > 0L) sniffImageType(file)?.let { return it }
+        }
+        return null
+    }
+
+    /** Magic-byte check: the cache has no file extensions to trust. */
+    private fun sniffImageType(file: File): String? = runCatching {
+        file.inputStream().use { input ->
+            val head = ByteArray(12)
+            val n = input.read(head)
+            when {
+                n >= 3 && head[0] == 0x89.toByte() && head[1] == 'P'.code.toByte() &&
+                    head[2] == 'N'.code.toByte() -> "image/png"
+                n >= 3 && head[0] == 0xFF.toByte() && head[1] == 0xD8.toByte() -> "image/jpeg"
+                n >= 12 && String(head, 0, 4) == "RIFF" && String(head, 8, 4) == "WEBP" -> "image/webp"
+                n >= 3 && String(head, 0, 3) == "GIF" -> "image/gif"
+                else -> null
+            }
+        }
+    }.getOrNull()
+
+    fun fileFor(context: Context, url: String?, fallbackQuery: String?, sizePx: Int): File? {
+        val candidates = ArrayList<String>(2)
+        url?.takeIf { it.isNotBlank() }?.let { candidates += resolveUrl(it, sizePx) }
+        if (!fallbackQuery.isNullOrBlank()) {
+            itunesArtwork(fallbackQuery, Kind.SONG, sizePx)?.let { candidates += it }
+        }
+        for (candidate in candidates) {
+            val file = fileAt(context, candidate) ?: continue
+            if (isImage(file)) return file
+            file.delete()
+        }
+        return null
+    }
+
+    private fun isImage(file: File): Boolean {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.path, bounds)
+        return bounds.outWidth > 0 && bounds.outHeight > 0
     }
 
     private fun decode(file: File, sizePx: Int): Bitmap? {

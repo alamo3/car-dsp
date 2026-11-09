@@ -58,6 +58,10 @@ sources stay 24-bit. Consecutive tracks at the same rate share one AudioTrack (g
   albums play in order. APE, WavPack, AIFF and DSD are skipped — Android can't decode them.
 - **Magnet links** pasted into the search box are added to TorBox (`/api/torrents/createtorrent`),
   then played once TorBox has them.
+- **The queue survives a restart.** Tracks now carry a stable source id instead of a lambda, so the
+  queue, current track and position are saved: reopen the app and the mini player is where you left
+  it, and play resumes mid-track. That stable id is also what a browse tree (Android Auto) and
+  favourites/offline will use.
 - Playback gets the live EQ, preamp, limiter and speed compensation, a MediaSession (steering-wheel
   / Bluetooth next/prev), notification controls and audio focus (pauses for calls, ducks for
   navigation). Same speaker safety as DSP: it pauses if the output lands on the phone speaker,
@@ -67,10 +71,64 @@ Roadmap:
 - 3b: de-clicker and content-aware dynamic EQ in the C++ engine
 - 2: cabin measurement (sine sweep, multi-position averaging, correction curve)
 
+## Android Auto / Automotive
+
+CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are
+browsable, the car's search finds anything on your addon, and the assistant can start anything
+("play One More Time on CabinEQ").
+
+- The root only shows sources that exist: **For you** (more from the artist you last played —
+  top tracks plus albums; the addon has no catalog feed, so this is derived from history),
+  **Recently played** (a real play history kept across sessions, not just the current queue),
+  and **My TorBox** only when a TorBox key is set. Empty tabs in a car are just noise.
+- Search uses `MediaBrowserServiceCompat.onSearch` (the framework service has no search API at
+  all, hence the one dependency): songs first, then albums to browse into. Past searches are
+  also a browse node (**Search**) so a car with no keyboard can replay them in one tap.
+- Media buttons are received even when nothing is running (`MediaButtonReceiver` + a *mutable*
+  PendingIntent — an immutable one makes the system's KeyEvent send fail), so a steering-wheel
+  or headset Play starts the service and the restored queue.
+
+- `EqService` **is** the `MediaBrowserService` the car binds: one service for the EQ, the in-app
+  player and browsing, so a play request from the car never needs a background service start.
+- Browse ids carry their source (`trb:<torrent>#<file>`, `alb:<album>#<track>`, `q:<index>`), so
+  the tree survives a process restart, and selecting a track queues its whole parent rather than
+  a queue of one.
+- The car opens icons itself, in its own process, so `ArtworkProvider` serves covers as
+  `content://` URIs from the same cache the phone UI uses.
+- The session publishes the queue, the active item, the buffered position and a session activity,
+  so the car has "up next", a moving progress bar and a way back into the app.
+- The framework `MediaBrowserService` has no `onSearch` (that exists only in Media3 / the support
+  library), so search goes through `androidx.media`; the car's on-screen keyboard search and the
+  voice path (`onPlayFromSearch`) both work.
+- Test with the Desktop Head Unit. **Production cars only list apps installed from the Play
+  Store**, so a GitHub-release build won't appear there — use a Play internal-testing track.
+  (This app is not Play-distributed: Android Auto's media drawer and AAOS's Media Center still
+  list sideloaded media apps, but the Google Assistant will not offer us for "play X on
+  CabinEQ" — that list is Google's, not something a manifest flag unlocks.)
+
+### Android Automotive OS
+
+AAOS runs the car UI on the device, so it needs two things beyond the above:
+
+- The media browser service must **opt in** with
+  `<meta-data android:name="androidx.car.app.launchable" android:value="true" />`
+  (`MediaSource.isMediaTemplate`); without it CarMedia never lists the app.
+- The car UI runs in **user 10** on AAOS images, so the app's service process is `u10_*` and
+  reads `/data/user/10/…`. When seeding settings for a test, write them there (the image is
+  userdebug, so `adb root` works).
+
+A local AAOS emulator is enough to see the real car UI: system image
+`android-35-ext15;android-automotive;x86_64`, a hand-written AVD pointing at it, and the x86_64
+APK (`-PcabinAbis=x86_64`).
+
 ## Build
 
 Open the folder in Android Studio and run on the device. If Studio suggests an AGP or
-Gradle upgrade, accept it. The project has no library dependencies.
+Gradle upgrade, accept it. The only library dependency is `androidx.media`, for the car's media
+browser search API (see below); everything else is framework-only.
+
+Builds are arm64 only, like every current phone. To run on an x86_64 emulator, add the ABI:
+`./gradlew installDebug -PcabinAbis=x86_64`.
 
 ## How it attaches to audio
 

@@ -7,6 +7,7 @@ import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.URLEncoder
+import java.util.Locale
 
 /**
  * Client for an Eclipse Music addon (protocol: https://eclipsemusic.app/docs), e.g. Nebula,
@@ -20,7 +21,8 @@ import java.net.URLEncoder
  *   GET /manifest.json     → { id, name, version, resources[] }
  *   GET /search?q=…        → { tracks[], albums[], artists[], playlists[] }   (all optional)
  *   GET /album/{id}        → { id, title, artist, artworkURL, year, trackCount, tracks[] }
- *   GET /stream/{id}       → 200 { url, format, sampleRate, bitDepth, … }
+ *   GET /playlist/{id}     → { id, title, description, trackCount, tracks[] }
+ *   GET /stream/{id}       → 200 { url, format, quality, sampleRate, bitDepth, … }
  *                            503 + Retry-After { notice: { title, message, progress } } = not ready yet
  */
 class EclipseAddon(link: String) {
@@ -49,6 +51,8 @@ class EclipseAddon(link: String) {
         /** Some addons include a ready stream URL in search results. */
         val streamUrl: String?,
         val artworkUrl: String? = null,
+        /** Recording id: identical across releases of the same recording, unlike the track id. */
+        val isrc: String? = null,
     )
 
     data class Album(
@@ -62,13 +66,24 @@ class EclipseAddon(link: String) {
 
     data class Artist(val id: String, val name: String, val artworkUrl: String?, val genres: List<String>)
 
+    data class Playlist(
+        val id: String,
+        val title: String,
+        val description: String?,
+        val trackCount: Int?,
+        val artworkUrl: String? = null,
+    )
+
     data class SearchResults(
         val tracks: List<Track>,
         val albums: List<Album>,
         val artists: List<Artist> = emptyList(),
+        val playlists: List<Playlist> = emptyList(),
     )
 
     data class AlbumDetail(val album: Album, val tracks: List<Track>)
+
+    data class PlaylistDetail(val playlist: Playlist, val tracks: List<Track>)
 
     data class ArtistDetail(val artist: Artist, val topTracks: List<Track>, val albums: List<Album>)
 
@@ -80,7 +95,19 @@ class EclipseAddon(link: String) {
         val sampleRate: Int?,
         val bitDepth: Int?,
         val codec: String?,
-    )
+        /** The addon's own verdict, e.g. "lossless". There is no client-side quality choice. */
+        val quality: String? = null,
+    ) {
+        /** "FLAC · lossless" for display until the decoder reports the real stream. */
+        fun qualityLabel(): String? {
+            val codec = format?.uppercase(Locale.ROOT)?.takeIf { it.isNotBlank() }
+            return when {
+                codec != null && quality != null -> "$codec · $quality"
+                codec != null -> codec
+                else -> quality
+            }
+        }
+    }
 
     // ---------------------------------------------------------------- endpoints
 
@@ -109,13 +136,125 @@ class EclipseAddon(link: String) {
         )
     }
 
-    fun search(query: String): SearchResults {
-        val o = getJson("/search?q=" + enc(query.trim())).json ?: return SearchResults(emptyList(), emptyList())
+    /**
+     * [limit] caps each result list (the protocol applies it per type; Nebula caps at 20).
+     */
+    fun search(query: String, limit: Int = DEFAULT_LIMIT): SearchResults {
+        val q = query.trim()
+        val primary = searchOnce(q, limit)
+        if (q.isBlank()) return primary
+        // The addon matches the whole string, so "title by artist" only works if the artist is
+        // spelled out exactly. When part of the query matched nothing, retry with the tail of
+        // the query as an artist and keep the songs whose title still matches the rest.
+        val tokens = q.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (tokens.size < 4) return primary
+        val unmatched = tokens.filter { tok ->
+            primary.tracks.none { it.title.contains(tok, true) || it.artist.contains(tok, true) } &&
+                primary.albums.none { it.title.contains(tok, true) || it.artist.contains(tok, true) } &&
+                primary.playlists.none { it.title.contains(tok, true) }
+        }
+        if (unmatched.size < 2) return primary      // every word was found somewhere: leave it
+
+        val leading = tokens.dropLast(2)
+        if (leading.size < 2) return primary
+        val extraTracks = ArrayList<Track>()
+        val extraAlbums = ArrayList<Album>()
+        for (take in 2..3) {
+            if (take > tokens.size - 2) break
+            val suffix = tokens.takeLast(take).joinToString(" ")
+            val r = runCatching { searchOnce(suffix, DEFAULT_LIMIT) }.getOrNull() ?: continue
+            extraAlbums += r.albums.filter { a -> leading.any { a.title.contains(it, true) || a.artist.contains(it, true) } }
+            extraTracks += r.tracks.filter { t ->
+                // Keep only what still looks like the requested song, not the artist's other work.
+                val hits = leading.count { t.title.contains(it, true) }
+                hits >= 2 && hits * 2 >= leading.size
+            }
+        }
+        if (extraTracks.isEmpty() && extraAlbums.isEmpty()) return primary
+        return SearchResults(
+            tracks = rank((primary.tracks + extraTracks).distinctBy { it.id }, q) { trackRank(it, q) },
+            albums = rank((primary.albums + extraAlbums).distinctBy { it.id }, q) { albumRank(it, q) },
+            artists = primary.artists,
+            playlists = primary.playlists,
+        )
+    }
+
+    /** One request, no recall tricks; used by [search] and by the artist lookups above it. */
+    private fun searchOnce(q: String, limit: Int): SearchResults {
+        val o = getJson("/search?q=" + enc(q) + "&limit=" + limit.coerceIn(1, MAX_LIMIT)).json
+            ?: return SearchResults(emptyList(), emptyList())
         return SearchResults(
             tracks = o.optJSONArray("tracks").objects().mapNotNull(::parseTrack),
             albums = o.optJSONArray("albums").objects().mapNotNull(::parseAlbum),
             artists = o.optJSONArray("artists").objects().mapNotNull(::parseArtist),
+            playlists = o.optJSONArray("playlists").objects().mapNotNull(::parsePlaylist),
         )
+    }
+
+    /** Stable sort by [score]: the addon's own (popularity) order breaks ties. */
+    private fun <T> rank(items: List<T>, query: String, score: (T) -> Int): List<T> {
+        if (query.isBlank() || items.size < 2) return items
+        return items.sortedBy(score)
+    }
+
+    /** 0 exact, 1 prefix, 2 whole-word, 3 substring, MAX when absent. */
+    private fun matchRank(text: String?, query: String): Int {
+        if (text.isNullOrBlank() || query.isBlank()) return Int.MAX_VALUE
+        val t = text.trim().lowercase()
+        val q = query.trim().lowercase()
+        return when {
+            t == q -> 0
+            t.startsWith(q) -> 1
+            Regex("\\b" + Regex.escape(q) + "\\b").containsMatchIn(t) -> 2
+            t.contains(q) -> 3
+            else -> Int.MAX_VALUE
+        }
+    }
+
+    /**
+     * How much of the query a field contains, 0..1. Whole-string matching alone loses queries
+     * like "the best is yet to come oakfield mansion": no single field holds all of it, yet the
+     * artist covers the last two words and the title the rest.
+     */
+    private fun coverage(text: String?, tokens: List<String>): Float {
+        if (text.isNullOrBlank() || tokens.isEmpty()) return 0f
+        val t = text.trim().lowercase()
+        return tokens.count { t.contains(it) }.toFloat() / tokens.size
+    }
+
+    private fun tokens(q: String): List<String> =
+        q.trim().lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
+
+    private fun trackRank(t: Track, q: String): Int {
+        val tokens = tokens(q)
+        var score = 1.2f * coverage(t.title, tokens) +
+            1.0f * coverage(t.artist, tokens) +
+            0.3f * coverage(t.album, tokens)
+        // Title coverage outweighs the artist (a song search must not become artist search), and
+        // an exact phrase in the title is the strongest single signal.
+        if (matchRank(t.title, q) <= 2) score += 0.6f
+        return (1000 - (score * 100)).toInt()
+    }
+
+    private fun albumRank(a: Album, q: String): Int {
+        val tokens = tokens(q)
+        var score = 1.2f * coverage(a.title, tokens) + 0.8f * coverage(a.artist, tokens)
+        if (matchRank(a.title, q) <= 2) score += 0.4f
+        return (1000 - (score * 100)).toInt()
+    }
+
+    /** GET /playlist/{id} — same shape as an album, plus owner description. */
+    fun playlist(id: String): PlaylistDetail {
+        val o = getJson("/playlist/" + encPath(id)).json
+            ?: throw AddonException("Playlist not found", 404)
+        val playlist = parsePlaylist(o) ?: throw AddonException("Playlist response had no id/title", 200)
+        val tracks = o.optJSONArray("tracks").objects().mapNotNull(::parseTrack).map { t ->
+            t.copy(
+                album = t.album ?: playlist.title,
+                artworkUrl = t.artworkUrl ?: playlist.artworkUrl,
+            )
+        }
+        return PlaylistDetail(playlist, tracks)
     }
 
     /**
@@ -175,6 +314,7 @@ class EclipseAddon(link: String) {
                 sampleRate = o.optIntOrNull("sampleRate"),
                 bitDepth = o.optIntOrNull("bitDepth"),
                 codec = o.optStr("codec"),
+                quality = o.optStr("quality"),
             )
         )
     }
@@ -254,12 +394,15 @@ class EclipseAddon(link: String) {
         return Track(
             id = id,
             title = title,
-            artist = o.optStr("artist") ?: "",
+            // Curated playlists come back with the artist filled in as "Unknown Artist"; an
+            // empty string renders better than a lie (the file's own tags fill it in on play).
+            artist = o.optStr("artist").orEmpty().takeUnless { it.equals("Unknown Artist", true) }.orEmpty(),
             album = o.optStr("album"),
             durationSec = o.optIntOrNull("duration"),
             format = o.optStr("format"),
             streamUrl = o.optStr("streamURL"),
             artworkUrl = artwork(o),
+            isrc = o.optStr("isrc"),
         )
     }
 
@@ -269,8 +412,22 @@ class EclipseAddon(link: String) {
         return Album(
             id = id,
             title = title,
-            artist = o.optStr("artist") ?: "",
+            // Curated playlists come back with the artist filled in as "Unknown Artist"; an
+            // empty string renders better than a lie (the file's own tags fill it in on play).
+            artist = o.optStr("artist").orEmpty().takeUnless { it.equals("Unknown Artist", true) }.orEmpty(),
             year = o.optStr("year")?.take(4),
+            trackCount = o.optIntOrNull("trackCount"),
+            artworkUrl = artwork(o),
+        )
+    }
+
+    private fun parsePlaylist(o: JSONObject): Playlist? {
+        val id = o.optStr("id") ?: return null
+        val title = o.optStr("title") ?: return null
+        return Playlist(
+            id = id,
+            title = title,
+            description = o.optStr("description"),
             trackCount = o.optIntOrNull("trackCount"),
             artworkUrl = artwork(o),
         )
@@ -293,6 +450,10 @@ class EclipseAddon(link: String) {
     }
 
     companion object {
+        /** The protocol applies limit per result type; Nebula caps it at 20. */
+        const val DEFAULT_LIMIT = 20
+        const val MAX_LIMIT = 50
+
         private val ART_KEYS = listOf(
             "artworkURL", "artworkUrl", "artwork_url", "artwork", "coverURL", "coverUrl", "cover",
             "image", "imageURL", "imageUrl", "picture", "thumbnail", "thumb", "art",

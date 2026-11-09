@@ -12,16 +12,33 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Templated media app (Car App Library). Without this the host won't treat us as one. -->
+    <uses-permission android:name="androidx.car.app.MEDIA_TEMPLATES" />
+
+    <!-- Single APK: also ships a MediaBrowserService, so the templates host is optional. -->
+    <uses-feature
+        android:name="android.software.car.templates_host.media"
+        android:required="false" />
 
     <application
         android:allowBackup="true"
-        android:icon="@android:drawable/ic_lock_silent_mode_off"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.CabinEQ">
 
+        <!-- Tells the car (Android Auto / Automotive) that we are a media source. -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+
+        <!-- Music is the app: the launcher opens search/playback. The EQ/DSP screen
+             (MainActivity) is reached from Music's settings and owns the capture engine. -->
         <activity
-            android:name=".MainActivity"
+            android:name=".MusicActivity"
             android:exported="true"
+            android:label="Music"
+            android:windowSoftInputMode="adjustResize"
             android:launchMode="singleTop">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -30,16 +47,63 @@
         </activity>
 
         <activity
-            android:name=".MusicActivity"
-            android:exported="false"
-            android:label="Music"
-            android:parentActivityName=".MainActivity"
-            android:windowSoftInputMode="adjustResize"
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="Equalizer &amp; DSP"
             android:launchMode="singleTop" />
 
+        <!-- The car binds this as a MediaBrowserService: one service for the EQ, the in-app
+             player and the browse tree, so playing from the car never needs a background
+             service start. Exported because the car app has a different uid. -->
         <service
             android:name=".EqService"
-            android:exported="false"
-            android:foregroundServiceType="mediaPlayback|location|mediaProjection" />
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback|location|mediaProjection">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+            <!-- Android Automotive's CarMedia only lists browser services that opt in with
+                 this flag (MediaSource.isMediaTemplate); without it the app never appears in
+                 the car's media source picker. -->
+            <meta-data
+                android:name="androidx.car.app.launchable"
+                android:value="true" />
+        </service>
+
+        <!-- Car App Library: the richer, YouTube-Music-style media templates (sections of
+             tiles, tabs). The MediaBrowserService above still owns the session and queue. -->
+        <service
+            android:name=".car.CabinCarAppService"
+            android:label="@string/app_name"
+            android:icon="@mipmap/ic_launcher"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="androidx.car.app.CarAppService" />
+                <category android:name="androidx.car.app.category.MEDIA" />
+                <!-- Launched from the car's playing surface: open the playback screen. -->
+                <action android:name="androidx.car.app.media.action.SHOW_MEDIA_PLAYBACK" />
+            </intent-filter>
+        </service>
+
+        <meta-data
+            android:name="androidx.car.app.minCarApiLevel"
+            android:value="9" />
+
+        <!-- Read-only album art for the car: a browse item's icon must be a URI the car's own
+             process can open, and it has no way to reach our cache. -->
+        <provider
+            android:name=".ArtworkProvider"
+            android:authorities="${applicationId}.art"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+        <!-- Steering wheel / headset / "start playing" when no session exists yet. -->
+        <receiver
+            android:name=".MediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

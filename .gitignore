@@ -12,3 +12,7 @@
 *.aab
 *.keystore
 *.jks
+
+# Tool caches
+.firebase/
+.kotlin/

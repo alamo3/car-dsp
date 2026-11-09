@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Declares to Android Auto and Android Automotive what kind of car app this is.
+  "media"    — we expose a MediaBrowserService (the media template / now playing / queue).
+  "template" — we also expose a Car App Library CarAppService, so hosts that support templated
+               media apps (Android Auto, AAOS 17+) render the richer sectioned UI instead.
+-->
+<automotiveApp xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses name="media" />
+    <uses name="template" />
+</automotiveApp>

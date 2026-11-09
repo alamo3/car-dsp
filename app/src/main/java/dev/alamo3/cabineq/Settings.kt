@@ -2,11 +2,17 @@ package dev.alamo3.cabineq
 
 import android.content.Context
 import android.content.SharedPreferences
+import org.json.JSONArray
+import org.json.JSONObject
 
 /** Thin wrapper over SharedPreferences. The service listens for changes and re-applies. */
 class Settings(context: Context) {
     val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    /** Guards read-modify-write of the string lists: search threads, the player and the car. */
+    private val recentSearchesLock = Any()
+    private val historyLock = Any()
 
     fun bandGain(i: Int): Float = prefs.getFloat(bandKey(i), 0f)
     fun setBandGain(i: Int, db: Float) = prefs.edit().putFloat(bandKey(i), db).apply()
@@ -29,14 +35,6 @@ class Settings(context: Context) {
     var dspEngine: Boolean
         get() = prefs.getBoolean(KEY_DSP_ENGINE, true)
         set(v) = prefs.edit().putBoolean(KEY_DSP_ENGINE, v).apply()
-
-    /**
-     * Allow DSP output on the phone's own speaker. Off by default: in the car, output on the
-     * phone speaker always means routing went wrong, so the app falls back instead.
-     */
-    var allowSpeakerOutput: Boolean
-        get() = prefs.getBoolean(KEY_ALLOW_SPEAKER, false)
-        set(v) = prefs.edit().putBoolean(KEY_ALLOW_SPEAKER, v).apply()
 
     /** Apps that block playback capture; they always use the Android effect engine. */
     var captureBlockedPackages: Set<String>
@@ -105,19 +103,45 @@ class Settings(context: Context) {
     val recentSearches: List<String>
         get() = prefs.getString(KEY_RECENT_SEARCHES, "").orEmpty().split('\n').filter { it.isNotBlank() }
 
-    fun addRecentSearch(query: String) {
+    fun addRecentSearch(query: String) = synchronized(recentSearchesLock) {
         val q = query.trim().replace('\n', ' ')
         if (q.isEmpty()) return
         val list = (listOf(q) + recentSearches.filterNot { it.equals(q, ignoreCase = true) }).take(MAX_RECENT)
         prefs.edit().putString(KEY_RECENT_SEARCHES, list.joinToString("\n")).apply()
     }
 
-    fun clearRecentSearches() = prefs.edit().remove(KEY_RECENT_SEARCHES).apply()
+    fun clearRecentSearches() = synchronized(recentSearchesLock) {
+        prefs.edit().remove(KEY_RECENT_SEARCHES).apply()
+    }
 
     /** Display name from the addon's manifest, e.g. "Nebula". */
     var addonName: String
         get() = prefs.getString(KEY_ADDON_NAME, "") ?: ""
         set(v) = prefs.edit().putString(KEY_ADDON_NAME, v).apply()
+
+    /**
+     * The artist the current queue should keep going from. Persisted with the queue snapshot so
+     * the one-ahead refill still works after Android kills and restarts the process.
+     */
+    var radioSeed: Track?
+        get() = prefs.getString(KEY_RADIO_SEED, null)?.let {
+            runCatching { Track.fromJson(JSONObject(it)) }.getOrNull()
+        }
+        set(v) = prefs.edit().apply {
+            if (v == null) remove(KEY_RADIO_SEED) else putString(KEY_RADIO_SEED, v.toJson().toString())
+        }.apply()
+
+    /** Queue loop mode, persisted so it survives a restart (FilePlayer.Repeat name). */
+    var repeatMode: String
+        get() = prefs.getString(KEY_REPEAT, "OFF") ?: "OFF"
+        set(v) = prefs.edit().putString(KEY_REPEAT, v).apply()
+
+    /** The jam session this phone hosted last, so an orphaned one can be cleaned up on restart. */
+    var lastJamSession: String?
+        get() = prefs.getString(KEY_JAM_SESSION, null)?.takeIf { it.isNotBlank() }
+        set(v) = prefs.edit().apply {
+            if (v == null) remove(KEY_JAM_SESSION) else putString(KEY_JAM_SESSION, v)
+        }.apply()
 
     /** Format filter for TorBox search and track picking (AudioPicker.FormatFilter name). */
     var torboxFormat: dev.alamo3.cabineq.torbox.AudioPicker.FormatFilter
@@ -125,6 +149,50 @@ class Settings(context: Context) {
             dev.alamo3.cabineq.torbox.AudioPicker.FormatFilter.valueOf(prefs.getString(KEY_TORBOX_FORMAT, null) ?: "ANY")
         }.getOrDefault(dev.alamo3.cabineq.torbox.AudioPicker.FormatFilter.ANY)
         set(v) = prefs.edit().putString(KEY_TORBOX_FORMAT, v.name).apply()
+
+    /**
+     * The last queue and where playback was, so a relaunch can resume it. Written with commit()
+     * from the player's own background thread: apply() can be lost if the process dies right
+     * after a track change, which is exactly when this matters.
+     */
+    var queueSnapshot: QueueSnapshot?
+        get() = prefs.getString(KEY_QUEUE, null)?.let {
+            runCatching { QueueSnapshot.fromJson(JSONObject(it)) }.getOrNull()
+        }
+        set(v) {
+            val e = prefs.edit()
+            if (v == null) e.remove(KEY_QUEUE) else e.putString(KEY_QUEUE, v.toJson().toString())
+            e.commit()
+        }
+
+    /**
+     * The same song reaches us as an album track, a single, a remaster or a search hit — ISRC is
+     * the only id that agrees across those, so prefer it and fall back to source id + title.
+     */
+    private fun sameRecording(a: Track, b: Track): Boolean =
+        if (a.isrc != null && b.isrc != null) a.isrc.equals(b.isrc, ignoreCase = true)
+        else a.mediaId == b.mediaId && a.title.equals(b.title, ignoreCase = true)
+
+    /**
+     * Most recently played first, across sessions. This is what makes "Recently played" real
+     * (not just the current queue) and what the car's "For you" row is built from.
+     */
+    fun playHistory(): List<Track> {
+        val raw = prefs.getString(KEY_HISTORY, null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let(Track::fromJson) }
+        }.getOrDefault(emptyList())
+    }
+
+    /** Called when a track starts; duplicates move to the front instead of piling up. */
+    fun recordPlayed(track: Track) = synchronized(historyLock) {
+        if (track.title.isBlank()) return@synchronized
+        val kept = playHistory().filterNot { sameRecording(it, track) }
+        val list = (listOf(track) + kept).take(MAX_HISTORY)
+        val json = JSONArray().apply { list.forEach { put(it.toJson()) } }
+        prefs.edit().putString(KEY_HISTORY, json.toString()).apply()
+    }
 
     fun resetEq() {
         val e = prefs.edit()
@@ -139,7 +207,6 @@ class Settings(context: Context) {
         const val KEY_GLOBAL = "global_mode"
         const val KEY_AUTO_PREAMP = "auto_preamp"
         const val KEY_DSP_ENGINE = "dsp_engine"
-        const val KEY_ALLOW_SPEAKER = "allow_speaker"
         const val KEY_CAPTURE_BLOCKED = "capture_blocked"
         // Known to opt out of playback capture.
         val DEFAULT_CAPTURE_BLOCKED = setOf("com.spotify.music", "com.android.chrome")
@@ -151,10 +218,16 @@ class Settings(context: Context) {
         const val KEY_SIM_KMH = "sim_kmh"
         const val KEY_TORBOX_KEY = "torbox_api_key"
         const val KEY_TORBOX_CACHED_ONLY = "torbox_cached_only"
+        const val KEY_JAM_SESSION = "jam_last_session"
+        const val KEY_RADIO_SEED = "radio_seed"
+        const val KEY_REPEAT = "repeat_mode"
         const val KEY_TORBOX_FORMAT = "torbox_format"
         const val KEY_ADDON_LINK = "addon_link"
         const val KEY_ADDON_NAME = "addon_name"
         const val KEY_RECENT_SEARCHES = "recent_searches"
+        const val KEY_QUEUE = "queue_snapshot"
+        const val KEY_HISTORY = "play_history"
+        const val MAX_HISTORY = 40
         const val MAX_RECENT = 8
         fun bandKey(i: Int) = "band_$i"
     }
