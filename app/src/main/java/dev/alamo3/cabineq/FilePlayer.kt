@@ -64,6 +64,13 @@ class FilePlayer private constructor(private val context: Context) {
         private set
     /** e.g. "FLAC 44.1 kHz / 16-bit · lossless" */
     @Volatile var formatInfo: String? = null
+    // Same facts as [formatInfo], kept as numbers for the output-path diagnostics.
+    @Volatile var sourceCodec: String? = null
+    @Volatile var sourceSampleRate = 0
+    @Volatile var sourceBits = 0
+
+    /** The AudioTrack currently feeding the mixer, if any. */
+    @Volatile private var liveOutput: Output? = null
         private set
     /** What the source claims about quality ("lossless"), appended to the decoder's line. */
     @Volatile private var declaredQuality: String? = null
@@ -614,7 +621,13 @@ class FilePlayer private constructor(private val context: Context) {
                 handle = NativeDsp.create(rate)
                 applyEqLocked()
             }
+            liveOutput = this
         }
+
+        /** Rate of the track we feed: the file's rate, i.e. what the mixer has to re-sample. */
+        fun trackRate(): Int? = runCatching { track.sampleRate }.getOrNull()
+
+        fun routed(): AudioDeviceInfo? = runCatching { track.routedDevice }.getOrNull()
 
         fun applyEqLocked() {
             val bands = eqBands ?: return
@@ -636,6 +649,7 @@ class FilePlayer private constructor(private val context: Context) {
         }
 
         fun release() {
+            if (liveOutput === this) liveOutput = null
             runCatching { track.pause(); track.flush(); track.release() }
             synchronized(eqLock) {
                 if (current === this) current = null
@@ -1095,17 +1109,26 @@ class FilePlayer private constructor(private val context: Context) {
         }
     }
 
+    private fun mimeLabel(mime: String): String = when (mime) {
+        MediaFormat.MIMETYPE_AUDIO_FLAC -> "FLAC"
+        MediaFormat.MIMETYPE_AUDIO_RAW -> "WAV"
+        MediaFormat.MIMETYPE_AUDIO_MPEG -> "MP3"
+        MediaFormat.MIMETYPE_AUDIO_AAC -> "AAC"
+        MediaFormat.MIMETYPE_AUDIO_VORBIS -> "Vorbis"
+        MediaFormat.MIMETYPE_AUDIO_OPUS -> "Opus"
+        "audio/alac" -> "ALAC"
+        else -> mime.removePrefix("audio/")
+    }
+
+    fun routedDevice(): AudioDeviceInfo? = liveOutput?.routed()
+
+    val outputSampleRate: Int? get() = liveOutput?.trackRate()
+
     private fun updateFormatInfo(mime: String, rate: Int, bits: Int, channels: Int) {
-        val codecName = when (mime) {
-            MediaFormat.MIMETYPE_AUDIO_FLAC -> "FLAC"
-            MediaFormat.MIMETYPE_AUDIO_RAW -> "WAV"
-            MediaFormat.MIMETYPE_AUDIO_MPEG -> "MP3"
-            MediaFormat.MIMETYPE_AUDIO_AAC -> "AAC"
-            MediaFormat.MIMETYPE_AUDIO_VORBIS -> "Vorbis"
-            MediaFormat.MIMETYPE_AUDIO_OPUS -> "Opus"
-            "audio/alac" -> "ALAC"
-            else -> mime.removePrefix("audio/")
-        }
+        sourceCodec = mimeLabel(mime)
+        sourceSampleRate = rate
+        sourceBits = bits
+        val codecName = mimeLabel(mime)
         val bitsPart = if (bits > 0) " / $bits-bit" else ""
         val chPart = if (channels > 2) " / $channels ch → stereo" else ""
         val qualityPart = declaredQuality?.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()

@@ -35,6 +35,8 @@ class MainActivity : Activity() {
 
     private lateinit var settings: Settings
     private lateinit var statusText: TextView
+    private lateinit var outputPathText: TextView
+    private var outputReport = ""
     private lateinit var startStopButton: Button
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var eqView: EqView
@@ -182,6 +184,30 @@ class MainActivity : Activity() {
             textSize = 13f
         }
         root.addView(statusText)
+
+        // --- Output path ---
+        root.addView(header("Output path"))
+        outputPathText = TextView(this).apply {
+            setPadding(0, dp(4), 0, dp(8))
+            typeface = android.graphics.Typeface.MONOSPACE
+            textSize = 12f
+        }
+        root.addView(outputPathText)
+        root.addView(Button(this).apply {
+            text = "Copy report"
+            setOnClickListener {
+                val cm = getSystemService(android.content.ClipboardManager::class.java)
+                cm?.setPrimaryClip(android.content.ClipData.newPlainText("CabinEQ audio path", outputReport))
+                android.widget.Toast.makeText(this@MainActivity, "Copied", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        })
+        root.addView(TextView(this).apply {
+            text = "Read-only: this is the path your audio takes today, measured from the framework. " +
+                "Nothing here changes the sound."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, dp(4), 0, dp(12))
+        })
 
         // --- Speed compensation ---
         root.addView(header("Speed compensation"))
@@ -360,6 +386,21 @@ class MainActivity : Activity() {
         return bar to label
     }
 
+    /**
+     * The mixer's contribution, spelled out: rate, resampling, volume, direct-path support and
+     * the route. Built from public API only — the vendor HAL (Dolby, SoundAlive) is invisible
+     * to apps, so [AudioPath] says so rather than guessing.
+     */
+    private fun refreshOutputPath() {
+        val facts = AudioPath.collect(this, FilePlayer.peek())
+        val rows = AudioPath.rows(facts)
+        val text = rows.joinToString("\n") { row ->
+            String.format(Locale.US, "%-11s %s", row.label + ":", row.value)
+        }
+        outputReport = AudioPath.plain(facts)
+        if (outputPathText.text?.toString() != text) outputPathText.text = text
+    }
+
     private fun refreshStatus() {
         val s = EngineState
         startStopButton.text = if (s.running) "Stop eq for other apps" else "Start eq for other apps"
@@ -420,6 +461,7 @@ class MainActivity : Activity() {
         }
         statusText.text = sb.toString()
         statusText.gravity = Gravity.START
+        refreshOutputPath()
     }
 
     // ---------------------------------------------------------------------------------

@@ -88,6 +88,34 @@ Roadmap:
 - 3b: de-clicker and content-aware dynamic EQ in the C++ engine
 - 2: cabin measurement (sine sweep, multi-position averaging, correction curve)
 
+### Output path (what the mixer does to our audio)
+
+Below **Status** on the Equalizer & DSP screen, **Output path** reports the stages a stream
+goes through on its way to the speaker — read-only, nothing there changes the sound:
+
+```
+Source:      FLAC 44.1 kHz / 16-bit
+Track:       PCM float · 44.1 kHz · stereo
+Device:      48.0 kHz · 192 frames/buffer
+Resample:    44.1 → 48.0 kHz, by the system mixer
+Volume:      6/15 (40%) — not at maximum; the mixer attenuates
+Direct:      no — this format is mixed
+Spatial:     on
+Effects:     none attached by CabinEQ
+Route:       phone speaker · SM-F956W
+```
+
+Everything comes from public API (`PROPERTY_OUTPUT_SAMPLE_RATE`, `AudioTrack.getRoutedDevice`,
+`getDirectPlaybackSupport`, `getSupportedMixerAttributes`, `Spatializer`), so it can be trusted
+when asking "is something in the way". Two things are deliberately *not* claimed:
+
+- **Volume dB**: the platform's `getStreamVolumeDb` reports −0.1 dB at 6/15 on the Fold 6 while
+  the mixer shows −25 dB on the track, so the index is shown instead of a false number.
+- **Vendor processing**: Dolby/SoundAlive runs in Samsung's HAL (`mDsEnable=1` there) and is
+  invisible to the framework; the panel says to check Settings → Sounds instead of guessing.
+
+**Copy report** puts the same text on the clipboard.
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are
