@@ -130,7 +130,9 @@ class CaptureEngine(private val context: Context, private val projection: MediaP
 
     fun setParams(coeffs: DoubleArray, bandCount: Int, preampLin: Float, limiterThresholdLin: Float) {
         val h = handle
-        if (h != 0L) NativeDsp.setParams(h, coeffs, bandCount, preampLin, limiterThresholdLin)
+        // The Bluetooth guard only matters for the in-app player; captured audio follows the
+        // route the capturing app was asked for.
+        if (h != 0L) NativeDsp.setParams(h, coeffs, bandCount, preampLin, limiterThresholdLin, null, 0)
     }
 
     /** [inPeak, outPeak, minLimiterGain] since the last call, or null if not running. */

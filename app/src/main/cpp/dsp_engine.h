@@ -48,6 +48,10 @@ struct Params {
     std::array<BiquadCoeffs, kMaxBands> coeffs{};
     float preampLin = 1.0f;
     float limiterThresholdLin = 0.891f;  // -1 dBFS
+    // Optional output low-pass (the Bluetooth guard): listeners hearing crackle over A2DP are
+    // hearing content the codec cannot reproduce, so removing it before the codec is honest.
+    int guardCount = 0;
+    std::array<BiquadCoeffs, 2> guard{};
 };
 
 // Peak limiter with a short lookahead: gain drops instantly when a peak *enters* the
@@ -179,6 +183,7 @@ public:
         const float target = active_.preampLin;
         const float step = frames > 0 ? (target - preamp_) / static_cast<float>(frames) : 0.0f;
         const int bands = active_.bandCount;
+        const int guardCount = active_.guardCount;
         const float threshold = active_.limiterThresholdLin;
         float inPeak = 0.0f, outPeak = 0.0f;
 
@@ -211,6 +216,17 @@ public:
             r = static_cast<float>(dr);
 
             limiter_.process(l, r, threshold);
+
+            if (guardCount > 0) {
+                double gl = l, gr = r;
+                for (int g = 0; g < guardCount; ++g) {
+                    gl = guardL_[g].process(active_.guard[g], gl);
+                    gr = guardR_[g].process(active_.guard[g], gr);
+                }
+                l = static_cast<float>(gl);
+                r = static_cast<float>(gr);
+            }
+
             l = std::clamp(l, -1.0f, 1.0f);
             r = std::clamp(r, -1.0f, 1.0f);
 
@@ -359,6 +375,7 @@ private:
     Params active_{};
 
     std::array<BiquadState, kMaxBands> stateL_{}, stateR_{};
+    std::array<BiquadState, 2> guardL_{}, guardR_{};
     float preamp_ = 1.0f;
     Limiter limiter_;
 

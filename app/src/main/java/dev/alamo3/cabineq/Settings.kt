@@ -142,6 +142,14 @@ class Settings(context: Context) {
         set(v) = prefs.edit().putBoolean(KEY_CACHE_WIFI_ONLY, v).apply()
 
     /**
+     * Low-pass at ~15.5 kHz when the output is Bluetooth: A2DP cannot reproduce that band, so
+     * what reaches the listener up there is codec noise — heard as crackle on bright material.
+     */
+    var bluetoothHfGuard: Boolean
+        get() = prefs.getBoolean(KEY_BT_HF_GUARD, true)
+        set(v) = prefs.edit().putBoolean(KEY_BT_HF_GUARD, v).apply()
+
+    /**
      * In car mode, raise the media stream to maximum so the mixer does not attenuate the
      * signal before it leaves the phone; restored when car mode ends.
      */
@@ -272,6 +280,7 @@ class Settings(context: Context) {
         const val KEY_JAM_SESSION = "jam_last_session"
         const val KEY_RADIO_SEED = "radio_seed"
         const val KEY_REPEAT = "repeat_mode"
+        const val KEY_BT_HF_GUARD = "bluetooth_hf_guard"
         const val KEY_MAX_VOLUME_IN_CAR = "max_volume_in_car"
         const val KEY_MAX_VOLUME_SPEAKER = "max_volume_speaker"
         const val KEY_PRE_CAR_VOLUME = "pre_car_volume"

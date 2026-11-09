@@ -45,6 +45,26 @@ object EqDesign {
         }
     }
 
+    /**
+     * Two cascaded 2nd-order Butterworth low-passes (24 dB/oct). Used as the Bluetooth guard:
+     * A2DP cannot carry much above ~15 kHz, so what it does carry is codec noise — removing it
+     * before the codec is why the crackle on bright material goes away.
+     */
+    fun lowPass(fs: Double, hz: Double): DoubleArray {
+        val f = kotlin.math.min(hz, fs * 0.45)
+        val w0 = 2 * PI * f / fs
+        val cw = kotlin.math.cos(w0)
+        val alpha = kotlin.math.sin(w0) / (2 * BUTTERWORTH_Q)
+        val b0 = (1 - cw) / 2
+        val a0 = 1 + alpha
+        // Same filter twice: b0, b1, b2, a1, a2 per stage.
+        val stage = doubleArrayOf(b0 / a0, (1 - cw) / a0, b0 / a0, (-2 * cw) / a0, (1 - alpha) / a0)
+        return stage + stage
+    }
+
+    /** Q of one 2nd-order section of a Butterworth pair. */
+    private const val BUTTERWORTH_Q = 0.7071067811865476
+
     private fun peaking(f0: Double, a: Double, q: Double, fs: Double): DoubleArray {
         val w0 = 2 * PI * f0 / fs
         val alpha = sin(w0) / (2 * q)

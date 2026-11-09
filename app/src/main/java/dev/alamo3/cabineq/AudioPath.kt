@@ -45,6 +45,8 @@ object AudioPath {
         val route: String?,
         /** What the car-mode volume hand-off is doing right now. */
         val carPolicy: String,
+        /** Is the Bluetooth high-frequency guard engaged on this route? */
+        val hfGuard: String,
         /** False when the player is idle: the rows then describe the device, not a stream. */
         val hasStream: Boolean,
     )
@@ -91,8 +93,16 @@ object AudioPath {
             spatialEnabled = spatial?.second,
             route = device?.label(),
             carPolicy = CarVolume.describe(context),
+            hfGuard = hfGuardState(context, device),
             hasStream = player?.currentTrack != null || (player?.sourceSampleRate ?: 0) > 0,
         )
+    }
+
+    private fun hfGuardState(context: Context, device: AudioDeviceInfo?): String {
+        if (!Settings(context).bluetoothHfGuard) return "off"
+        val bt = device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+        return if (bt) "on — Bluetooth, low-pass at 15.5 kHz" else "armed (Bluetooth only)"
     }
 
     private fun trackRateOf(player: FilePlayer?): Int? =
@@ -173,6 +183,7 @@ object AudioPath {
         add(Row("Clicks", if (EngineState.playerClicks == 0L) "none since start"
                           else "${EngineState.playerClicks} detected", warn = EngineState.playerClicks > 0))
         add(Row("Car volume", f.carPolicy))
+        add(Row("HF guard", f.hfGuard))
         f.route?.let { add(Row("Route", it)) }
     }
 

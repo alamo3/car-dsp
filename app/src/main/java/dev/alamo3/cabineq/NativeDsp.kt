@@ -10,7 +10,15 @@ object NativeDsp {
     external fun destroy(handle: Long)
 
     /** [coeffs] holds bandCount * 5 values per band: b0, b1, b2, a1, a2 (normalised by a0). */
-    external fun setParams(handle: Long, coeffs: DoubleArray, bandCount: Int, preampLin: Float, limiterThresholdLin: Float)
+    external fun setParams(
+        handle: Long,
+        coeffs: DoubleArray,
+        bandCount: Int,
+        preampLin: Float,
+        limiterThresholdLin: Float,
+        guardCoeffs: DoubleArray?,
+        guardCount: Int,
+    )
 
     /**
      * Rate of the stream being fed in. When it differs from the engine's rate the native

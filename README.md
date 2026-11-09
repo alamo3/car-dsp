@@ -185,6 +185,27 @@ playback with `pauseAndFlush()` steps from the current amplitude to zero. Fixing
 means holding the output tail and shrinking the AudioTrack buffer (200 ms → ~40 ms) so a cut
 lands near the write position — a latency trade worth asking about, not something to slip in.
 
+### Bluetooth high-frequency guard
+
+A2DP carries roughly 15–16 kHz of usable bandwidth. Bright material — and quite a lot of
+torrent-sourced "hi-res" is bright, with near-full-scale bursts at 20–22 kHz — turns into
+crackle over Bluetooth, because what arrives in that band is codec noise. With the guard on
+(default), the output is low-passed at 15.5 kHz (24 dB/oct, two Butterworth sections) **only
+when the routed device is Bluetooth**, before the codec sees it:
+
+| frequency | attenuation |
+|---|---|
+| 1 kHz | −0.2 dB |
+| 12 kHz | −1.4 dB |
+| 15.5 kHz | −6.2 dB |
+| 20 kHz | −29.7 dB |
+| 22 kHz | −54.1 dB |
+
+Wired, USB and speaker routes are untouched. The Output panel shows `HF guard: armed
+(Bluetooth only)` or `on — Bluetooth, low-pass at 15.5 kHz`, and the switch is on the same
+screen. The route is only known once a track is playing, so the parameters are re-pushed at
+that point rather than rebuilding the sink.
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are

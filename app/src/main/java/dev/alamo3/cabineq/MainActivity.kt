@@ -200,6 +200,19 @@ class MainActivity : Activity() {
             alpha = 0.7f
             setPadding(0, 0, 0, dp(8))
         })
+        root.addView(switch("Bluetooth high-frequency guard", settings.bluetoothHfGuard) { on ->
+            settings.bluetoothHfGuard = on
+            FilePlayer.peek()?.refreshRouteDependentParams()
+            refreshOutputPath()
+        })
+        root.addView(TextView(this).apply {
+            text = "On Bluetooth, low-pass at 15.5 kHz (24 dB/oct). A2DP cannot carry that band — " +
+                "what arrives up there is codec noise, heard as crackle on bright material — so it " +
+                "is removed before the codec. Wired and USB routes are untouched."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(8))
+        })
         root.addView(switch("Volume to max in the car", settings.maxVolumeInCar) { on ->
             settings.maxVolumeInCar = on
             CarVolume.sync(this)

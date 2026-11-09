@@ -174,6 +174,7 @@ class FilePlayer private constructor(private val context: Context) {
         if (r > 0 && r != deviceRate) {
             deviceRate = r
             routeEpoch++
+            runCatching { refreshRouteDependentParams() }
             Log.i(TAG, "device mixes at $r Hz")
             runCatching { CarVolume.sync(context) }
         // ENTER/EXIT_CAR_MODE are implicit broadcasts: a manifest receiver never sees them
@@ -711,8 +712,29 @@ class FilePlayer private constructor(private val context: Context) {
             val bands = eqBands ?: return
             if (handle == 0L || appliedEq == eqVersion) return
             val coeffs = EqDesign.designAll(bands, rate.toDouble())
-            NativeDsp.setParams(handle, coeffs, bands.size, EqService.dbToLin(eqPreampDb), eqLimiterLin)
+            val guard = guardCoeffs()
+            NativeDsp.setParams(
+                handle, coeffs, bands.size, EqService.dbToLin(eqPreampDb), eqLimiterLin,
+                guard, if (guard == null) 0 else 2,
+            )
             appliedEq = eqVersion
+        }
+
+        /** The Bluetooth guard, or null when it does not apply to this route. */
+        private fun guardCoeffs(): DoubleArray? {
+            if (!settings.bluetoothHfGuard) return null
+            val type = runCatching { track.routedDevice?.type }.getOrNull() ?: return null
+            val bt = type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            return if (bt) EqDesign.lowPass(rate.toDouble(), 15500.0) else null
+        }
+
+        /** Re-evaluates the guard after a route change, without rebuilding the sink. */
+        fun refreshRouteDependentParams() {
+            synchronized(eqLock) {
+                if (handle == 0L) return
+                appliedEq = -1        // force the next push
+                applyEqLocked()
+            }
         }
 
         /** Tells the engine what the decoder is producing, so it can resample to [rate]. */
@@ -1096,6 +1118,9 @@ class FilePlayer private constructor(private val context: Context) {
                         if (!beganThisTrack) {
                             beganThisTrack = true
                             startedAny = true
+                            // The route (and so the Bluetooth guard) is only known once the
+                            // track is really playing; re-push without rebuilding the sink.
+                            out.refreshRouteDependentParams()
                             // History/recommendations should reflect what was really heard, not
                             // what was merely requested (some source ids have no stream at all).
                             queue.getOrNull(currentIndex)?.let { began ->
@@ -1250,6 +1275,11 @@ class FilePlayer private constructor(private val context: Context) {
         MediaFormat.MIMETYPE_AUDIO_OPUS -> "Opus"
         "audio/alac" -> "ALAC"
         else -> mime.removePrefix("audio/")
+    }
+
+    /** Re-pushes EQ and the Bluetooth guard after a route or setting change; no sink rebuild. */
+    fun refreshRouteDependentParams() {
+        liveOutput?.refreshRouteDependentParams()
     }
 
     fun routedDevice(): AudioDeviceInfo? = liveOutput?.routed()

@@ -22,7 +22,8 @@ Java_dev_alamo3_cabineq_NativeDsp_destroy(JNIEnv*, jobject, jlong h) {
 // coeffs: bandCount * 5 doubles, each band (b0, b1, b2, a1, a2), already normalised by a0.
 JNIEXPORT void JNICALL
 Java_dev_alamo3_cabineq_NativeDsp_setParams(JNIEnv* env, jobject, jlong h, jdoubleArray coeffs,
-                                           jint bandCount, jfloat preampLin, jfloat limiterThresholdLin) {
+                                           jint bandCount, jfloat preampLin, jfloat limiterThresholdLin,
+                                           jdoubleArray guardCoeffs, jint guardCount) {
     cabin::Params p;
     p.bandCount = std::clamp(static_cast<int>(bandCount), 0, cabin::kMaxBands);
     p.preampLin = preampLin;
@@ -35,6 +36,20 @@ Java_dev_alamo3_cabineq_NativeDsp_setParams(JNIEnv* env, jobject, jlong h, jdoub
         p.coeffs[b] = cabin::BiquadCoeffs{c[5 * b], c[5 * b + 1], c[5 * b + 2], c[5 * b + 3], c[5 * b + 4]};
     }
     env->ReleaseDoubleArrayElements(coeffs, c, JNI_ABORT);
+
+    if (guardCoeffs != nullptr) {
+        const jsize glen = env->GetArrayLength(guardCoeffs);
+        p.guardCount = std::clamp(static_cast<int>(guardCount), 0, 2);
+        if (glen < p.guardCount * 5) p.guardCount = glen / 5;
+        if (p.guardCount > 0) {
+            jdouble* g = env->GetDoubleArrayElements(guardCoeffs, nullptr);
+            for (int i = 0; i < p.guardCount; ++i) {
+                p.guard[i] = cabin::BiquadCoeffs{g[5 * i], g[5 * i + 1], g[5 * i + 2], g[5 * i + 3], g[5 * i + 4]};
+            }
+            env->ReleaseDoubleArrayElements(guardCoeffs, g, JNI_ABORT);
+        }
+    }
+
     engine(h)->setParams(p);
 }
 
