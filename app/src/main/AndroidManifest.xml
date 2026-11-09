@@ -56,6 +56,35 @@
 
         <!-- Reached only from Music's settings (and from our own installer PendingIntent, which
              runs with our identity), so it is not exported: nothing else can drive its intents. -->
+        <!-- Playlist import: a CSV/JSON export can be shared straight into the app, and
+             cabineq://import lets a web page or a QR code hand over a list. -->
+        <activity
+            android:name=".ImportActivity"
+            android:exported="true"
+            android:label="Import playlist"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/json" />
+                <data android:mimeType="text/csv" />
+                <data android:mimeType="text/comma-separated-values" />
+                <data android:mimeType="application/octet-stream" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="cabineq" android:host="import" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name=".MainActivity"
             android:exported="false"

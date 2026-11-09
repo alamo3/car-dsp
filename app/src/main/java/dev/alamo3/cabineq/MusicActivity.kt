@@ -128,6 +128,7 @@ class MusicActivity : Activity() {
         setContentView(buildUi())
         navigate { renderHome() }
         startFromPlayFromSearch(intent)
+        handleImportIntent(intent)
     }
 
     /**
@@ -136,7 +137,9 @@ class MusicActivity : Activity() {
      */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         startFromPlayFromSearch(intent)
+        handleImportIntent(intent)
     }
 
     /** Same handling whether the activity was created by the intent or already running. */
@@ -1017,6 +1020,166 @@ class MusicActivity : Activity() {
     }
 
     // ---------------------------------------------------------------------------------
+    // Playlist import
+
+    /**
+     * Import a playlist exported from another service. The services themselves do not expose
+     * their playlists to other apps, so this takes what their export tools produce: CSV from
+     * Soundiiz/TuneMyMusic/Exportify, JSON from Spotify's data export, or a plain "Artist - Title"
+     * list. Matching happens against the catalogue through the addon, one search per artist.
+     */
+    private fun renderImport() {
+        clearPage()
+        page.addView(backRow())
+        page.addView(Ui.text(this, "Import playlists", 24f, bold = true).apply { setPadding(0, dp(4), 0, dp(6)) })
+        page.addView(Ui.text(this,
+            "YouTube Music has no public API for other apps, so use a transfer service: in " +
+                "Soundiiz or TuneMyMusic connect YouTube Music, then export a playlist to CSV or JSON " +
+                "and share the file here. Spotify users can use Exportify, which includes ISRCs and " +
+                "therefore matches almost exactly. You can also paste a list of \"Artist - Title\" lines.",
+            12f, Ui.TEXT_2, lines = 6).apply { setPadding(0, 0, 0, dp(12)) })
+
+        importText = EditText(this).apply {
+            hint = "Paste a track list, or pick a file below"
+            setHintTextColor(Ui.TEXT_2)
+            setTextColor(Ui.TEXT)
+            textSize = 14f
+            minLines = 4
+            maxLines = 10
+            gravity = android.view.Gravity.TOP or android.view.Gravity.START
+            background = Ui.rounded(Ui.SURFACE, dp(12).toFloat())
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        page.addView(importText, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(12), 0, dp(8))
+        }
+        actions.addView(Ui.pill(this, "Pick a file", filled = false) { pickImportFile() }, wrapLp().apply { rightMargin = dp(10) })
+        actions.addView(Ui.pill(this, "Import", filled = true) { runImport(importText.text.toString()) }, wrapLp())
+        page.addView(actions)
+
+        importStatus = Ui.text(this, lastImportStatus, 13f, Ui.TEXT_2, lines = 6)
+        page.addView(importStatus)
+
+        val known = settings.importedPlaylists()
+        if (known.isNotEmpty()) {
+            page.addView(Ui.text(this, "Imported: " + known.joinToString(", "), 12f, Ui.TEXT_2, lines = 4)
+                .apply { setPadding(0, dp(10), 0, dp(6)) })
+            page.addView(Ui.pill(this, "Forget imported playlists", filled = false) {
+                val removed = Taste.forgetImports(this)
+                showMessage("Removed $removed imported tracks")
+                renderImport()
+            }, wrapLp())
+        }
+    }
+
+    private fun pickImportFile() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("text/*", "application/json", "application/csv", "*/*"))
+        }
+        runCatching { startActivityForResult(intent, REQ_IMPORT_FILE) }
+            .onFailure { showMessage("No file picker available", isError = true) }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_IMPORT_FILE || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val name = runCatching { uri.lastPathSegment ?: "Imported playlist" }.getOrDefault("Imported playlist")
+        importExecutor.execute {
+            val text = runCatching {
+                contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }.getOrNull()
+            runOnUiThread {
+                if (text.isNullOrBlank()) {
+                    importStatus.text = "Couldn't read that file."
+                    return@runOnUiThread
+                }
+                runImport(text, name)
+            }
+        }
+    }
+
+    /** Shared text/links and cabineq://import land here. */
+    private fun handleImportIntent(intent: Intent?): Boolean {
+        intent ?: return false
+        val action = intent.action ?: return false
+        val text = when (action) {
+            ACTION_IMPORT -> intent.getStringExtra(EXTRA_IMPORT_TEXT)
+            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
+                ?.takeIf { it.isNotBlank() }
+                ?: intent.getParcelableExtra<android.net.Uri>(Intent.EXTRA_STREAM)?.let { uri ->
+                    runCatching {
+                        contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                    }.getOrNull()
+                }
+            Intent.ACTION_VIEW -> intent.dataString
+            else -> null
+        }
+        if (text.isNullOrBlank()) return false
+        navigate { renderImport() }
+        importText.setText(text)
+        // Sharing a file or opening an import link is an explicit "do it", unlike pasting.
+        if (action == Intent.ACTION_SEND || action == ACTION_IMPORT || action == Intent.ACTION_VIEW) {
+            runImport(text, "Shared playlist")
+        }
+        return true
+    }
+
+    private fun runImport(text: String, name: String = "Pasted list") {
+        val raw = text.trim()
+        if (raw.isBlank()) {
+            importStatus.text = "Nothing to import."
+            return
+        }
+        val link = settings.addonLink
+        if (link.isBlank()) {
+            importStatus.text = "Connect the search source first (Settings → Search source)."
+            return
+        }
+        val token = ++importToken
+        importStatus.text = "Parsing…"
+        importExecutor.execute {
+            val rows = Playlists.parse(name, raw)
+            if (rows.isEmpty()) {
+                runOnUiThread { if (token == importToken) importStatus.text = "No tracks found in that text." }
+                return@execute
+            }
+            val label = Playlists.sourceName(name)
+            val result = runCatching {
+                Playlists.match(EclipseAddon(link), rows, label, onProgress = { done, total ->
+                    if (done % 5 == 0 || done == total) {
+                        runOnUiThread {
+                            if (token == importToken) importStatus.text = "Matching $done/$total…"
+                        }
+                    }
+                })
+            }.getOrElse { e ->
+                runOnUiThread { if (token == importToken) importStatus.text = "Lookup failed: ${e.message}" }
+                return@execute
+            }
+            val added = Taste.importPlaylist(this, result.matched, label)
+            runOnUiThread {
+                if (token != importToken) return@runOnUiThread
+                lastImportStatus = buildString {
+                    append("${result.rows.size} rows")
+                    append(" · ${result.matchedRows} matched")
+                    if (result.unmatched > 0) append(" · ${result.unmatched} not in the catalogue")
+                    if (result.withIsrc > 0) append(" · ${result.withIsrc} with ISRC")
+                    append("\n$added new tracks added to your taste profile.")
+                }
+                importStatus.text = lastImportStatus
+                showMessage("Imported $label")
+                renderImport()
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
     // Sources
 
     private fun addon(): EclipseAddon? {
@@ -1117,6 +1280,15 @@ class MusicActivity : Activity() {
     private val lyricsExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "CabinEQ-Lyrics").apply { isDaemon = true }
     }
+
+    // Importing a playlist is minutes of network work; it must never queue behind playback.
+    private val importExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "CabinEQ-Import").apply { isDaemon = true }
+    }
+    private var importToken = 0
+    private var lastImportStatus = ""
+    private lateinit var importStatus: TextView
+    private lateinit var importText: EditText
 
     private val playExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "CabinEQ-Play").apply { isDaemon = true }
@@ -1336,6 +1508,17 @@ class MusicActivity : Activity() {
     private fun renderSettings() {
         clearPage()
         page.addView(backRow())
+
+        page.addView(sectionTitle("Import playlists"))
+        page.addView(Ui.text(this,
+            "Bring your taste over from another service: export a playlist (Soundiiz, TuneMyMusic or " +
+                "Exportify all produce CSV or JSON) and import it here. Matched tracks steer the " +
+                "recommendations at a deliberately low weight.",
+            12f, Ui.TEXT_2, lines = 4).apply { setPadding(0, 0, 0, dp(6)) })
+        val imported = settings.importedPlaylists()
+        page.addView(Ui.pill(this, if (imported.isEmpty()) "Import a playlist" else "Import a playlist (${imported.size} imported)", filled = true) {
+            navigate { renderImport() }
+        }.apply { setPadding(dp(18), dp(12), dp(18), dp(12)) }, wrapLp().apply { bottomMargin = dp(14) })
 
         // Playback cache: the next queued track is downloaded so track changes are instant.
         page.addView(sectionTitle("Playback cache"))
@@ -1589,6 +1772,13 @@ class MusicActivity : Activity() {
 
     companion object {
         const val ACTION_PLAY_FROM_SEARCH = "android.media.action.MEDIA_PLAY_FROM_SEARCH"
+
+        /** A playlist handed over by the share sheet or a cabineq://import link. */
+        const val ACTION_IMPORT = "dev.alamo3.cabineq.action.IMPORT"
+        const val EXTRA_IMPORT_TEXT = "import_text"
+
+        /** SAF request for the playlist file picker. */
+        const val REQ_IMPORT_FILE = 4101
 
 
         private const val REQ_NOTIFICATIONS = 11

@@ -206,6 +206,33 @@ Wired, USB and speaker routes are untouched. The Output panel shows `HF guard: a
 screen. The route is only known once a track is playing, so the parameters are re-pushed at
 that point rather than rebuilding the sink.
 
+### Importing playlists (taste from other services)
+
+The big services do not let another app read your playlists — YouTube Music, Spotify and Samsung
+Music all declare a **non-exported** `MediaBrowserService`, so there is no API, permission or
+trick by which CabinEQ can pull them. That is deliberate on their side.
+
+So import is an **export**: Music → ⚙ → **Import playlists**
+
+- **YouTube Music** (no public API): in Soundiiz or TuneMyMusic connect YouTube Music and export a
+  playlist to CSV/JSON. Google Takeout works too but its CSVs are video-id-only, with no titles.
+- **Spotify**: [Exportify](https://exportify.net) exports CSV **including ISRCs**, which matches
+  almost exactly.
+- Anything else: a plain `Artist - Title` list pasted in, of any length.
+
+Three ways in: paste, **pick a file** (SAF, no permission prompt), or **share** a CSV/JSON to
+CabinEQ from any file manager. `cabineq://import` and
+<https://cabineq-jam-81cd8.web.app/import.html> open the same screen.
+
+Matching goes through the addon, **one search per distinct artist** rather than per track, ISRC
+first and then title-token coverage with a 0.75 floor; the result reports what it could not find
+(`312 rows · 241 matched · 71 not in the catalogue`) instead of silently seeding half a list.
+
+Imported tracks become `Taste.Kind.IMPORT` events: **0.35** each, against a play's 0.25–1 and a
+like's 6, so an imported playlist nudges the profile without overruling what you actually listen
+to. Re-importing the same playlist does not double it, and **Forget imported playlists** removes
+every import in one tap while keeping your real history.
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are

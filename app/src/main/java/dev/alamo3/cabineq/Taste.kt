@@ -30,7 +30,11 @@ object Taste {
     private const val TAU_MS = 14.0 * 24 * 3600 * 1000
     private const val MAX_EVENTS = 4000
 
-    enum class Kind { PLAY, COMPLETE, SKIP, LIKE, DISLIKE }
+    enum class Kind {
+        PLAY, COMPLETE, SKIP, LIKE, DISLIKE,
+        /** A track found in an imported playlist: a hint, never as loud as an explicit like. */
+        IMPORT,
+    }
 
     class Event(
         val at: Long,
@@ -125,6 +129,68 @@ object Taste {
         persist()
     }
 
+    /**
+     * Seeds taste from an imported playlist. Tracks already imported are skipped, so importing
+     * the same playlist twice does not double its weight.
+     */
+    fun importPlaylist(context: Context, tracks: List<Track>, playlistName: String): Int {
+        if (tracks.isEmpty()) return 0
+        val s = store(context)
+        val now = System.currentTimeMillis()
+        val already = HashSet<String>()
+        synchronized(s) {
+            for (e in s.events) if (e.kind == Kind.IMPORT) already.add(e.key)
+        }
+        var added = 0
+        synchronized(s) {
+            for (t in tracks) {
+                if (t.title.isBlank()) continue
+                val k = key(t)
+                if (!already.add(k)) continue
+                s.events.add(
+                    Event(
+                        at = now,
+                        key = k,
+                        artist = t.artist?.trim()?.takeIf { it.isNotBlank() },
+                        album = t.album?.trim()?.takeIf { it.isNotBlank() },
+                        kind = Kind.IMPORT,
+                        value = 1f,
+                    )
+                )
+                added++
+            }
+            if (s.events.size > MAX_EVENTS) {
+                s.events.subList(0, s.events.size - MAX_EVENTS).clear()
+            }
+        }
+        if (added > 0) {
+            Settings(context).addImportedPlaylist(playlistName)
+            version++
+            ui.removeCallbacks(saveTask)
+            ui.postDelayed(saveTask, 1500)
+        }
+        return added
+    }
+
+    /** Undoes every import in one go, keeping what was actually listened to. */
+    fun forgetImports(context: Context): Int {
+        val s = store(context)
+        var removed = 0
+        synchronized(s) {
+            val it = s.events.iterator()
+            while (it.hasNext()) {
+                if (it.next().kind == Kind.IMPORT) { it.remove(); removed++ }
+            }
+        }
+        Settings(context).clearImportedPlaylists()
+        version++
+        ui.removeCallbacks(saveTask)
+        ui.postDelayed(saveTask, 1500)
+        return removed
+    }
+
+    fun importedPlaylists(context: Context): List<String> = Settings(context).importedPlaylists()
+
     private fun record(context: Context, track: Track, kind: Kind, value: Float) {
         if (track.title.isBlank()) return
         val s = store(context)
@@ -202,6 +268,8 @@ object Taste {
             Kind.SKIP -> if (e.value < 0.25f) -1.2f else -0.4f * (1f - e.value)
             Kind.LIKE -> 6f
             Kind.DISLIKE -> -8f
+            // A playlist placement says "this belongs somewhere I listen", not "play this a lot".
+            Kind.IMPORT -> 0.35f * e.value.coerceIn(0f, 1f)
         }
         return base * decay
     }

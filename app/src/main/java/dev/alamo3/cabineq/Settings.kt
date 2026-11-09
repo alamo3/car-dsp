@@ -141,6 +141,21 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_CACHE_WIFI_ONLY, false)
         set(v) = prefs.edit().putBoolean(KEY_CACHE_WIFI_ONLY, v).apply()
 
+    /** Playlists imported from another service, so they can be listed and forgotten. */
+    fun importedPlaylists(): List<String> =
+        (prefs.getStringSet(KEY_IMPORTED_PLAYLISTS, emptySet()) ?: emptySet()).sorted()
+
+    fun addImportedPlaylist(name: String) {
+        val set = HashSet(prefs.getStringSet(KEY_IMPORTED_PLAYLISTS, emptySet()) ?: emptySet())
+        if (set.add(name.trim().take(80))) {
+            prefs.edit().putStringSet(KEY_IMPORTED_PLAYLISTS, set).apply()
+        }
+    }
+
+    fun clearImportedPlaylists() {
+        prefs.edit().remove(KEY_IMPORTED_PLAYLISTS).apply()
+    }
+
     /**
      * Low-pass at ~15.5 kHz when the output is Bluetooth: A2DP cannot reproduce that band, so
      * what reaches the listener up there is codec noise — heard as crackle on bright material.
@@ -281,6 +296,7 @@ class Settings(context: Context) {
         const val KEY_RADIO_SEED = "radio_seed"
         const val KEY_REPEAT = "repeat_mode"
         const val KEY_BT_HF_GUARD = "bluetooth_hf_guard"
+        const val KEY_IMPORTED_PLAYLISTS = "imported_playlists"
         const val KEY_MAX_VOLUME_IN_CAR = "max_volume_in_car"
         const val KEY_MAX_VOLUME_SPEAKER = "max_volume_speaker"
         const val KEY_PRE_CAR_VOLUME = "pre_car_volume"
