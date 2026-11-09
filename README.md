@@ -137,9 +137,14 @@ local build to *replace* that app (rather than failing with `INSTALL_FAILED_UPDA
 or ending up as a second copy), it must use the same key and package:
 
 ```sh
-export SIGNING_KEYSTORE_B64='<the GitHub secret value>'
+# if you have the existing key (the SIGNING_KEYSTORE_B64 secret value):
+export SIGNING_KEYSTORE_B64='<the secret value>'
 tools/import-signing-key.sh                      # -> ~/.android/cabineq-release.jks
-echo 'cabineq.storePassword=<SIGNING_PASSWORD secret>' >> local.properties   # never committed
+
+# if you need a new key (the old one is lost, or this is the first release):
+tools/make-signing-key.sh                        # asks for a password, prints the base64 for CI
+
+echo 'cabineq.storePassword=<SIGNING_PASSWORD>' >> local.properties   # never committed
 ./gradlew installDebug -PcabinVersionCode=9999   # no -PcabinAppIdSuffix: same package
 ```
 
