@@ -20,7 +20,13 @@ object TrackResolver {
     /** A playable URL plus what the source claims it is (the addon tells us; TorBox doesn't). */
     class Resolved(val url: String, val quality: String? = null)
 
-    fun resolve(context: Context, track: Track, onNote: (String?) -> Unit, isCancelled: () -> Boolean): Resolved {
+    fun resolve(
+        context: Context,
+        track: Track,
+        onNote: (String?) -> Unit,
+        isCancelled: () -> Boolean,
+        maxWaitMs: Long = 5 * 60_000L,
+    ): Resolved {
         track.streamUrl?.let { return Resolved(it) }
         val settings = Settings(context)
         return when (track.source) {
@@ -31,6 +37,7 @@ object TrackResolver {
                     ?: throw IllegalStateException("“${track.title}” has no addon id")
                 EclipseAddon(link).resolveStream(
                     trackId = id,
+                    maxWaitMs = maxWaitMs,
                     isCancelled = isCancelled,
                     onNotice = { onNote(describe(it)) },
                 ).let { Resolved(it.url, it.quality) }

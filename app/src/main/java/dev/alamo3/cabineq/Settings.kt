@@ -131,6 +131,21 @@ class Settings(context: Context) {
             if (v == null) remove(KEY_RADIO_SEED) else putString(KEY_RADIO_SEED, v.toJson().toString())
         }.apply()
 
+    /** Prefetch the next queued track to disk so track changes are instant. */
+    var cacheEnabled: Boolean
+        get() = prefs.getBoolean(KEY_CACHE_ENABLED, true)
+        set(v) = prefs.edit().putBoolean(KEY_CACHE_ENABLED, v).apply()
+
+    /** Prefetch only on Wi-Fi/Ethernet. Off by default: the user decides. */
+    var cacheWifiOnly: Boolean
+        get() = prefs.getBoolean(KEY_CACHE_WIFI_ONLY, false)
+        set(v) = prefs.edit().putBoolean(KEY_CACHE_WIFI_ONLY, v).apply()
+
+    /** Audio cache cap in megabytes. */
+    var cacheMaxMb: Int
+        get() = prefs.getInt(KEY_CACHE_MAX_MB, 2048)
+        set(v) = prefs.edit().putInt(KEY_CACHE_MAX_MB, v.coerceIn(128, 65536)).apply()
+
     /** Queue loop mode, persisted so it survives a restart (FilePlayer.Repeat name). */
     var repeatMode: String
         get() = prefs.getString(KEY_REPEAT, "OFF") ?: "OFF"
@@ -230,6 +245,9 @@ class Settings(context: Context) {
         const val KEY_JAM_SESSION = "jam_last_session"
         const val KEY_RADIO_SEED = "radio_seed"
         const val KEY_REPEAT = "repeat_mode"
+        const val KEY_CACHE_ENABLED = "cache_enabled"
+        const val KEY_CACHE_WIFI_ONLY = "cache_wifi_only"
+        const val KEY_CACHE_MAX_MB = "cache_max_mb"
         const val KEY_TORBOX_FORMAT = "torbox_format"
         const val KEY_ADDON_LINK = "addon_link"
         const val KEY_ADDON_NAME = "addon_name"

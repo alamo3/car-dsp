@@ -352,6 +352,10 @@ class FilePlayer private constructor(private val context: Context) {
         }
         version++
         saveQueue()
+        // A guest or the radio just queued the immediate next track: start caching it now.
+        if (queue.size - tracks.size == currentIndex + 1) {
+            MediaCache.prefetch(context, tracks.first())
+        }
         return keys
     }
 
@@ -687,6 +691,7 @@ class FilePlayer private constructor(private val context: Context) {
                     formatInfo = null
                     if (state != State.PAUSED) setState(State.LOADING) else version++
                     extendRadioIfNeeded()
+                    queue.getOrNull(index + 1)?.let { MediaCache.prefetch(context, it) }
                     val outcome = try {
                         playTrack(queue[index])
                     } catch (e: Exception) {
@@ -800,14 +805,21 @@ class FilePlayer private constructor(private val context: Context) {
             note = null
             val url = resolved.url
             declaredQuality = resolved.quality
+            // Prefetched ahead of time: open the local file instead of the network.
+            val cached = MediaCache.fileFor(context, item)
             // Files without source artwork (e.g. TorBox library tracks): read the cover and tags
             // embedded in the file itself, which is exact per song even on compilations.
-            if (item.artworkUrl == null) readFileInfo(url, gen, currentIndex)
+            if (item.artworkUrl == null) readFileInfo(cached?.path ?: url, cached != null, gen, currentIndex)
 
             val extractor = MediaExtractor()
             var codec: MediaCodec? = null
             try {
-                extractor.setDataSource(url, emptyMap<String, String>())
+                if (cached != null) {
+                    Log.i(TAG, "playing cached \"${item.title}\" (${cached.length() / 1024} kB)")
+                    extractor.setDataSource(cached.path)
+                } else {
+                    extractor.setDataSource(url, emptyMap<String, String>())
+                }
                 val trackIndex = (0 until extractor.trackCount).firstOrNull {
                     extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
                 } ?: return Outcome.Failed("no audio stream")
@@ -983,7 +995,7 @@ class FilePlayer private constructor(private val context: Context) {
         return codec
     }
 
-    private fun readFileInfo(url: String, gen: Int, index: Int) {
+    private fun readFileInfo(source: String, isFile: Boolean, gen: Int, index: Int) {
         val key = "$gen:$index"
         if (infoBusy.size > 32) infoBusy.clear()   // abandoned generations never clean themselves
         if (!infoBusy.add(key)) return
@@ -994,7 +1006,7 @@ class FilePlayer private constructor(private val context: Context) {
             }
             val r = MediaMetadataRetriever()
             val info = try {
-                r.setDataSource(url, HashMap<String, String>())
+                if (isFile) r.setDataSource(source) else r.setDataSource(source, HashMap<String, String>())
                 FileInfo(
                     art = r.embeddedPicture?.let { decodeCover(it, 1000) },
                     title = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)?.trim()?.ifBlank { null },

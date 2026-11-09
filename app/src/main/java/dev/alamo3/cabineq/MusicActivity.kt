@@ -1172,6 +1172,56 @@ class MusicActivity : Activity() {
         clearPage()
         page.addView(backRow())
 
+        // Playback cache: the next queued track is downloaded so track changes are instant.
+        page.addView(sectionTitle("Playback cache"))
+        page.addView(Ui.text(this,
+            "The next track in the queue is downloaded while the current one plays, so it starts " +
+                "instantly and survives a network blip. Nothing leaves this phone.",
+            12f, Ui.TEXT_2, lines = 3).apply { setPadding(0, 0, 0, dp(10)) })
+        val cacheToggles = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun refreshCacheToggles() {
+            cacheToggles.removeAllViews()
+            cacheToggles.addView(Ui.pill(this, "Cache: ${if (settings.cacheEnabled) "on" else "off"}", filled = true) {
+                settings.cacheEnabled = !settings.cacheEnabled
+                if (!settings.cacheEnabled) MediaCache.clear(this)
+                renderSettings()
+            }.apply { textSize = 13f; setPadding(dp(14), dp(8), dp(14), dp(8)) },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
+            cacheToggles.addView(Ui.pill(this, "Only on Wi-Fi: ${if (settings.cacheWifiOnly) "on" else "off"}", filled = false) {
+                settings.cacheWifiOnly = !settings.cacheWifiOnly
+                renderSettings()
+            }.apply { textSize = 13f; setPadding(dp(14), dp(8), dp(14), dp(8)) },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        refreshCacheToggles()
+        page.addView(HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(cacheToggles) }, wrapLp(top = 4))
+
+        val sizes = listOf(512, 1024, 2048, 4096, 8192)
+        val sizeChips = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun refreshSizeChips() {
+            sizeChips.removeAllViews()
+            for (mb in sizes) {
+                val label = if (mb >= 1024) "${mb / 1024} GB" else "$mb MB"
+                sizeChips.addView(Ui.pill(this, label, filled = settings.cacheMaxMb == mb) {
+                    settings.cacheMaxMb = mb
+                    MediaCache.applyLimit(this)
+                    renderSettings()
+                }.apply { textSize = 13f; setPadding(dp(12), dp(8), dp(12), dp(8)) },
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
+            }
+        }
+        refreshSizeChips()
+        page.addView(Ui.text(this, "Maximum size", 13f, Ui.TEXT_2).apply { setPadding(0, dp(14), 0, dp(6)) })
+        page.addView(HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false; addView(sizeChips) })
+
+        val usedMb = (MediaCache.usedBytes(this) / (1024 * 1024)).toInt()
+        page.addView(Ui.text(this,
+            "Using $usedMb MB of ${settings.cacheMaxMb} MB.",
+            12f, Ui.TEXT_2, lines = 2).apply { setPadding(0, dp(10), 0, 0) })
+        page.addView(Ui.pill(this, "Clear cache", filled = false) {
+            MediaCache.clear(this)
+            renderSettings()
+        }, wrapLp(top = 10))
         // The EQ/DSP screen is the secondary surface now that Music is the app.
         page.addView(sectionTitle("Equalizer & DSP"))
         page.addView(card(
