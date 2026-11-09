@@ -32,7 +32,7 @@ public:
      */
     void configure(int inRate, int outRate) {
         active_ = false;
-        reset();
+        clear();
         inRate_ = outRate_ = L_ = M_ = 0;
         if (inRate <= 0 || outRate <= 0 || inRate == outRate) return;
         const int g = gcd(inRate, outRate);
@@ -58,7 +58,7 @@ public:
 
     /** Resamples a block. Returns the number of output frames written to [out]. */
     int process(const float* in, int inFrames, float* out, int outCap) {
-        if (!active_) return 0;
+        if (!active_ || outCap <= 0) return 0;
         if (inFrames > 0) append(in, inFrames);
         int produced = 0;
         while (produced < outCap) {
@@ -94,7 +94,21 @@ public:
         return n;
     }
 
+    /**
+     * Drops all history but keeps the kernel configured. Must leave the buffer prefilled with
+     * silence: without it the next process() would index before the buffer (the kernel looks
+     * kTaps/2 samples back), which is exactly what happened after a track ended and the next
+     * one — same sample rate, so no reconfigure — started on the same resampler.
+     */
     void reset() {
+        if (!active_) {
+            clear();
+            return;
+        }
+        prefill(kTaps / 2);
+    }
+
+    void clear() {
         buf_.clear();
         frames_ = 0;
         start_ = 0;

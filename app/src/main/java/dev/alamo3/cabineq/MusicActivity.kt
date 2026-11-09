@@ -954,6 +954,7 @@ class MusicActivity : Activity() {
         lyricsExecutor.execute {
             val sheet = Lyrics.forPlayer(this, p)
             runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
                 // The song or the page may have changed while the lookup ran.
                 if (token != lyricToken || !lyricsOpen || lyricsBlock !== holder) return@runOnUiThread
                 showLyrics(holder, sheet)

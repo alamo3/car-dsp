@@ -68,7 +68,8 @@ object Lyrics {
     // Hits and misses, keyed by [keyOf]; both are also on disk, this just skips the file read.
     private val hits = ConcurrentHashMap<String, Sheet>()
     private val misses = ConcurrentHashMap.newKeySet<String>()
-    private val busy = ConcurrentHashMap.newKeySet<String>()
+    /** One fetch per song at a time; a second caller waits for it instead of failing. */
+    private val locks = ConcurrentHashMap<String, Any>()
 
     /**
      * Lyrics for whatever [player] is on, using the file's own tags when the source gave none.
@@ -137,25 +138,34 @@ object Lyrics {
             hits[key] = sheet
             return sheet
         }
-        // One request per song at a time, but don't block a second caller on the first:
-        // it just gets null now and the next render will find the result cached.
-        if (!busy.add(key)) return null
+        // The phone page and the car screen can ask at the same time. Serialise per song and
+        // re-check the cache inside the lock, so the second caller returns the answer the first
+        // one fetched instead of telling the user the service was unreachable.
+        val lock = locks.getOrPut(key) { Any() }
         try {
-            val sheet = fetch(title, artist, album, durationMs) ?: NOTHING
-            writeDisk(context, key, sheet)
-            if (sheet.empty) {
-                misses.add(key)
-            } else {
-                hits[key] = sheet
+            synchronized(lock) {
+                hits[key]?.let { return it }
+                if (key in misses) return NOTHING
+                readDisk(context, key)?.let { sheet ->
+                    if (sheet.empty) {
+                        misses.add(key)
+                        return NOTHING
+                    }
+                    hits[key] = sheet
+                    return sheet
+                }
+                val sheet = fetch(title, artist, album, durationMs) ?: NOTHING
+                writeDisk(context, key, sheet)
+                if (sheet.empty) misses.add(key) else hits[key] = sheet
+                return sheet
             }
-            return sheet
         } catch (e: Exception) {
             // Network trouble is not "this song has no lyrics": leave no cache entry so a
             // later attempt can succeed.
             Log.i(TAG, "lookup failed for \"$title\": ${e.javaClass.simpleName} ${e.message.orEmpty()}")
             return null
         } finally {
-            busy.remove(key)
+            locks.remove(key, lock)
         }
     }
 
@@ -325,13 +335,15 @@ object Lyrics {
     private fun dir(context: Context) = File(context.filesDir, "lyrics").apply { mkdirs() }
 
     private fun file(context: Context, key: String): File =
-        File(dir(context), Integer.toHexString(key.hashCode()) + ".json")
+        File(dir(context), Integer.toHexString(key.hashCode()) + "-" + key.length + ".json")
 
     private fun readDisk(context: Context, key: String): Sheet? {
         val f = file(context, key)
         if (!f.isFile) return null
         return try {
             val o = JSONObject(f.readText())
+            // A hashCode collision would otherwise serve another song's lyrics for a month.
+            if (!o.has("key") || o.optString("key") != key) return null
             val ttl = if (o.optBoolean("miss")) MISS_TTL_MS else HIT_TTL_MS
             if (System.currentTimeMillis() - o.optLong("at") > ttl) return null
             if (o.optBoolean("miss")) return NOTHING
@@ -348,7 +360,7 @@ object Lyrics {
     }
 
     private fun writeDisk(context: Context, key: String, sheet: Sheet) {
-        val o = JSONObject().put("at", System.currentTimeMillis())
+        val o = JSONObject().put("at", System.currentTimeMillis()).put("key", key)
         if (sheet.empty) {
             o.put("miss", true)
         } else {

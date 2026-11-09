@@ -33,10 +33,15 @@ object EqDesign {
     fun design(band: Int, gainDb: Double, fs: Double): DoubleArray {
         if (kotlin.math.abs(gainDb) < 0.01) return doubleArrayOf(1.0, 0.0, 0.0, 0.0, 0.0)
         val a = 10.0.pow(gainDb / 40.0)
+        // We now run at whatever rate the device mixes at, which can be 32 kHz on some routes.
+        // A centre at Nyquist degenerates the biquad to a pole on the unit circle (sin(w0) = 0,
+        // cos(w0) = -1) — infinite gain, or a screech. Keep every centre below 0.45 fs.
+        val limit = fs * 0.45
+        fun f(hz: Double) = if (hz < limit) hz else limit
         return when (band) {
-            0 -> lowShelf(LOW_SHELF_HZ, a, fs)
-            Bands.COUNT - 1 -> highShelf(HIGH_SHELF_HZ, a, fs)
-            else -> peaking(Bands.CENTERS[band].toDouble(), a, PEAK_Q, fs)
+            0 -> lowShelf(f(LOW_SHELF_HZ), a, fs)
+            Bands.COUNT - 1 -> highShelf(f(HIGH_SHELF_HZ), a, fs)
+            else -> peaking(f(Bands.CENTERS[band].toDouble()), a, PEAK_Q, fs)
         }
     }
 

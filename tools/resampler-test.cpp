@@ -45,7 +45,42 @@ static std::vector<float> run(int inRate, int outRate, const std::vector<float>&
     return out;
 }
 
+
+// Two consecutive tracks on one resampler, which is what a queue does: track A ends with
+// flush(), track B starts with the same rate (so nothing reconfigures). This used to read
+// before the buffer because reset() cleared the history the kernel looks back into.
+
+int twoTrackCheck() {
+    Resampler rs;
+    rs.configure(44100, 48000);
+    const int frames = 4096;
+    std::vector<float> in(frames * 2), out(frames * 2 + 8192);
+    for (int i = 0; i < frames; ++i) { in[2*i] = 0.25f; in[2*i+1] = 0.25f; }
+
+    rs.process(in.data(), frames, out.data(), (int)(frames * 2 + 8192) / 2);
+    rs.flush(out.data(), 8192);
+    // Track B on the same instance.
+    const int n = rs.process(in.data(), frames, out.data(), 8192);
+
+    // Reference: a fresh instance fed the same block.
+    Resampler fresh;
+    fresh.configure(44100, 48000);
+    std::vector<float> ref(frames * 2 + 8192);
+    const int rn = fresh.process(in.data(), frames, ref.data(), (int)ref.size() / 2);
+
+    if (n != rn) { std::printf("TWO TRACKS: FAIL — %d vs %d frames\n", n, rn); return 1; }
+    for (int i = 0; i < std::min(n, 512); ++i) {
+        if (std::fabs(out[2*i] - ref[2*i]) > 1e-6f) {
+            std::printf("TWO TRACKS: FAIL — sample %d is %f, expected %f\n", i, out[2*i], ref[2*i]);
+            return 1;
+        }
+    }
+    std::printf("TWO TRACKS: ok (%d frames, start matches a fresh resampler)\n", n);
+    return 0;
+}
+
 int main() {
+    twoTrackCheck();
     for (int block : {1, 37, 512, 1024, 4096}) {
         for (double f : {100.0, 1000.0, 10000.0, 19000.0}) {
             const int inRate = 44100, outRate = 48000, frames = 44100;

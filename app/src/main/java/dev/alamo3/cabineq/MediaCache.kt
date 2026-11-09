@@ -125,6 +125,7 @@ object MediaCache {
                 return 0L
             }
             var written = 0L
+            var capped = false
             conn.inputStream.use { input ->
                 tmp.outputStream().use { out ->
                     val buf = ByteArray(64 * 1024)
@@ -133,11 +134,14 @@ object MediaCache {
                         if (n < 0) break
                         out.write(buf, 0, n)
                         written += n
-                        if (written > max) break   // never let one file blow the cap
+                        if (written > max) {       // never let one file blow the cap
+                            capped = true
+                            break
+                        }
                     }
                 }
             }
-            if (written <= 0L || (expected > 0 && written < expected)) {
+            if (written <= 0L || capped || (expected > 0 && written < expected)) {
                 tmp.delete()
                 return 0L
             }

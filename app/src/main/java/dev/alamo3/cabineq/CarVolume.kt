@@ -87,16 +87,20 @@ object CarVolume {
     private fun restore(context: Context, am: AudioManager, settings: Settings) {
         val saved = settings.preCarVolume
         if (saved < 0) return
-        settings.preCarVolume = -1
         val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val now = am.getStreamVolume(AudioManager.STREAM_MUSIC)
         // Only undo what we did: if the listener moved it since, that is the level they want.
         if (now != max) {
+            settings.preCarVolume = -1
             Log.i(TAG, "left the volume at $now/$max (moved since CabinEQ set it)")
             return
         }
-        runCatching { am.setStreamVolume(AudioManager.STREAM_MUSIC, saved.coerceIn(0, max), 0) }
-        Log.i(TAG, "car mode ended: volume $max -> ${saved.coerceIn(0, max)}")
+        // Keep the record until the set actually succeeded, otherwise a failure here loses the
+        // level for good and the next session starts from whatever maximum we left behind.
+        val ok = runCatching { am.setStreamVolume(AudioManager.STREAM_MUSIC, saved.coerceIn(0, max), 0) }.isSuccess
+        if (ok) settings.preCarVolume = -1
+        Log.i(TAG, if (ok) "car mode ended: volume $max -> ${saved.coerceIn(0, max)}"
+                  else "could not restore the volume; keeping ${settings.preCarVolume}")
     }
 
     /** Short description for the Output panel. */
