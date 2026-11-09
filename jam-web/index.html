@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#10141a">
+<title>CabinEQ Jam</title>
+<style>
+  :root {
+    --bg:#10141a; --surface:#1a1f27; --surface2:#232a34; --text:#eef1f5;
+    --text2:#9aa4b2; --accent:#64c8ff; --danger:#ff6b6b;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         padding:16px 16px 96px; }
+  h1 { font-size:20px; margin:0 0 2px; }
+  .sub { color:var(--text2); font-size:13px; margin-bottom:16px; }
+  .card { background:var(--surface); border-radius:14px; padding:14px; margin-bottom:14px; }
+  .row { display:flex; align-items:center; gap:12px; }
+  .art { width:44px; height:44px; border-radius:8px; object-fit:cover; background:var(--surface2); flex:0 0 auto; }
+  .title { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .meta { color:var(--text2); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .grow { flex:1 1 auto; min-width:0; }
+  button { font:inherit; border:0; border-radius:10px; padding:10px 14px;
+           background:var(--surface2); color:var(--text); }
+  button.primary { background:var(--accent); color:#08121a; font-weight:600; }
+  button.ghost { background:transparent; color:var(--text2); padding:8px 10px; }
+  button.danger { background:transparent; color:var(--danger); padding:8px 10px; }
+  button:disabled { opacity:.45; }
+  input[type=search] { width:100%; font:inherit; color:var(--text);
+    background:var(--surface2); border:0; border-radius:12px; padding:14px 16px; }
+  .list { display:flex; flex-direction:column; gap:10px; }
+  .item { display:flex; align-items:center; gap:12px; }
+  .status { position:fixed; left:0; right:0; bottom:0; padding:10px 16px;
+            background:var(--surface); font-size:13px; color:var(--text2);
+            display:flex; justify-content:space-between; gap:12px;
+            border-top:1px solid rgba(255,255,255,.06); }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--danger); display:inline-block; }
+  .dot.ok { background:#5ad19a; }
+  .muted { color:var(--text2); font-size:14px; }
+  .hint { color:var(--text2); font-size:13px; margin-top:8px; }
+  .item.pending { opacity:.55; }
+  .item.pending .meta { color:var(--accent); }
+  button.primary.adding { background:var(--surface2); color:var(--text2); }
+  @keyframes flash { from { background:rgba(90,209,154,.35); } to { background:var(--surface2); } }
+  button.primary.fresh { animation:flash 1.2s ease-out; }
+</style>
+</head>
+<body>
+<h1>CabinEQ Jam</h1>
+<div class="sub" id="session">Connecting…</div>
+
+<div class="card" id="nowCard" hidden>
+  <div class="row">
+    <img class="art" id="nowArt" alt="">
+    <div class="grow">
+      <div class="title" id="nowTitle"></div>
+      <div class="meta" id="nowMeta"></div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="justify-content:space-between;margin-bottom:10px">
+    <strong>Up next</strong>
+    <button class="ghost" id="skip" hidden>Skip</button>
+  </div>
+  <div class="list" id="queue"><div class="muted">Nothing queued yet.</div></div>
+</div>
+
+<div class="card">
+  <input id="q" type="search" placeholder="Search songs, albums, artists" autocomplete="off">
+  <div class="hint" id="searchHint" hidden></div>
+  <div class="list" id="results"></div>
+</div>
+
+<div class="status">
+  <span><span class="dot" id="dot"></span> <span id="conn">connecting</span></span>
+  <span id="who"></span>
+</div>
+
+<script src="config.js"></script>
+<script>
+(() => {
+  const cfg = window.CABINEQ_JAM || {};
+  const db = (cfg.databaseURL || "").replace(/\/$/, "");
+  const sid = (location.hash || "").replace(/^#/, "") || new URLSearchParams(location.search).get("s") || "";
+  const sessionEl = document.getElementById("session");
+  const dot = document.getElementById("dot");
+  const connEl = document.getElementById("conn");
+  const whoEl = document.getElementById("who");
+
+  if (!db) { sessionEl.textContent = "Relay not configured (config.js)."; return; }
+  if (!sid) { sessionEl.textContent = "Open the link from the car screen to join."; return; }
+  sessionEl.textContent = "Session " + sid.slice(0, 8) + "…";
+
+  // Guest identity (no accounts): random id kept in this browser.
+  let guest = localStorage.getItem("cabineq.guest");
+  if (!guest) {
+    guest = "g_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6);
+    localStorage.setItem("cabineq.guest", guest);
+  }
+  let name = localStorage.getItem("cabineq.name") || "";
+  if (!name) {
+    name = (prompt("Your name for the jam?", "") || "").trim().slice(0, 40);
+    if (name) localStorage.setItem("cabineq.name", name);
+  }
+  whoEl.textContent = name || "guest";
+
+  const base = `${db}/jam/${encodeURIComponent(sid)}`;
+  const api = {
+    get: async (path) => {
+      const r = await fetch(`${base}/${path}.json`, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    },
+    push: async (path, body) => {
+      const r = await fetch(`${base}/${path}.json?print=silent`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    },
+  };
+
+  const op = (o) => api.push("ops", Object.assign({ guest, name, at: Date.now() }, o));
+
+  // ---------------------------------------------------------------- state
+
+  let state = null;
+  let online = false;
+  const setOnline = (ok) => {
+    online = ok;
+    dot.classList.toggle("ok", ok);
+    connEl.textContent = ok ? "live" : "reconnecting…";
+  };
+
+  const esc = (s) => (s == null ? "" : String(s));
+  const meta = (t) => [t.artist, t.album].filter(Boolean).join(" · ");
+  /** Same recording = same ISRC, else title+artist: how the host dedupes, so how we match too. */
+  const trackKey = (t) => (t && (t.isrc || ((t.title || "") + "|" + (t.artist || "")).toLowerCase())) || "";
+
+  // Optimistic UI. The host polls its ops every ~0.7 s and republishes state every ~0.9 s, so a
+  // confirmed round trip can take two seconds. These make the tap feel instant:
+  //   pending  — rows we have asked to add, shown greyed out until the host's state includes them
+  //   hidden   — keys we asked to remove, hidden until the state no longer lists them
+  const pending = new Map();
+  const hidden = new Map();
+  let localSeq = 0;
+
+  function dropConfirmed() {
+    if (pending.size) poke();   // stay at ~280 ms until the host confirms
+    // Count, don't just test membership: adding a song that is already queued is legitimate,
+    // so one copy already present must not count as "confirmed".
+    const queue = (state && Array.isArray(state.queue)) ? state.queue : [];
+    const counts = new Map();
+    for (const t of queue) {
+      const k = trackKey(t);
+      counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    const keys = new Set(queue.map(trackKey));
+    for (const [id, p] of pending) {
+      if ((counts.get(p.key) || 0) <= p.baseCount) continue;
+      pending.delete(id);
+      if (p.btn && p.btn.isConnected) {
+        p.btn.textContent = "Add";
+        p.btn.disabled = false;
+        p.btn.classList.remove("adding");
+        p.btn.classList.add("fresh");
+        setTimeout(() => p.btn && p.btn.classList.remove("fresh"), 1300);
+      }
+    }
+    for (const [key, at] of hidden) {
+      if (!keys.has(key)) hidden.delete(key);
+      else if (Date.now() - at > 12000) hidden.delete(key);   // the remove never landed
+    }
+    // A pending add that never shows up (host closed, relay hiccup) must not hang forever.
+    for (const [id, p] of pending) {
+      if (Date.now() - p.at < 20000) continue;
+      pending.delete(id);
+      if (p.btn && p.btn.isConnected) {
+        p.btn.textContent = "Add";
+        p.btn.disabled = false;
+        p.btn.classList.remove("adding");
+      }
+      hint("Couldn't add “" + p.track.title + "” — try again.");
+    }
+  }
+
+  /** Poll fast for a moment after an action instead of waiting for the 1 s tick. */
+  let burstUntil = 0;
+  const poke = () => { burstUntil = Date.now() + 2600; };
+  let pollBusy = false;
+
+  function render() {
+    const s = state;
+    const nowCard = document.getElementById("nowCard");
+    if (s && (s.nowPlaying || s.playing)) {
+      const t = s.nowPlaying || {};
+      nowCard.hidden = false;
+      document.getElementById("nowTitle").textContent = esc(t.title) || "—";
+      document.getElementById("nowMeta").textContent = meta(t) || (s.playing ? "playing" : "paused");
+      const art = document.getElementById("nowArt");
+      if (t.art) { art.src = t.art; art.style.visibility = "visible"; }
+      else { art.removeAttribute("src"); art.style.visibility = "hidden"; }
+    } else {
+      nowCard.hidden = true;
+    }
+
+    document.getElementById("skip").hidden = !(s && s.canSkip);
+
+    dropConfirmed();
+
+    const all = (s && Array.isArray(s.queue)) ? s.queue : [];
+    // The host publishes the whole queue; "up next" is only what is still ahead of the play head.
+    const base = (s && Number.isInteger(s.currentIndex)) ? s.currentIndex + 1 : 0;
+    const queue = all.slice(base).filter((t) => !hidden.has(trackKey(t)));
+    const ghosts = [...pending.values()];
+    const box = document.getElementById("queue");
+    box.innerHTML = "";
+    if (!queue.length && !ghosts.length) {
+      box.innerHTML = '<div class="muted">Nothing queued yet — search below and add a song.</div>';
+      return;
+    }
+    queue.forEach((t, i) => {
+      const abs = base + i;   // move/remove address the host's queue, so send absolute indices
+      const el = document.createElement("div");
+      el.className = "item";
+      const art = t.art ? `<img class="art" src="${t.art}" alt="">` : `<div class="art"></div>`;
+      el.innerHTML = `${art}
+        <div class="grow">
+          <div class="title">${esc(t.title)}</div>
+          <div class="meta">${esc(meta(t))}</div>
+        </div>
+        <button class="ghost" data-act="up" data-i="${abs}" ${i === 0 ? "disabled" : ""}>↑</button>
+        <button class="ghost" data-act="down" data-i="${abs}" ${i === queue.length - 1 ? "disabled" : ""}>↓</button>
+        <button class="danger" data-act="remove" data-i="${abs}">✕</button>`;
+      box.appendChild(el);
+    });
+    ghosts.forEach((p) => {
+      const t = p.track;
+      const el = document.createElement("div");
+      el.className = "item pending";
+      const art = t.art ? `<img class="art" src="${t.art}" alt="">` : `<div class="art"></div>`;
+      el.innerHTML = `${art}
+        <div class="grow">
+          <div class="title">${esc(t.title)}</div>
+          <div class="meta">adding…</div>
+        </div>`;
+      box.appendChild(el);
+    });
+  }
+
+  document.getElementById("queue").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-act]");
+    if (!b) return;
+    const i = Number(b.dataset.i);
+    const t = (state && state.queue) ? state.queue[i] : null;
+    if (!t) return;
+    if (b.dataset.act === "up" && i > 0) { op({ op: "move", key: t.key, to: i - 1 }).catch(() => {}); poke(); }
+    if (b.dataset.act === "down") { op({ op: "move", key: t.key, to: i + 1 }).catch(() => {}); poke(); }
+    if (b.dataset.act === "remove") {
+      hidden.set(trackKey(t), Date.now());
+      render();                       // the row disappears now; the host confirms shortly
+      op({ op: "remove", key: t.key }).catch(() => hidden.delete(trackKey(t)));
+      poke();
+    }
+  });
+
+  document.getElementById("skip").addEventListener("click", () => op({ op: "skip" }));
+
+  async function pollState() {
+    if (pollBusy) return;
+    pollBusy = true;
+    try {
+      state = await api.get("state");
+      setOnline(true);
+      render();
+    } catch (e) {
+      setOnline(false);
+    } finally {
+      pollBusy = false;
+    }
+  }
+
+  // ---------------------------------------------------------------- search
+
+  const qEl = document.getElementById("q");
+  const hintEl = document.getElementById("searchHint");
+
+  /** One place for the hint line: search status, add failures, everything. */
+  function hint(text, ms) {
+    hintEl.hidden = false;
+    hintEl.textContent = text;
+    clearTimeout(hint._t);
+    if (ms !== 0) hint._t = setTimeout(() => { hintEl.hidden = true; }, ms || 2500);
+  }
+  const resultsEl = document.getElementById("results");
+  let searchTimer = 0, reqId = 0, resultsTimer = 0;
+
+  function clearResults() {
+    resultsEl.innerHTML = "";
+    hintEl.hidden = true;
+    clearInterval(resultsTimer);
+  }
+
+  async function doSearch(q) {
+    const query = q.trim();
+    if (query.length < 2) { clearResults(); return; }
+    reqId = Date.now();
+    const mine = reqId;
+    hint("Searching…", 0);
+    resultsEl.innerHTML = "";
+    try {
+      await op({ op: "search", q: query, reqId: mine });
+    } catch (e) {
+      hint("Search failed: " + e.message);
+      return;
+    }
+    clearInterval(resultsTimer);
+    const started = Date.now();
+    resultsTimer = setInterval(async () => {
+      if (Date.now() - started > 15000) {
+        clearInterval(resultsTimer);
+        hint("No answer from the car (is the app open?).", 0);
+        return;
+      }
+      let r = null;
+      try { r = await api.get(`results/${mine}`); } catch (_) { return; }
+      if (!r || !Array.isArray(r.items)) return;
+      clearInterval(resultsTimer);
+      clearTimeout(hint._t);
+      hintEl.hidden = true;
+      renderResults(r.items, query);
+    }, 600);
+  }
+
+  function renderResults(items, query) {
+    resultsEl.innerHTML = "";
+    if (!items.length) { hint("No results."); return; }
+    items.slice(0, 20).forEach((t) => {
+      const el = document.createElement("div");
+      el.className = "item";
+      const art = t.art ? `<img class="art" src="${t.art}" alt="">` : `<div class="art"></div>`;
+      el.innerHTML = `${art}
+        <div class="grow">
+          <div class="title">${esc(t.title)}</div>
+          <div class="meta">${esc(meta(t))}</div>
+        </div>
+        <button class="primary" data-add="1">Add</button>`;
+      const addBtn = el.querySelector("[data-add]");
+      addBtn.addEventListener("click", async () => {
+        // Never leave the tap unanswered: show the row in "Up next" and mark the button at once.
+        const key = trackKey(t);
+        const baseCount = ((state && state.queue) || []).filter((x) => trackKey(x) === key).length;
+        const entry = { id: ++localSeq, key, baseCount, track: t, at: Date.now(), btn: addBtn };
+        pending.set(entry.id, entry);
+        addBtn.disabled = true;
+        addBtn.textContent = "Adding…";
+        addBtn.classList.add("adding");
+        render();
+        try {
+          await op({ op: "add", track: t });
+          poke();
+        } catch (e) {
+          pending.delete(entry.id);
+          addBtn.disabled = false;
+          addBtn.textContent = "Add";
+          addBtn.classList.remove("adding");
+          hint("Couldn't add — " + e.message);
+          render();
+        }
+      });
+      resultsEl.appendChild(el);
+    });
+  }
+
+  qEl.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    const q = qEl.value;
+    searchTimer = setTimeout(() => doSearch(q), 400);
+  });
+
+  // ---------------------------------------------------------------- loop
+
+  pollState();
+  setInterval(pollState, 1000);                                  // steady heartbeat
+  setInterval(() => { if (Date.now() < burstUntil) pollState(); }, 280);   // right after a tap
+  setInterval(() => { if (!state) pollState(); }, 3000);
+})();
+</script>
+</body>
+</html>

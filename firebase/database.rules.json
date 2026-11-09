@@ -1,0 +1,38 @@
+{
+  "rules": {
+    "jam": {
+      "$sid": {
+        "info": {
+          ".read": true,
+          ".write": "!data.exists() || !newData.exists()",
+          ".validate": "!newData.exists() || newData.hasChildren(['createdAt'])"
+        },
+        "state": {
+          ".read": true,
+          ".write": true,
+          ".validate": "newData.hasChildren(['playing', 'updatedAt'])"
+        },
+        "ops": {
+          ".read": true,
+          "$op": {
+            ".write": "!data.exists() || !newData.exists()",
+            ".validate": "!newData.exists() || (newData.hasChildren(['op', 'guest', 'at']) && newData.child('op').isString() && newData.child('op').val().matches(/^(add|move|remove|vote|skip|search)$/) && newData.child('guest').isString() && newData.child('guest').val().length <= 64 && newData.child('at').isNumber())"
+          }
+        },
+        "results": {
+          ".read": true,
+          "$req": {
+            ".write": true
+          }
+        },
+        "guests": {
+          ".read": true,
+          "$g": {
+            ".write": true,
+            ".validate": "newData.hasChildren(['at'])"
+          }
+        }
+      }
+    }
+  }
+}
