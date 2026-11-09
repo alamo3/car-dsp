@@ -428,19 +428,25 @@ class MusicActivity : Activity() {
         if (addonReady) {
             val sections = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             page.addView(sections)
+            // One container each: the two background loads finish in either order, and the
+            // shelves must not swap places between renders.
+            val recommendedBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val albumsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            sections.addView(recommendedBox)
+            sections.addView(albumsBox)
             val id = op
             // Song-level picks from the engine: mixed artists, ranked by what this phone has
             // learned (see Taste/Radio), refreshed whenever home is rendered.
             background(id, { Radio.recommend(this, 12) }) { picks ->
                 if (id != op || picks.isEmpty()) return@background
-                sections.addView(sectionTitle("Recommended for you"))
-                sections.addView(trackCarousel(picks) { i -> play(picks, i, "Recommended") })
+                recommendedBox.addView(sectionTitle("Recommended for you"))
+                recommendedBox.addView(trackCarousel(picks) { i -> play(picks, i, "Recommended") })
             }
             background(id, { MediaBrowse.forYouContent(this) }) { fy ->
                 if (fy == null || id != op) return@background
                 if (fy.albums.isNotEmpty()) {
-                    sections.addView(sectionTitle("Albums"))
-                    sections.addView(albumCarousel(fy.albums) { al ->
+                    albumsBox.addView(sectionTitle("Albums"))
+                    albumsBox.addView(albumCarousel(fy.albums) { al ->
                         addon()?.let { a -> navigate { renderAlbum(a, al) } }
                     })
                 }
@@ -947,7 +953,9 @@ class MusicActivity : Activity() {
     private fun play(tracks: List<Track>, index: Int, title: String, radio: Track? = null) {
         EngineState.playerMessage = null
         // Keeps playback alive in the background and feeds the live EQ + speed compensation.
-        startForegroundService(Intent(this, EqService::class.java).setAction(EqService.ACTION_PLAYER_ATTACH))
+        runCatching {
+            startForegroundService(Intent(this, EqService::class.java).setAction(EqService.ACTION_PLAYER_ATTACH))
+        }.onFailure { showMessage("Couldn't start playback service: ${it.javaClass.simpleName}", isError = true) }
         playExecutor.execute { player.play(tracks, index, title, radio = radio) }
         shownVersion = -1
         refreshSoon()
@@ -977,7 +985,7 @@ class MusicActivity : Activity() {
         stack.addLast { renderSearchLoading(query) }
         searchPageOnTop = true
         renderSearchLoading(query)
-        background(id, { a.search(query) }) { r ->
+        background(id, { a.search(query, deep = !fromTyping) }) { r ->
             val render = { renderSearch(a, query, r) }
             stack.removeLast()
             stack.addLast(render)

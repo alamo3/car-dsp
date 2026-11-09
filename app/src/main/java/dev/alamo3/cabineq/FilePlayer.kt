@@ -196,7 +196,10 @@ class FilePlayer private constructor(private val context: Context) {
         // Playing something else while a track was underway is a skip (but a resume from IDLE is
         // not: state IDLE/ERROR never reaches this branch).
         val wasPlaying = currentTrack
-        if (wasPlaying != null && (state == State.PLAYING || state == State.PAUSED || state == State.LOADING)) {
+        val restarting = wasPlaying?.mediaId == tracks[startIndex.coerceIn(0, tracks.lastIndex)].mediaId
+        if (wasPlaying != null && !restarting &&
+            (state == State.PLAYING || state == State.PAUSED || state == State.LOADING)
+        ) {
             Log.i(TAG, "play() replaces ${wasPlaying.title} at ${positionMs}ms (state=$state) — counted as a skip")
             Taste.onSkip(context, wasPlaying, positionMs, durationMs)
         }
@@ -412,7 +415,10 @@ class FilePlayer private constructor(private val context: Context) {
             val currentArtist = queued.getOrNull(currentIndex)?.track?.artist
             val next = runCatching { Radio.next(context, seed, exclude, session, currentArtist) }.getOrNull()
             radioBusy = false
-            if (next == null || gen != generation || radioSeed !== seed) return@execute
+            if (next == null || gen != generation || radioSeed !== seed) {
+                followNewTrack = false
+                return@execute
+            }
             Log.i(TAG, "Radio: queuing \"${next.title}\" — ${next.artist}")
             enqueue(listOf(next))
             if (followNewTrack) {

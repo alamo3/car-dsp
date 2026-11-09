@@ -26,6 +26,7 @@ object MediaCache {
     private const val TAG = "CabinEQ/Cache"
     private const val DIR = "media"
     private const val PREFETCH_WAIT_MS = 90_000L
+    private const val MIN_FREE_BYTES = 256L * 1024 * 1024
 
     private val io = Executors.newSingleThreadExecutor { r ->
         Thread(r, "CabinEQ-Cache").apply { isDaemon = true }
@@ -40,7 +41,10 @@ object MediaCache {
     /** The cached audio for this track, or null when it hasn't been prefetched. */
     fun fileFor(context: Context, track: Track): File? {
         val f = File(dir(context), name(track))
-        return if (f.exists() && f.length() > 0L) f else null
+        if (!f.exists() || f.length() <= 0L) return null
+        // Opening a cached track counts as a use for the LRU (lastModified is the eviction key).
+        f.setLastModified(System.currentTimeMillis())
+        return f
     }
 
     fun usedBytes(context: Context): Long =
@@ -48,7 +52,6 @@ object MediaCache {
 
     fun clear(context: Context) {
         dir(context).listFiles()?.forEach { it.delete() }
-        trimmedFor = 0L
     }
 
     /**
@@ -64,6 +67,10 @@ object MediaCache {
             return
         }
         if (fileFor(app, track) != null) return
+        if (app.cacheDir.usableSpace < MIN_FREE_BYTES) {
+            Log.i(TAG, "skip ${track.title}: only ${app.cacheDir.usableSpace / 1024 / 1024} MB free")
+            return
+        }
         val key = track.mediaId
         synchronized(inFlight) { if (!inFlight.add(key)) return }
         io.execute {
@@ -146,8 +153,6 @@ object MediaCache {
             conn?.disconnect()
         }
     }
-
-    private var trimmedFor = 0L
 
     /** Oldest-first eviction down to [max] bytes (stale .part files are dropped outright). */
     private fun trim(context: Context, max: Long) {

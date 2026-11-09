@@ -53,8 +53,11 @@ class ArtworkProvider : ContentProvider() {
             val file = dev.alamo3.cabineq.jam.QrCodes.fileFor(ctx, text, size) ?: return null
             return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
         }
-        val url = uri.getQueryParameter("u")?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
-        val query = uri.getQueryParameter("q")
+        // This provider is exported: only plain HTTPS images, and a bounded search query, so it
+        // cannot be used to probe local services or spam the iTunes lookup.
+        val url = uri.getQueryParameter("u")
+            ?.takeIf { it.startsWith("https://") && it.length <= 2048 }
+        val query = uri.getQueryParameter("q")?.take(120)
         if (url == null && query.isNullOrBlank()) return null
         val size = uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(64, 1200) ?: 512
         // Cached cover: serve it. Otherwise hand over a placeholder now and fetch in the
@@ -72,8 +75,11 @@ class ArtworkProvider : ContentProvider() {
         // The cache has no extensions: report what the bytes actually are. Not cached yet means
         // openFile() will hand out the placeholder, which is a PNG.
         val ctx = context ?: return "image/png"
-        val url = uri.getQueryParameter("u")?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
-        val query = uri.getQueryParameter("q")
+        // This provider is exported: only plain HTTPS images, and a bounded search query, so it
+        // cannot be used to probe local services or spam the iTunes lookup.
+        val url = uri.getQueryParameter("u")
+            ?.takeIf { it.startsWith("https://") && it.length <= 2048 }
+        val query = uri.getQueryParameter("q")?.take(120)
         val size = uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(64, 1200) ?: 512
         return Artwork.cachedMimeType(ctx, url, query, size) ?: "image/png"
     }

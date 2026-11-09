@@ -44,7 +44,11 @@ object MediaBrowse {
     private const val RECENT_ITEM = "q:"
 
     private const val ART_PX = 512
+    private class Memo(val at: Long, val items: List<MediaBrowser.MediaItem>)
+    private val memo = HashMap<String, Memo>()
     private const val FOR_YOU_TTL_MS = 60_000L
+    /** The car re-binds tabs often; re-fetching the TorBox/addon lists each time is slow. */
+    private const val MEMO_TTL_MS = 45_000L
     private const val MAX_ROWS = 100
 
     /** 2 == MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM. */
@@ -65,14 +69,28 @@ object MediaBrowse {
 
     fun children(context: Context, parentId: String): List<MediaBrowser.MediaItem> = when {
         parentId == ROOT -> rootChildren(context)
-        parentId == LIBRARY -> torrents(context)
+        parentId == LIBRARY -> memoized(parentId) { torrents(context) }
         parentId == RECENT -> recent(context)
         parentId == FOR_YOU -> forYou(context)
         parentId == SEARCH_NODE -> savedSearches(context)
-        parentId.startsWith(TORRENT) -> torrentTracks(context, parentId)
-        parentId.startsWith(ALBUM) -> albumTracks(context, parentId)
-        parentId.startsWith(PLAYLIST) -> playlistTracks(context, parentId)
+        parentId.startsWith(TORRENT) -> memoized(parentId) { torrentTracks(context, parentId) }
+        parentId.startsWith(ALBUM) -> memoized(parentId) { albumTracks(context, parentId) }
+        parentId.startsWith(PLAYLIST) -> memoized(parentId) { playlistTracks(context, parentId) }
         else -> emptyList()
+    }
+
+    /** Only the network-backed lists are memoised: they change rarely and cost 1–2 requests. */
+    private fun memoized(
+        parentId: String,
+        compute: () -> List<MediaBrowser.MediaItem>,
+    ): List<MediaBrowser.MediaItem> {
+        val now = SystemClock.elapsedRealtime()
+        synchronized(memo) {
+            memo[parentId]?.let { if (now - it.at < MEMO_TTL_MS) return it.items }
+        }
+        val items = compute()
+        synchronized(memo) { memo[parentId] = Memo(now, items) }
+        return items
     }
 
     /**

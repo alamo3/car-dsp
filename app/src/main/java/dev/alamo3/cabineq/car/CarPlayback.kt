@@ -47,7 +47,8 @@ object CarPlayback {
         Log.i(
             TAG,
             "playTracks: ${tracks.size} tracks, index=$start, title=$title, first=${tracks[start].title}" +
-                " (source=${tracks[start].source} id=${tracks[start].sourceId} url=${tracks[start].streamUrl})"
+                " (source=${tracks[start].source} id=${tracks[start].sourceId}" +
+                " hasUrl=${tracks[start].streamUrl != null})"
         )
         executor.execute {
             // Bring the session up first: the host renders the playback template from it, and a

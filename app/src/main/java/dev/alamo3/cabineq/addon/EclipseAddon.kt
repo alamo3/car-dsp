@@ -139,13 +139,15 @@ class EclipseAddon(link: String) {
     /**
      * [limit] caps each result list (the protocol applies it per type; Nebula caps at 20).
      */
-    fun search(query: String, limit: Int = DEFAULT_LIMIT): SearchResults {
+    fun search(query: String, limit: Int = DEFAULT_LIMIT, deep: Boolean = true): SearchResults {
         val q = query.trim()
         val primary = searchOnce(q, limit)
         if (q.isBlank()) return primary
         // The addon matches the whole string, so "title by artist" only works if the artist is
         // spelled out exactly. When part of the query matched nothing, retry with the tail of
         // the query as an artist and keep the songs whose title still matches the rest.
+        // Recall costs two extra requests; as-you-type searches skip it.
+        if (!deep) return primary
         val tokens = q.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
         if (tokens.size < 4) return primary
         val unmatched = tokens.filter { tok ->
