@@ -233,6 +233,34 @@ like's 6, so an imported playlist nudges the profile without overruling what you
 to. Re-importing the same playlist does not double it, and **Forget imported playlists** removes
 every import in one tap while keeping your real history.
 
+### Cabin response measurement (slice 1)
+
+Equalizer & DSP → **Measure cabin response** plays a 10 s exponential sweep (20 Hz–20 kHz,
+−20 dBFS) through the current output route and records it with the phone's microphone, then
+shows the transfer function as a curve.
+
+- Playback is a plain 48 kHz `AudioTrack` on `USAGE_MEDIA`, so it takes exactly the route music
+  takes — the car's head unit, its EQ and its speakers are part of the measurement.
+- Recording uses `AudioRecord` at 48 kHz mono, preferring `UNPROCESSED`, and **disables AGC and
+  noise suppression** on the session so the phone does not fight the measurement.
+- Analysis is magnitude-only (an EQ needs no phase, so there is no deconvolution and no
+  alignment): `|H| = |Y|/|X|` over a 2^n FFT, then 1/6-octave power averaging, normalised to the
+  median of the trusted band. The SNR of the recording is reported next to the curve.
+
+**What the curve means:** everything between us and the microphone multiplies into it — cabin
+modes, speakers, the head unit's DSP, and the microphone itself. It is therefore a *relative*
+curve, and only **100 Hz – 8 kHz** is trusted (those mics are roughly flat there); the view dims
+the rest. Peaks and dips inside the trusted band are listed under the curve.
+
+Validated offline against a synthetic "car" (two cabin modes, a 3 kHz dip, a high shelf): the
+measurement recovers it to **0.11 dB** from 100 Hz–1 kHz and 0.03 dB above, using the same
+formulas as `CabinMeasure`.
+
+Volume dependence is the next problem, and it has a hard limit: **over Android Auto the car's
+volume is not readable by an app**. The plan is to measure at quiet/normal/loud, keep one curve
+per level, and let the listener pick — because we cannot pick for them. Correction (a limited
+inverse as an extra biquad layer) comes after the curve can be trusted per level.
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are

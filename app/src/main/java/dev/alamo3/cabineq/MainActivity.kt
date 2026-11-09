@@ -35,6 +35,14 @@ class MainActivity : Activity() {
 
     private lateinit var settings: Settings
     private lateinit var statusText: TextView
+    private lateinit var cabinView: dev.alamo3.cabineq.cabin.ResponseView
+    private lateinit var cabinSummary: TextView
+    private lateinit var cabinButton: Button
+    private var cabinMeasuring = false
+    private val cabinExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "CabinEQ-Measure").apply { isDaemon = true }
+    }
+
     private lateinit var outputPathText: TextView
     private var outputReport = ""
     private lateinit var startStopButton: Button
@@ -264,6 +272,34 @@ class MainActivity : Activity() {
             setPadding(0, dp(4), 0, dp(12))
         })
 
+        // --- Cabin measurement ---
+        root.addView(header("Cabin response"))
+        root.addView(TextView(this).apply {
+            text = "Plays a 10 s sweep and records it with the phone's microphone, so you can see " +
+                "how the car colours the sound. Mic, cabin, speakers and the head unit all add up " +
+                "in here, so the curve is relative, and only 100 Hz – 8 kHz is trustworthy. " +
+                "Engine and air conditioning off, windows up, phone where you normally sit."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(8))
+        })
+        cabinView = dev.alamo3.cabineq.cabin.ResponseView(this)
+        root.addView(cabinView, LinearLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        cabinSummary = TextView(this).apply {
+            textSize = 12f
+            setPadding(0, dp(6), 0, dp(6))
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        root.addView(cabinSummary)
+        cabinButton = Button(this).apply {
+            setOnClickListener { startCabinMeasure() }
+        }
+        root.addView(cabinButton)
+        refreshCabinButton()
+
         // --- Speed compensation ---
         root.addView(header("Speed compensation"))
         root.addView(switch("Enabled", settings.speedCompEnabled) { settings.speedCompEnabled = it })
@@ -454,6 +490,59 @@ class MainActivity : Activity() {
         }
         outputReport = AudioPath.plain(facts)
         if (outputPathText.text?.toString() != text) outputPathText.text = text
+    }
+
+    /**
+     * Slice 1 of the cabin measurement: run it, draw it, say how good the recording was. No
+     * correction is applied yet — that comes once the curve can be trusted.
+     */
+    private fun startCabinMeasure() {
+        if (cabinMeasuring) return
+        if (!hasPerm(Manifest.permission.RECORD_AUDIO)) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQ_RECORD_AUDIO)
+            return
+        }
+        cabinMeasuring = true
+        refreshCabinButton()
+        cabinSummary.text = "Starting…"
+        // Don't measure over music, and don't leave the player paused afterwards by accident.
+        val player = FilePlayer.peek()
+        val wasPlaying = player?.state == FilePlayer.State.PLAYING
+        player?.pause()
+        cabinExecutor.execute {
+            val result = runCatching {
+                dev.alamo3.cabineq.cabin.CabinMeasure.measure(
+                    this,
+                    onProgress = { stage, frac ->
+                        runOnUiThread {
+                            cabinSummary.text = "%s %d%%".format(java.util.Locale.US, stage, (frac * 100).toInt())
+                        }
+                    },
+                )
+            }.getOrNull()
+            runOnUiThread {
+                cabinMeasuring = false
+                refreshCabinButton()
+                if (result == null) {
+                    cabinSummary.text = "Measurement failed — check microphone permission and that nothing else is recording."
+                    return@runOnUiThread
+                }
+                cabinView.set(result.points)
+                val worst = result.extremes(3)
+                cabinSummary.text = buildString {
+                    append("SNR %.0f dB · %d bands\n".format(java.util.Locale.US, result.snrDb, result.points.size))
+                    for (p in worst) append("  %5.0f Hz  %+.1f dB\n".format(java.util.Locale.US, p.hz, p.db))
+                    if (result.snrDb < 20) append("Low SNR: turn the volume up and measure again.")
+                }
+                if (wasPlaying) player?.resume()
+            }
+        }
+    }
+
+    private fun refreshCabinButton() {
+        if (!::cabinButton.isInitialized) return
+        cabinButton.isEnabled = !cabinMeasuring
+        cabinButton.text = if (cabinMeasuring) "Measuring…" else "Measure cabin response"
     }
 
     private fun refreshStatus() {
