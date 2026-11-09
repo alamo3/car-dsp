@@ -85,6 +85,16 @@ class MusicActivity : Activity() {
     private lateinit var fullNote: TextView
     private var seeking = false
 
+    // Lyrics page (the car has its own screen; both share Lyrics.kt and its disk cache).
+    private var lyricsOpen = false
+    private var lyricsBlock: LinearLayout? = null
+    private var lyricViews = ArrayList<TextView>()
+    private var lyricSheet: Lyrics.Sheet? = null
+    private var lyricIndex = -1
+    private var lyricScrolled = Int.MIN_VALUE
+    private var lyricTouchedAt = 0L
+    private var lyricToken = 0
+
     @Volatile private var op = 0
     private var shownVersion = -1
     private var askedForNotifications = false
@@ -238,6 +248,7 @@ class MusicActivity : Activity() {
             setPadding(dp(16), dp(4), dp(16), dp(24))
         }
         scroll = ScrollView(this).apply {
+            setOnTouchListener { _, _ -> lyricTouchedAt = System.currentTimeMillis(); false }
             isFillViewport = true
             addView(page)
         }
@@ -393,6 +404,12 @@ class MusicActivity : Activity() {
             fullRepeat.text = repeatLabel()
         }
         repeatRow.addView(fullRepeat)
+        repeatRow.addView(Ui.pill(this, "Lyrics", filled = false) {
+            // Lyrics is a page of its own: the full player is an overlay on top of the stack.
+            showFull(false)
+            navigate { renderLyrics() }
+        },
+            wrapLp().apply { leftMargin = dp(10) })
         col.addView(repeatRow)
 
         fullInfo = Ui.text(this, "", 12f, Ui.TEXT_2, lines = 4).apply { gravity = Gravity.CENTER }
@@ -424,7 +441,12 @@ class MusicActivity : Activity() {
         @Suppress("DEPRECATION") onBackPressed()
     }
 
-    private fun clearPage() = page.removeAllViews()
+    private fun clearPage() {
+        page.removeAllViews()
+        lyricsOpen = false
+        lyricsBlock = null
+        lyricViews = ArrayList()
+    }
 
     // ---------------------------------------------------------------------------------
     // Pages
@@ -887,6 +909,7 @@ class MusicActivity : Activity() {
             fullNote.setTextColor(if (p.note != null) Ui.TEXT_2 else Ui.ERROR)
             fullNote.visibility = if (note == null) View.GONE else View.VISIBLE
         }
+        if (lyricsOpen) updateLyricsHighlight()
     }
 
     private fun showFull(show: Boolean) {
@@ -894,6 +917,102 @@ class MusicActivity : Activity() {
         full.visibility = if (show) View.VISIBLE else View.GONE
         shownVersion = -1
         refreshPlayer()
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Lyrics
+
+    /**
+     * Lyrics for what is playing, following the song line by line. Fetched in the background:
+     * a cache hit paints immediately-on-arrival, a miss shows "looking…" for about a second.
+     * Plain (untimed) lyrics are shown without highlight — better than nothing, never a lie.
+     */
+    private fun renderLyrics() {
+        clearPage()
+        lyricsOpen = true
+        page.addView(backRow())
+        page.addView(Ui.text(this, "Lyrics", 24f, bold = true).apply { setPadding(0, dp(4), 0, dp(4)) })
+        val p = player
+        val t = p.currentTrack
+        if (t == null) {
+            page.addView(Ui.text(this, "Nothing playing.", 15f, Ui.TEXT_2).apply { setPadding(0, dp(12), 0, 0) })
+            return
+        }
+        val label = listOfNotNull(t.title, t.artist ?: p.currentInfo?.artist).joinToString(" — ")
+        page.addView(Ui.text(this, label, 15f, Ui.TEXT_2, lines = 2).apply { setPadding(0, 0, 0, dp(16)) })
+
+        val holder = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        holder.addView(Ui.text(this, "Looking for lyrics…", 15f, Ui.TEXT_2))
+        page.addView(holder)
+        lyricsBlock = holder
+        lyricViews = ArrayList()
+        lyricSheet = null
+        lyricIndex = -1
+        lyricScrolled = Int.MIN_VALUE
+
+        val token = ++lyricToken
+        lyricsExecutor.execute {
+            val sheet = Lyrics.forPlayer(this, p)
+            runOnUiThread {
+                // The song or the page may have changed while the lookup ran.
+                if (token != lyricToken || !lyricsOpen || lyricsBlock !== holder) return@runOnUiThread
+                showLyrics(holder, sheet)
+            }
+        }
+    }
+
+    private fun showLyrics(holder: LinearLayout, sheet: Lyrics.Sheet?) {
+        holder.removeAllViews()
+        lyricViews = ArrayList()
+        lyricSheet = sheet
+        lyricIndex = -1
+        lyricScrolled = Int.MIN_VALUE
+        if (sheet == null) {
+            holder.addView(Ui.text(this, "Couldn't reach the lyrics service.", 15f, Ui.TEXT_2))
+            return
+        }
+        if (sheet.empty) {
+            holder.addView(Ui.text(this, "No lyrics found for this song.", 15f, Ui.TEXT_2))
+            return
+        }
+        if (!sheet.synced) {
+            holder.addView(Ui.text(this, "Plain lyrics — no timings for this one", 12f, Ui.TEXT_2)
+                .apply { setPadding(0, 0, 0, dp(10)) })
+        }
+        for (line in sheet.lines) {
+            if (line.text.isBlank()) continue
+            val v = Ui.text(this, line.text, 16f, if (sheet.synced) Ui.TEXT_2 else Ui.TEXT, lines = 4)
+            v.setPadding(0, dp(7), 0, dp(7))
+            holder.addView(v)
+            lyricViews.add(v)
+        }
+        updateLyricsHighlight(force = true)
+    }
+
+    /** Moves the highlight (and the scroll) to the line being sung; cheap enough for 2 Hz. */
+    private fun updateLyricsHighlight(force: Boolean = false) {
+        val sheet = lyricSheet ?: return
+        if (!sheet.synced || lyricViews.isEmpty()) return
+        val idx = sheet.indexAt(player.positionMs)
+        if (idx != lyricIndex || force) {
+            lyricIndex = idx
+            lyricViews.forEachIndexed { i, v ->
+                val current = i == idx
+                v.setTextColor(if (current) Ui.TEXT else Ui.TEXT_2)
+                v.typeface = if (current) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            }
+        }
+        if (idx < 0) return
+        // Someone reading further ahead keeps their place for a few seconds.
+        if (System.currentTimeMillis() - lyricTouchedAt < 6_000) return
+        val target = lyricViews.getOrNull(idx) ?: return
+        val block = lyricsBlock ?: return
+        // top > 0 means the list has been laid out; before that this would scroll to nowhere.
+        if (target.top > 0 && idx != lyricScrolled) {
+            lyricScrolled = idx
+            // Keep the current line a third of the way down so the next ones are visible.
+            scroll.smoothScrollTo(0, (block.top + target.top - scroll.height / 3).coerceAtLeast(0))
+        }
     }
 
     // ---------------------------------------------------------------------------------
@@ -992,6 +1111,10 @@ class MusicActivity : Activity() {
         playExecutor.execute { player.play(tracks, index, title, radio = radio) }
         shownVersion = -1
         refreshSoon()
+    }
+
+    private val lyricsExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "CabinEQ-Lyrics").apply { isDaemon = true }
     }
 
     private val playExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->

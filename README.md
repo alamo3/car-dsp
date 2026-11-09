@@ -3,6 +3,23 @@
 An Android EQ built for the car: a static EQ, speed-dependent compensation, and
 (later) cabin measurement and content-aware dynamic EQ. Rootless.
 
+### Lyrics
+
+The phone's full player has a **Lyrics** button, and the car's now-playing screen a **Lyrics**
+action: both show the song's lyrics with the current line highlighted and followed as it plays.
+
+Lyrics come from [LRCLIB](https://lrclib.net) (free, no key, line-level timecodes), because the
+addon has no lyrics resource. Lookups are cached in `filesDir/lyrics` — a hit for a month, a
+miss for a week — so repeats and instrumentals never hit the network twice. When only untimed
+lyrics exist they are shown without highlighting; when the song has none at all the screen says
+so, and a failed lookup says that instead (it is not cached).
+
+In the car this is a plain `ListTemplate` (Android Auto has no lyrics surface): a fixed 8-row
+window of timed lines, the current one marked and tappable to seek there, refreshed about once
+a second — the fastest a host reliably accepts. Templates want short text by design, so the
+phone view remains the full one.
+
+
 ## Status: milestone 3a — native DSP
 
 - 10-band EQ (31 Hz–16 kHz) + preamp, applied with `DynamicsProcessing`

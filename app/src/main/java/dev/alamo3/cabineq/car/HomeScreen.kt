@@ -156,6 +156,9 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
                     .setStartHeaderAction(Action.APP_ICON)
                     .setEndHeaderActions(
                         listOf(
+                            // Action.MEDIA_PLAYBACK below is the host's minimised panel; it is
+                            // enough once playback is live (bottom right), so the header keeps
+                            // a single action and the search field its full width.
                             Action.Builder()
                                 .setTitle(if (JamHost.running) "Jam ●" else "Jam")
                                 .setOnClickListener { screenManager.push(JamScreen(carContext)) }
@@ -521,6 +524,12 @@ class NowPlayingScreen(carContext: CarContext) : Screen(carContext) {
             .setHeader(
                 Header.Builder()
                     .setStartHeaderAction(Action.BACK)
+                    .addEndHeaderAction(
+                        Action.Builder()
+                            .setTitle("Lyrics")
+                            .setOnClickListener { screenManager.push(LyricsScreen(carContext)) }
+                            .build()
+                    )
                     .addEndHeaderAction(
                         Action.Builder()
                             .setTitle("Queue")
