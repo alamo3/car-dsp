@@ -152,6 +152,8 @@ class CaptureEngine(private val context: Context, private val projection: MediaP
         val rec = record ?: return
         val out = track ?: return
         val buf = FloatArray(BLOCK_FRAMES * 2)
+        // Capture and playback rates are equal here, so the engine only copies through.
+        val processed = FloatArray(BLOCK_FRAMES * 2)
         var silentFrames = 0
         val pauseAfterFrames = sampleRate * SILENCE_PAUSE_MS / 1000
         try {
@@ -185,8 +187,8 @@ class CaptureEngine(private val context: Context, private val projection: MediaP
                 }
                 if (outputPaused) continue
 
-                NativeDsp.process(handle, buf, frames)
-                out.write(buf, 0, n, AudioTrack.WRITE_BLOCKING)
+                val written = NativeDsp.process(handle, buf, frames, processed, BLOCK_FRAMES)
+                if (written > 0) out.write(processed, 0, written * 2, AudioTrack.WRITE_BLOCKING)
             }
         } catch (e: Exception) {
             Log.e(TAG, "DSP loop failed", e)

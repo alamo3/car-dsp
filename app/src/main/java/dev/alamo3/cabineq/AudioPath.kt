@@ -112,10 +112,15 @@ object AudioPath {
             add(Row("Device", "${f.deviceRate / 1000.0} kHz$buf"))
         }
         if (f.hasStream && rate > 0 && f.deviceRate != null) {
-            if (rate == f.deviceRate) {
-                add(Row("Resample", "none — same rate"))
-            } else {
-                add(Row("Resampling", "${rate / 1000.0} → ${f.deviceRate / 1000.0} kHz, by the system mixer", warn = true))
+            when {
+                // We resampled to the device rate: the mixer's own resampler is out of the path.
+                f.sourceRate > 0 && f.sourceRate != rate && rate == f.deviceRate ->
+                    add(Row("Resample", "${f.sourceRate / 1000.0} → ${rate / 1000.0} kHz, by CabinEQ"))
+
+                rate != f.deviceRate ->
+                    add(Row("Resample", "${rate / 1000.0} → ${f.deviceRate / 1000.0} kHz, by the system mixer", warn = true))
+
+                else -> add(Row("Resample", "none — source rate already matches"))
             }
         }
 

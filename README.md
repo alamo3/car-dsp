@@ -116,6 +116,32 @@ when asking "is something in the way". Two things are deliberately *not* claimed
 
 **Copy report** puts the same text on the clipboard.
 
+### Sample-rate matching
+
+By default CabinEQ emits at the rate Android mixes at (48 kHz on the speaker, whatever the
+route reports), resampling in its own DSP when the source differs — so the Android mixer has
+nothing to convert. The alternative — handing it 44.1 kHz and letting the platform convert —
+is one line in **Equalizer & DSP → Output path → Match device rate**, and the panel says which
+side did the resampling.
+
+The resampler is `app/src/main/cpp/resampler.h`: exact-rational polyphase (phase count is
+outRate/gcd, so there are no interpolated phases and no drifting accumulator), Kaiser-windowed
+sinc, 128 taps, cutoff placed so the stop-band starts exactly at the lower Nyquist. Measured
+offline (`tools/resampler-test.cpp`):
+
+| test | result |
+|---|---|
+| 44.1 → 48 kHz, 100 Hz–19 kHz | 118–132 dB SNR |
+| block sizes 1 / 37 / 512 / 1024 / 4096 | identical results (no boundary artifacts) |
+| 48 → 44.1 kHz, 0–20 kHz | flat, −9.0 dBFS in → −9.0 dBFS out |
+| 48 → 44.1 kHz, ≥ 22.05 kHz | −60 dB or lower, −230 dB at 24 kHz |
+| DC | gain error −0.01 dB |
+
+It costs about 10 % of one core for the whole player thread (FLAC decode + EQ + limiter +
+resampling); the resampler is the smaller part. The tail is flushed at the end of a track so
+the last milliseconds are not cut, and a route change (headphones, USB DAC, Bluetooth) rebuilds
+the output at the new rate instead of silently resampling twice.
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are

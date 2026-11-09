@@ -2,6 +2,7 @@ package dev.alamo3.cabineq
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioFormat
@@ -151,6 +152,44 @@ class FilePlayer private constructor(private val context: Context) {
     val isActive: Boolean get() = state == State.LOADING || state == State.PLAYING || state == State.PAUSED
 
     private val audioManager = context.getSystemService(AudioManager::class.java)
+
+    // ------------------------------------------------------- output sample rate (device side)
+
+    /** The rate Android mixes this route at; 0 until first read. */
+    @Volatile private var deviceRate = 0
+
+    /** Bumped whenever the output rate may have changed, so the worker rebuilds its sink. */
+    @Volatile var routeEpoch = 0
+        private set
+
+    private val deviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = refreshDeviceRate()
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) = refreshDeviceRate()
+    }
+
+    private fun refreshDeviceRate() {
+        val r = runCatching {
+            audioManager?.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull()
+        }.getOrNull() ?: return
+        if (r > 0 && r != deviceRate) {
+            deviceRate = r
+            routeEpoch++
+            Log.i(TAG, "device mixes at $r Hz")
+        }
+    }
+
+    /** Rate we emit at: the device's, so the mixer has nothing to resample. */
+    private fun targetRate(sourceRate: Int): Int {
+        if (!settings.matchDeviceRate || sourceRate <= 0) return sourceRate
+        if (deviceRate == 0) refreshDeviceRate()
+        return if (deviceRate > 0) deviceRate else sourceRate
+    }
+
+    /** Called when the user flips "Match device rate": the worker rebuilds at the new rate. */
+    fun onRateSettingChanged() {
+        refreshDeviceRate()
+        routeEpoch++
+    }
     private var thread: Thread? = null
 
     @Volatile private var generation = 0          // incremented to retire the current worker
@@ -165,6 +204,10 @@ class FilePlayer private constructor(private val context: Context) {
     init {
         repeat = runCatching { Repeat.valueOf(settings.repeatMode) }.getOrDefault(Repeat.OFF)
         restoreQueue()
+        // The mix rate follows the route (speaker 48k, a USB DAC maybe 96k, BT often 44.1),
+        // so the worker has to be told when it moves rather than guessing once at startup.
+        runCatching { audioManager?.registerAudioDeviceCallback(deviceCallback, null) }
+        refreshDeviceRate()
     }
     @Volatile private var focusPaused = false
     /** Artist-radio seed: one more track is queued when this one becomes the last entry. */
@@ -602,6 +645,14 @@ class FilePlayer private constructor(private val context: Context) {
         /** Frames written since creation or the last flush; compared with the play head to drain. */
         var framesWritten = 0L
 
+        /** The processed (possibly resampled) block; [processedFrames] of them are valid. */
+        var outBuf = FloatArray(0)
+            private set
+        var processedFrames = 0
+            private set
+        /** Rate the decoder produces; the engine resamples when it differs from [rate]. */
+        private var inputRate = 0
+
         init {
             val minBuf = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_FLOAT)
             // ~200 ms: we're streaming over mobile data, latency doesn't matter here.
@@ -637,9 +688,38 @@ class FilePlayer private constructor(private val context: Context) {
             appliedEq = eqVersion
         }
 
-        fun process(buf: FloatArray, frames: Int) {
+        /** Tells the engine what the decoder is producing, so it can resample to [rate]. */
+        fun setInputRate(r: Int) {
+            if (r <= 0) return
             synchronized(eqLock) {
-                if (handle != 0L) NativeDsp.process(handle, buf, frames)
+                if (r == inputRate) return
+                inputRate = r
+                if (handle != 0L) NativeDsp.setInputRate(handle, r)
+            }
+            Log.i(TAG, if (r == rate) "no resampling: source is $r Hz" else "resampling ${r} -> $rate Hz")
+        }
+
+        /** Runs the whole chain (resample → EQ → limiter) into [outBuf]. */
+        fun process(buf: FloatArray, frames: Int) {
+            val cap = synchronized(eqLock) {
+                if (handle == 0L) frames else NativeDsp.maxFrames(handle, frames)
+            }
+            if (outBuf.size < cap * 2) outBuf = FloatArray(cap * 2)
+            processedFrames = synchronized(eqLock) {
+                if (handle == 0L) 0 else NativeDsp.process(handle, buf, frames, outBuf, cap)
+            }
+        }
+
+        /** End of a track: the resampler's look-ahead would otherwise be dropped (a click). */
+        fun flush() {
+            val cap = synchronized(eqLock) { if (handle == 0L) 0 else NativeDsp.maxFrames(handle, 1024) }
+            if (cap <= 0) {
+                processedFrames = 0
+                return
+            }
+            if (outBuf.size < cap * 2) outBuf = FloatArray(cap * 2)
+            processedFrames = synchronized(eqLock) {
+                if (handle == 0L) 0 else NativeDsp.flush(handle, outBuf, cap)
             }
         }
 
@@ -671,6 +751,7 @@ class FilePlayer private constructor(private val context: Context) {
 
     private inner class Worker(private val gen: Int, private val start: Int, private var startAtMs: Long) : Runnable {
         private var output: Output? = null
+        private var builtEpoch = -1
         private var stereo = FloatArray(0)
         private var lastSavedAt = 0L
 
@@ -857,8 +938,11 @@ class FilePlayer private constructor(private val context: Context) {
 
                 var channels = inFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                 var encoding = AudioFormat.ENCODING_PCM_16BIT
-                var out = outputFor(inFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE))
-                updateFormatInfo(mime, out.rate, sourceBits, channels)
+                var streamRate = inFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                var out = outputFor(targetRate(streamRate))
+                builtEpoch = routeEpoch
+                out.setInputRate(streamRate)
+                updateFormatInfo(mime, streamRate, sourceBits, channels)
 
                 // Resuming a saved queue: enter the stream at the sync point at or before the
                 // saved position. Only the first track of a worker starts here.
@@ -882,13 +966,16 @@ class FilePlayer private constructor(private val context: Context) {
 
                 while (true) {
                     if (!live) return Outcome.Cancelled
+                    // Plugging in headphones/USB can move the mix rate under us.
+                    if (routeEpoch != builtEpoch) rebuildOutput = true
                     if (rebuildOutput) {
                         rebuildOutput = false
                         val resumeAt = positionMs
-                        val rate = out.rate
                         out.release()
                         output = null
-                        out = outputFor(rate)
+                        out = outputFor(targetRate(streamRate))
+                        builtEpoch = routeEpoch
+                        out.setInputRate(streamRate)
                         out.pauseAndFlush()
                         extractor.seekTo(resumeAt * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
                         dec.flush()
@@ -941,8 +1028,11 @@ class FilePlayer private constructor(private val context: Context) {
                         encoding = if (f.containsKey(MediaFormat.KEY_PCM_ENCODING))
                             f.getInteger(MediaFormat.KEY_PCM_ENCODING) else AudioFormat.ENCODING_PCM_16BIT
                         channels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        out = outputFor(f.getInteger(MediaFormat.KEY_SAMPLE_RATE))
-                        updateFormatInfo(mime, out.rate, sourceBits, channels)
+                        streamRate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        out = outputFor(targetRate(streamRate))
+                        builtEpoch = routeEpoch
+                        out.setInputRate(streamRate)
+                        updateFormatInfo(mime, streamRate, sourceBits, channels)
                         continue
                     }
                     if (outIdx < 0) continue
@@ -964,7 +1054,9 @@ class FilePlayer private constructor(private val context: Context) {
 
                         out.process(stereo, frames)
                         if (out.track.playState != AudioTrack.PLAYSTATE_PLAYING) out.track.play()
-                        val written = out.track.write(stereo, 0, frames * 2, AudioTrack.WRITE_BLOCKING)
+                        val written = out.track.write(
+                            out.outBuf, 0, out.processedFrames * 2, AudioTrack.WRITE_BLOCKING,
+                        )
                         if (written < 0) return Outcome.Failed("AudioTrack.write error $written")
                         out.framesWritten += written / 2
                         positionMs = info.presentationTimeUs / 1000
@@ -990,7 +1082,16 @@ class FilePlayer private constructor(private val context: Context) {
                     } else {
                         dec.releaseOutputBuffer(outIdx, false)
                     }
-                    if (eos) return Outcome.Finished
+                    if (eos) {
+                        // The resampler holds a few ms of look-ahead; write it out instead of
+                        // cutting the last note off.
+                        out.flush()
+                        if (out.processedFrames > 0) {
+                            out.track.write(out.outBuf, 0, out.processedFrames * 2, AudioTrack.WRITE_BLOCKING)
+                            out.framesWritten += out.processedFrames
+                        }
+                        return Outcome.Finished
+                    }
                 }
             } finally {
                 runCatching { codec?.stop() }

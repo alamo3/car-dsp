@@ -38,13 +38,44 @@ Java_dev_alamo3_cabineq_NativeDsp_setParams(JNIEnv* env, jobject, jlong h, jdoub
     engine(h)->setParams(p);
 }
 
-// buffer: interleaved stereo float, processed in place.
+// Rate of the incoming stream. Equal to the engine's rate means no resampling at all.
 JNIEXPORT void JNICALL
-Java_dev_alamo3_cabineq_NativeDsp_process(JNIEnv* env, jobject, jlong h, jfloatArray buffer, jint frames) {
-    auto* data = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(buffer, nullptr));
-    if (data == nullptr) return;
-    engine(h)->process(data, frames);
-    env->ReleasePrimitiveArrayCritical(buffer, data, 0);
+Java_dev_alamo3_cabineq_NativeDsp_setInputRate(JNIEnv*, jobject, jlong h, jint inRate) {
+    engine(h)->setInputRate(static_cast<int>(inRate));
+}
+
+// Upper bound on the frames process() can return for `inFrames` input frames.
+JNIEXPORT jint JNICALL
+Java_dev_alamo3_cabineq_NativeDsp_maxFrames(JNIEnv*, jobject, jlong h, jint inFrames) {
+    return static_cast<jint>(engine(h)->maxOutputFrames(static_cast<int>(inFrames)));
+}
+
+// in: interleaved stereo float from the decoder. out: processed (and resampled) stereo float.
+// Returns the frames written to `out`, which the caller writes to the AudioTrack.
+JNIEXPORT jint JNICALL
+Java_dev_alamo3_cabineq_NativeDsp_process(JNIEnv* env, jobject, jlong h, jfloatArray in,
+                                          jint inFrames, jfloatArray out, jint outFrames) {
+    auto* src = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(in, nullptr));
+    if (src == nullptr) return 0;
+    auto* dst = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(out, nullptr));
+    if (dst == nullptr) {
+        env->ReleasePrimitiveArrayCritical(in, src, JNI_ABORT);
+        return 0;
+    }
+    const int n = engine(h)->process(src, static_cast<int>(inFrames), dst, static_cast<int>(outFrames));
+    env->ReleasePrimitiveArrayCritical(out, dst, 0);
+    env->ReleasePrimitiveArrayCritical(in, src, JNI_ABORT);
+    return n;
+}
+
+// End of track: push the resampler's look-ahead through the chain.
+JNIEXPORT jint JNICALL
+Java_dev_alamo3_cabineq_NativeDsp_flush(JNIEnv* env, jobject, jlong h, jfloatArray out, jint outFrames) {
+    auto* dst = static_cast<jfloat*>(env->GetPrimitiveArrayCritical(out, nullptr));
+    if (dst == nullptr) return 0;
+    const int n = engine(h)->flush(dst, static_cast<int>(outFrames));
+    env->ReleasePrimitiveArrayCritical(out, dst, 0);
+    return n;
 }
 
 JNIEXPORT void JNICALL

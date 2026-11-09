@@ -187,6 +187,19 @@ class MainActivity : Activity() {
 
         // --- Output path ---
         root.addView(header("Output path"))
+        root.addView(switch("Match device rate", settings.matchDeviceRate) { on ->
+            settings.matchDeviceRate = on
+            FilePlayer.peek()?.onRateSettingChanged()
+            refreshOutputPath()
+        })
+        root.addView(TextView(this).apply {
+            text = "On: streams are resampled to the rate Android mixes at — by CabinEQ's own " +
+                "128-tap polyphase resampler in the native DSP — so the system mixer has nothing " +
+                "to convert. Off: the file's rate goes to the mixer and Android resamples it."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(8))
+        })
         outputPathText = TextView(this).apply {
             setPadding(0, dp(4), 0, dp(8))
             typeface = android.graphics.Typeface.MONOSPACE

@@ -141,6 +141,15 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_CACHE_WIFI_ONLY, false)
         set(v) = prefs.edit().putBoolean(KEY_CACHE_WIFI_ONLY, v).apply()
 
+    /**
+     * Emit at the rate the device mixes at, resampling in our own DSP when the source differs.
+     * On: the Android mixer's resampler is out of the path. Off: the file's own rate goes to
+     * the mixer and the platform converts it.
+     */
+    var matchDeviceRate: Boolean
+        get() = prefs.getBoolean(KEY_MATCH_DEVICE_RATE, true)
+        set(v) = prefs.edit().putBoolean(KEY_MATCH_DEVICE_RATE, v).apply()
+
     /** Audio cache cap in megabytes. */
     var cacheMaxMb: Int
         get() = prefs.getInt(KEY_CACHE_MAX_MB, 2048)
@@ -245,6 +254,7 @@ class Settings(context: Context) {
         const val KEY_JAM_SESSION = "jam_last_session"
         const val KEY_RADIO_SEED = "radio_seed"
         const val KEY_REPEAT = "repeat_mode"
+        const val KEY_MATCH_DEVICE_RATE = "match_device_rate"
         const val KEY_CACHE_ENABLED = "cache_enabled"
         const val KEY_CACHE_WIFI_ONLY = "cache_wifi_only"
         const val KEY_CACHE_MAX_MB = "cache_max_mb"

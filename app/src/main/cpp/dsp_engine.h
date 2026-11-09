@@ -1,8 +1,12 @@
 // CabinEQ native DSP engine.
 //
-// Signal chain (interleaved stereo float, in place):
-//   preamp (smoothed) -> N biquads (EQ: shelves + peaking, designed in Kotlin)
+// Signal chain (interleaved stereo float):
+//   [resample source rate -> output rate]  (only when they differ; see resampler.h)
+//   -> preamp (smoothed) -> N biquads (EQ: shelves + peaking, designed in Kotlin)
 //   -> lookahead peak limiter -> hard safety clip at 0 dBFS
+//
+// Resampling first means the EQ runs at the rate the device actually mixes at, and the
+// limiter is still the last stage, so the output peaks are still bounded.
 //
 // Threading: setParams() is called from the control thread (10 Hz); process() runs on
 // the audio thread. Parameters are handed over through a mutex the audio thread only
@@ -16,6 +20,8 @@
 #include <cstdint>
 #include <mutex>
 #include <vector>
+
+#include "resampler.h"
 
 namespace cabin {
 
@@ -90,13 +96,49 @@ public:
         limiter_.prepare(sampleRate, 1.5f, 80.0f);
     }
 
+    /** Rate of the stream we are fed; sets up (or tears down) the resampler. */
+    void setInputRate(int inRate) {
+        if (inRate == inputRate_) return;
+        inputRate_ = inRate;
+        resampler_.configure(inRate, static_cast<int>(std::lround(sampleRate_)));
+    }
+
+    int maxOutputFrames(int inFrames) const {
+        return resampler_.active() ? resampler_.maxOutputFrames(inFrames) : inFrames;
+    }
+
+    /**
+     * Resamples (when needed) into [out], then runs the chain in place. Returns how many
+     * frames [out] holds — the caller writes exactly that many to the AudioTrack.
+     */
+    int process(const float* in, int inFrames, float* out, int outCap) {
+        if (resampler_.active()) {
+            const int n = resampler_.process(in, inFrames, out, outCap);
+            processCore(out, n);
+            return n;
+        }
+        const int n = std::min(inFrames, outCap);
+        if (out != in) std::memcpy(out, in, static_cast<size_t>(n) * 2 * sizeof(float));
+        processCore(out, n);
+        return n;
+    }
+
+    /** Empties the resampler's tail at the end of a track. Returns frames written. */
+    int flush(float* out, int outCap) {
+        if (!resampler_.active()) return 0;
+        const int n = resampler_.flush(out, outCap);
+        processCore(out, n);
+        return n;
+    }
+
     void setParams(const Params& p) {
         std::lock_guard<std::mutex> lock(mutex_);
         pending_ = p;
         dirty_.store(true, std::memory_order_release);
     }
 
-    void process(float* interleaved, int frames) {
+    void processCore(float* interleaved, int frames) {
+        if (frames <= 0) return;
         enableFlushToZero();
         pickUpParams();
 
@@ -195,7 +237,9 @@ private:
         while (v < cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
     }
 
-    const float sampleRate_;
+    const float sampleRate_;   // the rate we process (and output) at
+    int inputRate_ = 0;        // the rate the decoder hands us
+    Resampler resampler_;
     std::mutex mutex_;
     std::atomic<bool> dirty_{false};
     Params pending_{};
