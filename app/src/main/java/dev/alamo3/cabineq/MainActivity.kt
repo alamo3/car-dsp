@@ -59,7 +59,6 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         settings = Settings(this)
         setContentView(buildUi())
-        requestNeededPermissions()
         handleInstallStatus(intent)
         checkForUpdate(userInitiated = false)
     }
@@ -518,6 +517,9 @@ class MainActivity : Activity() {
     // Service + permissions
 
     private fun toggleService() {
+        // Ask only when the engine is actually being started; simply opening this screen must
+        // not throw permission dialogs at the user.
+        if (!EngineState.running) requestNeededPermissions()
         if (EngineState.running) {
             startService(Intent(this, EqService::class.java).setAction(EqService.ACTION_STOP))
         } else if (settings.dspEngine) {

@@ -224,6 +224,7 @@ class EqService : MediaBrowserServiceCompat() {
     }
 
     /** MediaBrowse speaks framework types; the compat service needs its own copies. */
+    @android.annotation.SuppressLint("WrongConstant")   // item.flags is already a MediaItem mask
     private fun toCompat(item: MediaBrowser.MediaItem): MediaBrowserCompat.MediaItem {
         val d = item.description
         val description = MediaDescriptionCompat.Builder()

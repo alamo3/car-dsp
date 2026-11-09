@@ -110,6 +110,7 @@ private fun warmArt(context: Context, urls: List<Pair<String?, String?>>, done: 
  * tile rows for the current recommendation seed. Same media ids as the browser tree, so playback
  * goes through the exact same queue-building code.
  */
+@androidx.annotation.OptIn(markerClass = [androidx.car.app.annotations.ExperimentalCarApi::class])
 class HomeScreen(carContext: CarContext) : Screen(carContext) {
 
     @Volatile private var recent: List<Track>? = null

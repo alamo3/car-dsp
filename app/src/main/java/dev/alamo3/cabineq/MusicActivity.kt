@@ -87,6 +87,7 @@ class MusicActivity : Activity() {
 
     @Volatile private var op = 0
     private var shownVersion = -1
+    private var askedForNotifications = false
     private var shownArt: String? = "\u0000"
     private val stack = ArrayDeque<() -> Unit>()
     private var searchPageOnTop = false
@@ -116,6 +117,27 @@ class MusicActivity : Activity() {
         }
         setContentView(buildUi())
         navigate { renderHome() }
+        startFromPlayFromSearch(intent)
+    }
+
+    /**
+     * "Play <something> on CabinEQ" from Assistant or the car's voice search, declared in the
+     * manifest as MEDIA_PLAY_FROM_SEARCH. It is the same search the app performs itself.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        startFromPlayFromSearch(intent)
+    }
+
+    /** Same handling whether the activity was created by the intent or already running. */
+    private fun startFromPlayFromSearch(intent: Intent?) {
+        if (intent?.action != ACTION_PLAY_FROM_SEARCH) return
+        val query = intent.getStringExtra(android.app.SearchManager.QUERY)?.trim().orEmpty()
+        if (query.isBlank() || !::searchInput.isInitialized) return
+        searchInput.setText(query)
+        searchInput.setSelection(query.length)
+        handler.removeCallbacks(searchRunnable)
+        runSearch(query, fromTyping = false)
     }
 
     override fun onResume() {
@@ -123,6 +145,7 @@ class MusicActivity : Activity() {
         shownVersion = -1
         handler.post(ticker)
     }
+
 
     override fun onPause() {
         handler.removeCallbacks(ticker)
@@ -952,6 +975,13 @@ class MusicActivity : Activity() {
      */
     private fun play(tracks: List<Track>, index: Int, title: String, radio: Track? = null) {
         EngineState.playerMessage = null
+        if (!askedForNotifications && Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            askedForNotifications = true
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS)
+        }
         // Keeps playback alive in the background and feeds the live EQ + speed compensation.
         runCatching {
             startForegroundService(Intent(this, EqService::class.java).setAction(EqService.ACTION_PLAYER_ATTACH))
@@ -1431,6 +1461,10 @@ class MusicActivity : Activity() {
     }
 
     companion object {
+        const val ACTION_PLAY_FROM_SEARCH = "android.media.action.MEDIA_PLAY_FROM_SEARCH"
+
+
+        private const val REQ_NOTIFICATIONS = 11
         private const val POLL_MS = 3000L
         private const val SEARCH_DEBOUNCE_MS = 350L
         private const val MAX_ALBUMS = 12
