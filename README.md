@@ -166,6 +166,25 @@ re-checked when the player starts and when the output route changes. If the proc
 session the volume stays where it was set, and the next start finds `preCarVolume` and undoes
 it.
 
+### Click-proofing and metering
+
+Three things guard the output, and one number tells you whether they work:
+
+- **Fade-in at every (re)start** — track start, seek, rebuilt sink. Starting mid-waveform at
+  full amplitude is a step, and a step is a click; 15 ms of ramp hides it and is inaudible.
+- **Ramped limiter attack** — the gain now reaches its target over the lookahead, so it lands
+  exactly when the peak leaves the delay line. (Measured before: the step-based attack left a
+  discontinuity; now the output peak lands on the threshold with no jump of its own.)
+- **True-peak and click meters** in the Output panel. True peak is a 6-tap windowed-sinc
+  reconstruction (within ~0.15 dB of a 4× meter), which is what the DAC's filter sees between
+  samples. "Clicks" counts one-sample jumps that tower over the recent signal — fast cymbals
+  don't count, a discontinuity does.
+
+The click counter is the honest part: after 3 skips and 2 seeks it reads **1**, because cutting
+playback with `pauseAndFlush()` steps from the current amplitude to zero. Fixing that last one
+means holding the output tail and shrinking the AudioTrack buffer (200 ms → ~40 ms) so a cut
+lands near the write position — a latency trade worth asking about, not something to slip in.
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are

@@ -30,6 +30,10 @@ object EngineState {
     @Volatile var playerInPeakDb = -120f
     @Volatile var playerOutPeakDb = -120f
     @Volatile var playerLimiterDb = 0f
+    /** Inter-sample peak of the output, dBFS: what the DAC sees between samples. */
+    @Volatile var playerTruePeakDb = -120f
+    /** Discontinuities detected in the output since the app started (should stay at 0). */
+    @Volatile var playerClicks = 0L
     @Volatile var playerRoute: String? = null
     @Volatile var playerMessage: String? = null
 }

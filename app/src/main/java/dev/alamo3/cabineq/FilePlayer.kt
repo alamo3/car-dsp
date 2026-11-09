@@ -255,7 +255,7 @@ class FilePlayer private constructor(private val context: Context) {
     private var eqLimiterLin = 0.891f
     private var eqVersion = 0
     @Volatile private var current: Output? = null
-    private val meterScratch = FloatArray(3)
+    private val meterScratch = FloatArray(5)
 
     // ---------------------------------------------------------------- controls
 
@@ -696,6 +696,8 @@ class FilePlayer private constructor(private val context: Context) {
             synchronized(eqLock) {
                 handle = NativeDsp.create(rate)
                 applyEqLocked()
+                // Never start mid-waveform at full amplitude: that step is a click.
+                NativeDsp.fadeIn(handle, rate * FADE_IN_MS / 1000)
             }
             liveOutput = this
         }
@@ -751,6 +753,10 @@ class FilePlayer private constructor(private val context: Context) {
         fun pauseAndFlush() {
             runCatching { track.pause(); track.flush() }
             framesWritten = 0
+            // Whatever plays next starts from silence, not from the middle of a waveform.
+            synchronized(eqLock) {
+                if (handle != 0L) NativeDsp.fadeIn(handle, rate * FADE_IN_MS / 1000)
+            }
         }
 
         fun release() {
@@ -1263,6 +1269,9 @@ class FilePlayer private constructor(private val context: Context) {
     }
 
     companion object {
+        /** Ramp-in length at every (re)start; long enough to hide a step, short enough to forget. */
+        private const val FADE_IN_MS = 15
+
         /** Full focus loss retries: enough to survive the car host grabbing the panel. */
         private const val FOCUS_RETRIES = 4
         private const val FOCUS_RETRY_MS = 1500L

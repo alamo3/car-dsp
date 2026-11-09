@@ -78,11 +78,17 @@ Java_dev_alamo3_cabineq_NativeDsp_flush(JNIEnv* env, jobject, jlong h, jfloatArr
     return n;
 }
 
+// Ramps the output up from silence over `frames` (track start, seek, rebuilt sink).
+JNIEXPORT void JNICALL
+Java_dev_alamo3_cabineq_NativeDsp_fadeIn(JNIEnv*, jobject, jlong h, jint frames) {
+    engine(h)->fadeIn(static_cast<int>(frames));
+}
+
 JNIEXPORT void JNICALL
 Java_dev_alamo3_cabineq_NativeDsp_readMeters(JNIEnv* env, jobject, jlong h, jfloatArray out) {
-    float m[3];
+    float m[5];
     engine(h)->readMeters(m);
-    env->SetFloatArrayRegion(out, 0, 3, m);
+    env->SetFloatArrayRegion(out, 0, 5, m);
 }
 
 }  // extern "C"

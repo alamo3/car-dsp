@@ -163,6 +163,15 @@ object AudioPath {
             add(Row("Spatial", if (f.spatialEnabled == true) "on" else if (f.spatialAvailable) "available, off" else "not available"))
         }
         add(Row("Effects", "none attached by CabinEQ"))
+        // A number for "I hear clicking": true peak shows inter-sample overshoot, the counter
+        // shows discontinuities we produced. Both should sit near zero.
+        val tp = EngineState.playerTruePeakDb
+        if (tp > -110f) {
+            add(Row("True peak", String.format(Locale.US, "%.1f dBFS%s", tp,
+                if (tp > -0.5f) " — over full scale between samples" else ""), warn = tp > -0.5f))
+        }
+        add(Row("Clicks", if (EngineState.playerClicks == 0L) "none since start"
+                          else "${EngineState.playerClicks} detected", warn = EngineState.playerClicks > 0))
         add(Row("Car volume", f.carPolicy))
         f.route?.let { add(Row("Route", it)) }
     }

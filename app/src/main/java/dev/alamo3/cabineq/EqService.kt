@@ -642,6 +642,8 @@ class EqService : MediaBrowserServiceCompat() {
             EngineState.playerInPeakDb = toDb(m[0])
             EngineState.playerOutPeakDb = toDb(m[1])
             EngineState.playerLimiterDb = toDb(m[2])
+            EngineState.playerTruePeakDb = toDb(m[3])
+            if (m[4] > 0f) EngineState.playerClicks += m[4].toLong()
         }
         EngineState.playerRoute = player.routedDeviceType()?.let { deviceName(it) }
 

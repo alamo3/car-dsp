@@ -37,6 +37,12 @@ object NativeDsp {
     /** End of a track: pushes the resampler's look-ahead through. Returns frames written. */
     external fun flush(handle: Long, output: FloatArray, outputFrames: Int): Int
 
-    /** out = [input peak, output peak, minimum limiter gain], all linear, reset on read. */
+    /** Ramps the output up from silence over [frames]; call whenever playback (re)starts. */
+    external fun fadeIn(handle: Long, frames: Int)
+
+    /**
+     * out = [input peak, output peak, min limiter gain, true peak, clicks], all linear except
+     * the count; reset on read.
+     */
     external fun readMeters(handle: Long, out: FloatArray)
 }

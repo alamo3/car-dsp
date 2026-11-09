@@ -50,7 +50,7 @@ class CaptureEngine(private val context: Context, private val projection: MediaP
     @Volatile var lastError: String? = null
         private set
 
-    private val meterScratch = FloatArray(3)
+    private val meterScratch = FloatArray(5)
 
     @SuppressLint("MissingPermission") // RECORD_AUDIO is checked by the caller
     fun start(): Boolean {
