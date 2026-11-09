@@ -175,6 +175,27 @@ class FilePlayer private constructor(private val context: Context) {
             deviceRate = r
             routeEpoch++
             Log.i(TAG, "device mixes at $r Hz")
+            runCatching { CarVolume.sync(context) }
+        // ENTER/EXIT_CAR_MODE are implicit broadcasts: a manifest receiver never sees them
+        // (API 26+), so register here — the player is alive exactly when the volume matters.
+        runCatching {
+            val filter = android.content.IntentFilter().apply {
+                addAction(android.app.UiModeManager.ACTION_ENTER_CAR_MODE)
+                addAction(android.app.UiModeManager.ACTION_EXIT_CAR_MODE)
+            }
+            val receiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: Context, intent: android.content.Intent) {
+                    Log.i(TAG, "car mode: ${intent.action}")
+                    runCatching { CarVolume.sync(c) }
+                }
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                context.registerReceiver(receiver, filter)
+            }
+        }
         }
     }
 
@@ -208,6 +229,10 @@ class FilePlayer private constructor(private val context: Context) {
         // so the worker has to be told when it moves rather than guessing once at startup.
         runCatching { audioManager?.registerAudioDeviceCallback(deviceCallback, null) }
         refreshDeviceRate()
+        // Car mode may already be on (Android Auto launched us): raise the stream now, and
+        // again whenever the route moves, since "external output in a car" is the case that
+        // should get full scale.
+        runCatching { CarVolume.sync(context) }
     }
     @Volatile private var focusPaused = false
     /** Artist-radio seed: one more track is queued when this one becomes the last entry. */

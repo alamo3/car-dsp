@@ -200,6 +200,35 @@ class MainActivity : Activity() {
             alpha = 0.7f
             setPadding(0, 0, 0, dp(8))
         })
+        root.addView(switch("Volume to max in the car", settings.maxVolumeInCar) { on ->
+            settings.maxVolumeInCar = on
+            CarVolume.sync(this)
+            refreshOutputPath()
+        })
+        root.addView(TextView(this).apply {
+            text = "In car mode (Android Auto) the media stream goes to 100%, so the mixer's " +
+                "volume attenuation is out of the path and the car's own volume sets the level. " +
+                "It is put back when car mode ends, and only if it is still at maximum. Skipped " +
+                "when the platform fixes the volume, over Bluetooth (there the phone's volume is " +
+                "the car's) and, unless enabled below, when the sound comes out of the phone's " +
+                "own speaker."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(4))
+        })
+        root.addView(switch("…also with the phone speaker", settings.maxVolumeIncludeSpeaker) { on ->
+            settings.maxVolumeIncludeSpeaker = on
+            CarVolume.sync(this)
+            refreshOutputPath()
+        })
+        root.addView(Button(this).apply {
+            text = "Set volume to max now"
+            setOnClickListener {
+                CarVolume.setMaxNow(this@MainActivity)
+                android.widget.Toast.makeText(this@MainActivity, "Volume set", android.widget.Toast.LENGTH_SHORT).show()
+                refreshOutputPath()
+            }
+        })
         outputPathText = TextView(this).apply {
             setPadding(0, dp(4), 0, dp(8))
             typeface = android.graphics.Typeface.MONOSPACE

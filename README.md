@@ -142,6 +142,30 @@ resampling); the resampler is the smaller part. The tail is flushed at the end o
 the last milliseconds are not cut, and a route change (headphones, USB DAC, Bluetooth) rebuilds
 the output at the new rate instead of silently resampling twice.
 
+### Volume in the car
+
+When car mode starts (Android Auto, AAOS, or a car dock), the media stream is set to maximum
+so the mixer's stream-volume attenuation is out of the path before the audio leaves the phone;
+the car's own volume then sets the level. It is put back when car mode ends.
+
+That touches the user's own volume, so it is deliberately conservative:
+
+- only in car mode, and only with **Volume to max in the car** on (default on);
+- skipped when `AudioManager.isVolumeFixed` — the head unit owns the volume there and setting
+  it does nothing but fight the car;
+- skipped over Bluetooth, where the phone's stream volume *is* the car's volume (absolute
+  volume), so "max" would mean "turn the car to maximum";
+- skipped into the phone's own speaker unless **…also with the phone speaker** is enabled —
+  that is the one case where this can blow your ears off;
+- applied **once** per car session, so turning it down afterwards sticks, and restored only if
+  it is still at the maximum we set.
+
+`ENTER/EXIT_CAR_MODE` are implicit broadcasts, which a manifest receiver never receives since
+API 26, so the receiver is registered at runtime while the player is alive; the state is also
+re-checked when the player starts and when the output route changes. If the process dies mid
+session the volume stays where it was set, and the next start finds `preCarVolume` and undoes
+it.
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are

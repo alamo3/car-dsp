@@ -43,6 +43,8 @@ object AudioPath {
         val spatialAvailable: Boolean?,
         val spatialEnabled: Boolean?,
         val route: String?,
+        /** What the car-mode volume hand-off is doing right now. */
+        val carPolicy: String,
         /** False when the player is idle: the rows then describe the device, not a stream. */
         val hasStream: Boolean,
     )
@@ -88,6 +90,7 @@ object AudioPath {
             spatialAvailable = spatial?.first,
             spatialEnabled = spatial?.second,
             route = device?.label(),
+            carPolicy = CarVolume.describe(context),
             hasStream = player?.currentTrack != null || (player?.sourceSampleRate ?: 0) > 0,
         )
     }
@@ -160,6 +163,7 @@ object AudioPath {
             add(Row("Spatial", if (f.spatialEnabled == true) "on" else if (f.spatialAvailable) "available, off" else "not available"))
         }
         add(Row("Effects", "none attached by CabinEQ"))
+        add(Row("Car volume", f.carPolicy))
         f.route?.let { add(Row("Route", it)) }
     }
 
