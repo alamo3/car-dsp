@@ -1,6 +1,7 @@
 package dev.alamo3.cabineq.car
 
 import android.content.Intent
+import android.util.Log
 import android.os.SystemClock
 import androidx.car.app.CarAppService
 import androidx.car.app.Session
@@ -63,6 +64,9 @@ class CabinCarSession : Session() {
     private var lastPlaybackPushAt = 0L
 
     override fun onCreateScreen(intent: Intent): Screen {
+        // Which entry point did the host use? "The app looks wrong in the car" is impossible to
+        // diagnose without knowing whether this was ever called, and with what.
+        Log.i(CabinCarAppService.TAG, "onCreateScreen action=${intent.action} extras=${intent.extras?.keySet()?.joinToString() ?: "none"}")
         // The car needs our MediaSessionCompat token to render controls for this app. It lives in
         // EqService, so make sure that service is up before asking for it.
         CarPlayback.ensureService(carContext)

@@ -112,6 +112,7 @@ private fun warmArt(context: Context, urls: List<Pair<String?, String?>>, done: 
  */
 @androidx.annotation.OptIn(markerClass = [androidx.car.app.annotations.ExperimentalCarApi::class])
 class HomeScreen(carContext: CarContext) : Screen(carContext) {
+    private var lastLoggedAt = 0L
 
     @Volatile private var recent: List<Track>? = null
     @Volatile private var recommended: List<Track>? = null
@@ -121,6 +122,12 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
     private var tokenTries = 0
 
     override fun onGetTemplate(): Template {
+        // Logged once per render (throttled): if the car shows something that is not this
+        // template, the log says whether we were asked at all.
+        if (System.currentTimeMillis() - lastLoggedAt > 2000) {
+            lastLoggedAt = System.currentTimeMillis()
+            android.util.Log.i("CabinEQ/CarApp", "HomeScreen.onGetTemplate")
+        }
         CarMediaBridge.register(carContext)
         // The session is created asynchronously by EqService; retry a few times, then stop.
         if (!CarMediaBridge.register(carContext) && tokenTries < 6) {
