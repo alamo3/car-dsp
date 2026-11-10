@@ -150,8 +150,19 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
                 .build()
         }
 
+        // The manifest admits hosts from car API level 7, but the sectioned home needs 8 and its
+        // search header 9. Sending a template the host doesn't know fails on the host side, so
+        // older hosts get the closest thing they can draw.
+        val api = carContext.carAppApiLevel
+        if (api < 8) return legacyHome(rows, picks)
+
+        val jamAction = Action.Builder()
+            .setTitle(if (JamHost.running) "Jam ●" else "Jam")
+            .setOnClickListener { screenManager.push(JamScreen(carContext)) }
+            .build()
         val builder = SectionedItemTemplate.Builder()
-            .setSearchHeader(
+        if (api >= 9) {
+            builder.setSearchHeader(
                 SearchHeader.Builder(object : SearchTemplate.SearchCallback {
                     override fun onSearchSubmitted(searchText: String) {
                         if (searchText.isBlank()) return
@@ -161,19 +172,22 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
                     .setSearchHint("Songs, albums, artists")
                     .setShowKeyboardByDefault(false)
                     .setStartHeaderAction(Action.APP_ICON)
-                    .setEndHeaderActions(
-                        listOf(
-                            // Action.MEDIA_PLAYBACK below is the host's minimised panel; it is
-                            // enough once playback is live (bottom right), so the header keeps
-                            // a single action and the search field its full width.
-                            Action.Builder()
-                                .setTitle(if (JamHost.running) "Jam ●" else "Jam")
-                                .setOnClickListener { screenManager.push(JamScreen(carContext)) }
-                                .build()
-                        )
-                    )
+                    // Action.MEDIA_PLAYBACK below is the host's minimised panel; it is enough
+                    // once playback is live (bottom right), so the header keeps a single action
+                    // and the search field its full width.
+                    .setEndHeaderActions(listOf(jamAction))
                     .build()
             )
+        } else {
+            builder.setHeader(
+                Header.Builder()
+                    .setTitle("CabinEQ")
+                    .setStartHeaderAction(Action.APP_ICON)
+                    .addEndHeaderAction(searchAction())
+                    .addEndHeaderAction(jamAction)
+                    .build()
+            )
+        }
 
         if (rows.isNotEmpty()) builder.addSection(recentSection(rows))
         if (picks.isNotEmpty()) builder.addSection(recommendedSection(picks))
@@ -189,6 +203,48 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         // browse screen. Hosts render this as the minimised control panel (bottom right).
         builder.addAction(Action.MEDIA_PLAYBACK)
         return builder.build()
+    }
+
+    /** Car API 7 hosts: one list of recent songs and picks, search and Jam in the header. */
+    private fun legacyHome(rows: List<Track>, picks: List<Track>): Template {
+        val items = ItemList.Builder()
+        fun add(tracks: List<Track>, label: String) {
+            tracks.take(10).forEachIndexed { i, track ->
+                items.addItem(
+                    Row.Builder()
+                        .setTitle(track.title)
+                        .addText(listOf(label, track.subtitle()).filter { it.isNotBlank() }.joinToString(" · "))
+                        .setImage(carIcon(carContext, track.artworkUrl, artQuery(track.artist, track.album, track.title)))
+                        .setOnClickListener {
+                            CarPlayback.playTracks(carContext, tracks, i, label, ::openPlayer)
+                        }
+                        .build()
+                )
+            }
+        }
+        add(rows, "Recently played")
+        add(picks, "For you")
+        if (rows.isEmpty() && picks.isEmpty()) {
+            return MessageTemplate.Builder("Nothing to play yet — search for something, or start a song on your phone.")
+                .setHeaderAction(searchAction())
+                .build()
+        }
+        return ListTemplate.Builder()
+            .setTitle("CabinEQ")
+            .setHeaderAction(Action.APP_ICON)
+            .setActionStrip(
+                androidx.car.app.model.ActionStrip.Builder()
+                    .addAction(searchAction())
+                    .addAction(
+                        Action.Builder()
+                            .setTitle(if (JamHost.running) "Jam ●" else "Jam")
+                            .setOnClickListener { screenManager.push(JamScreen(carContext)) }
+                            .build()
+                    )
+                    .build()
+            )
+            .setSingleList(items.build())
+            .build()
     }
 
     private fun load() {
@@ -523,7 +579,60 @@ class NowPlayingScreen(carContext: CarContext) : Screen(carContext) {
                 .setTitle("Playback problem")
                 .build()
         }
+        // MediaPlaybackTemplate is car API 8; older hosts get a pane with the basic controls.
+        if (carContext.carAppApiLevel < 8) return legacyPlaybackTemplate(player)
         return playbackTemplate()
+    }
+
+    private fun legacyPlaybackTemplate(player: dev.alamo3.cabineq.FilePlayer?): Template {
+        val track = player?.currentTrack
+        val playing = player?.state == dev.alamo3.cabineq.FilePlayer.State.PLAYING
+        val pane = Pane.Builder()
+            .addRow(
+                Row.Builder()
+                    .setTitle(track?.title ?: "Nothing playing")
+                    .apply { track?.subtitle()?.takeIf { it.isNotBlank() }?.let { addText(it) } }
+                    .apply {
+                        track?.let {
+                            setImage(carIcon(carContext, it.artworkUrl, artQuery(it.artist, it.album, it.title)))
+                        }
+                    }
+                    .build()
+            )
+        if (player != null && track != null) {
+            pane.addAction(
+                Action.Builder()
+                    .setTitle(if (playing) "Pause" else "Play")
+                    .setOnClickListener {
+                        if (playing) player.pause() else player.resume()
+                        runCatching { invalidate() }
+                    }
+                    .build()
+            )
+            pane.addAction(
+                Action.Builder()
+                    .setTitle("Next")
+                    .setOnClickListener {
+                        player.next()
+                        runCatching { invalidate() }
+                    }
+                    .build()
+            )
+        }
+        return PaneTemplate.Builder(pane.build())
+            .setTitle("Now playing")
+            .setHeaderAction(Action.BACK)
+            .setActionStrip(
+                androidx.car.app.model.ActionStrip.Builder()
+                    .addAction(
+                        Action.Builder()
+                            .setTitle("Queue")
+                            .setOnClickListener { screenManager.push(QueueScreen(carContext)) }
+                            .build()
+                    )
+                    .build()
+            )
+            .build()
     }
 
     private fun playbackTemplate(): Template =

@@ -49,8 +49,9 @@ class ArtworkProvider : ContentProvider() {
         if (mode != "r" || uri.pathSegments.firstOrNull() != "art") return null
         val ctx = context ?: return null
         // A jam QR: generated here, so the car's host can fetch it at its own resolution.
-        uri.getQueryParameter("qr")?.takeIf { it.isNotBlank() }?.let { text ->
-            val size = uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(128, 1024) ?: 640
+        // Bounded: a jam URL is ~70 characters, and every distinct text is a cached image.
+        uri.getQueryParameter("qr")?.takeIf { it.isNotBlank() && it.length <= MAX_QR_TEXT }?.let { text ->
+            val size = snap(uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(128, 1024) ?: 640)
             val file = dev.alamo3.cabineq.jam.QrCodes.fileFor(ctx, text, size) ?: return null
             return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
         }
@@ -60,7 +61,7 @@ class ArtworkProvider : ContentProvider() {
             ?.takeIf { it.startsWith("https://") && it.length <= 2048 }
         val query = uri.getQueryParameter("q")?.take(120)
         if (url == null && query.isNullOrBlank()) return null
-        val size = uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(64, 1200) ?: 512
+        val size = snap(uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(64, 1200) ?: 512)
         // Cached cover: serve it. Otherwise hand over a placeholder now and fetch in the
         // background — the car opens icons synchronously, and a 15 s network wait paints a
         // blank tile (or stalls the row) while it works.
@@ -90,7 +91,7 @@ class ArtworkProvider : ContentProvider() {
         val url = uri.getQueryParameter("u")
             ?.takeIf { it.startsWith("https://") && it.length <= 2048 }
         val query = uri.getQueryParameter("q")?.take(120)
-        val size = uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(64, 1200) ?: 512
+        val size = snap(uri.getQueryParameter("s")?.toIntOrNull()?.coerceIn(64, 1200) ?: 512)
         return Artwork.cachedMimeType(ctx, url, query, size) ?: "image/png"
     }
 
@@ -116,6 +117,15 @@ class ArtworkProvider : ContentProvider() {
     companion object {
         /** How long an icon request may wait for the real image before the placeholder. */
         private const val ICON_WAIT_MS = 1200L
+
+        private const val MAX_QR_TEXT = 512
+
+        /**
+         * Sizes are rounded up to a multiple of 64. Every size is its own cache file, and this
+         * provider is exported: without the rounding any app could ask for each of ~1,100 sizes
+         * of the same cover.
+         */
+        private fun snap(px: Int): Int = ((px + 63) / 64) * 64
 
         /**
          * Declared in the manifest as `${applicationId}.art`, so a test build installed next to a

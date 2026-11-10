@@ -24,6 +24,8 @@
 
     <application
         android:allowBackup="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/app_name"
@@ -123,10 +125,11 @@
             </intent-filter>
         </service>
 
-        <!-- Car API level 7 is what this app actually uses: SectionedItemTemplate with
-             GridSections, SearchHeader, MediaPlaybackTemplate and header actions. It said 9,
-             which is CAL 1.9-alpha, and hosts that advertise a lower level hide the whole car
-             app from the launcher ("All vehicle apps") while still listing its media entry. -->
+        <!-- Hosts from car API level 7 may run us. The richer templates need more
+             (SectionedItemTemplate, GridSection, MediaPlaybackTemplate and Action.MEDIA_PLAYBACK
+             are 8, SearchHeader is 9), so the screens check carContext.carAppApiLevel and fall
+             back to list/pane templates on older hosts. A higher minimum would hide the whole
+             car app from the launcher on those hosts while still listing its media entry. -->
         <meta-data
             android:name="androidx.car.app.minCarApiLevel"
             android:value="7" />

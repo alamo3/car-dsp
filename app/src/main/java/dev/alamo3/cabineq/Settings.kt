@@ -10,6 +10,23 @@ class Settings(context: Context) {
     val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    /**
+     * Credentials (TorBox key, Nebula link — which embeds the key) live in their own file, which
+     * the backup rules exclude: the rest of the settings may go to the cloud, these may not.
+     */
+    private val secrets: SharedPreferences =
+        context.applicationContext.getSharedPreferences(SECRETS_NAME, Context.MODE_PRIVATE)
+            .also { migrateSecrets(it) }
+
+    private fun migrateSecrets(to: SharedPreferences) {
+        if (!prefs.contains(KEY_TORBOX_KEY) && !prefs.contains(KEY_ADDON_LINK)) return
+        val e = to.edit()
+        prefs.getString(KEY_TORBOX_KEY, null)?.let { if (!to.contains(KEY_TORBOX_KEY)) e.putString(KEY_TORBOX_KEY, it) }
+        prefs.getString(KEY_ADDON_LINK, null)?.let { if (!to.contains(KEY_ADDON_LINK)) e.putString(KEY_ADDON_LINK, it) }
+        // Write the new copy before dropping the old one, so a crash in between loses nothing.
+        if (e.commit()) prefs.edit().remove(KEY_TORBOX_KEY).remove(KEY_ADDON_LINK).apply()
+    }
+
     /** Guards read-modify-write of the string lists: search threads, the player and the car. */
     private val recentSearchesLock = Any()
     private val historyLock = Any()
@@ -83,8 +100,8 @@ class Settings(context: Context) {
 
     /** TorBox API key (TorBox dashboard → Settings → API). Stored in app-private prefs. */
     var torboxApiKey: String
-        get() = prefs.getString(KEY_TORBOX_KEY, "") ?: ""
-        set(v) = prefs.edit().putString(KEY_TORBOX_KEY, v.trim()).apply()
+        get() = secrets.getString(KEY_TORBOX_KEY, "") ?: ""
+        set(v) = secrets.edit().putString(KEY_TORBOX_KEY, v.trim()).apply()
 
     /** Only show search results TorBox already has cached (instant playback). */
     var torboxCachedOnly: Boolean
@@ -96,8 +113,8 @@ class Settings(context: Context) {
      * in app-private prefs and only its host is ever shown.
      */
     var addonLink: String
-        get() = prefs.getString(KEY_ADDON_LINK, "") ?: ""
-        set(v) = prefs.edit().putString(KEY_ADDON_LINK, v.trim()).apply()
+        get() = secrets.getString(KEY_ADDON_LINK, "") ?: ""
+        set(v) = secrets.edit().putString(KEY_ADDON_LINK, v.trim()).apply()
 
     /** Most recent first, at most [MAX_RECENT]. */
     val recentSearches: List<String>
@@ -300,6 +317,8 @@ class Settings(context: Context) {
 
     companion object {
         const val PREFS_NAME = "cabin_eq"
+        /** Excluded from backup in res/xml/backup_rules.xml and data_extraction_rules.xml. */
+        const val SECRETS_NAME = "cabin_eq_secrets"
         const val KEY_PREAMP = "preamp_db"
         const val KEY_GLOBAL = "global_mode"
         const val KEY_AUTO_PREAMP = "auto_preamp"

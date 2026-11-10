@@ -8,6 +8,7 @@ import androidx.car.app.Session
 import androidx.car.app.Screen
 import androidx.car.app.media.MediaPlaybackManager
 import androidx.car.app.validation.HostValidator
+import dev.alamo3.cabineq.BuildConfig
 import androidx.core.graphics.drawable.IconCompat
 import dev.alamo3.cabineq.PlaybackTokenHolder
 import dev.alamo3.cabineq.Radio
@@ -33,10 +34,16 @@ class CabinCarAppService : CarAppService() {
     }
 
     /**
-     * Android Auto and Android Automotive are the hosts we care about; this app is not on Play,
-     * so the default allow-list (which names Play-signed hosts) is too strict to test with.
+     * Only real car hosts may bind: Android Auto (which also drives the desktop head unit) and
+     * Android Automotive's templates host, as listed by the library's allow-list. Allowing every
+     * host let any app on the phone bind the service and drive playback. Debug builds still
+     * accept any host, for third-party test hosts.
      */
-    override fun createHostValidator(): HostValidator = HostValidator.ALLOW_ALL_HOSTS_VALIDATOR
+    override fun createHostValidator(): HostValidator =
+        if (BuildConfig.DEBUG) HostValidator.ALLOW_ALL_HOSTS_VALIDATOR
+        else HostValidator.Builder(applicationContext)
+            .addAllowedHosts(androidx.car.app.R.array.hosts_allowlist_sample)
+            .build()
 
     companion object {
         /** Hosts validate this; AA and AAOS are the expected ones. */
