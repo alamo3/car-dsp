@@ -129,7 +129,7 @@ class LyricsScreen(carContext: CarContext) : Screen(carContext) {
     private fun currentIndex(): Int {
         val s = sheet ?: return -1
         val p = FilePlayer.peek() ?: return -1
-        return s.indexAt(p.positionMs)
+        return s.indexAt(p.audiblePositionMs)
     }
 
     /** One lookup per screen; the cache in [Lyrics] makes a repeat open instant. */

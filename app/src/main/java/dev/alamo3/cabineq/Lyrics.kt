@@ -35,6 +35,12 @@ object Lyrics {
     private const val UA = "CabinEQ/0.1 (personal music player)"
     private const val HIT_TTL_MS = 30L * 24 * 3_600_000
     private const val MISS_TTL_MS = 7L * 24 * 3_600_000
+    private const val EXACT_DURATION_WAIT_MS = 10_000L
+    /**
+     * Timed lyrics belong to one edit of a song. LRCLIB itself accepts ±2 s; a few more seconds
+     * covers a remaster's silence, anything beyond is another version whose lines land elsewhere.
+     */
+    private const val MAX_DURATION_DELTA_S = 4.0
 
     /** One lyric line. [atMs] is -1 for plain (untimed) lyrics. */
     data class Line(val atMs: Long, val text: String)
@@ -77,6 +83,17 @@ object Lyrics {
      * song exists but has no lyrics.
      */
     fun forPlayer(context: Context, player: FilePlayer): Sheet? {
+        // Lyrics are matched by the song's length, and until the decoder has opened the file the
+        // only length is the catalogue's (rounded, sometimes another edit's). Matching on it
+        // picked a different version of the song than a lookup a second later: the same lines at
+        // other times. Wait for the real one (a moment after the track starts loading).
+        val deadline = android.os.SystemClock.elapsedRealtime() + EXACT_DURATION_WAIT_MS
+        while (!player.durationExact && player.currentTrack != null &&
+            player.state == FilePlayer.State.LOADING &&
+            android.os.SystemClock.elapsedRealtime() < deadline
+        ) {
+            android.os.SystemClock.sleep(150)
+        }
         val q = queryOf(player) ?: return null
         return load(context, q.title, q.artist, q.album, q.durationMs, q.isrc)
     }
@@ -196,9 +213,21 @@ object Lyrics {
         getPath(main, -1)
         if (artist != null && !artist.equals(main, ignoreCase = true)) getPath(artist.trim(), -1)
 
+        // Words only, from a record whose timings are for another edit: better than nothing, and
+        // never highlighted, so it can't be out of sync.
+        var untimed: Sheet? = null
         for (path in attempts) {
             when (val r = get(path)) {
-                is JSONObject -> parse(r)?.let { return it }
+                is JSONObject -> parse(r)?.let { sheet ->
+                    // The no-duration retries return whatever record matches the name, which
+                    // may be a different edit: timed lyrics only count if the length agrees.
+                    if (sheet.synced && !lengthAgrees(r, sec)) {
+                        Log.i(TAG, "\"$clean\": record is ${r.optDouble("duration")}s, song is ${sec}s — not this edit")
+                        if (untimed == null) untimed = parse(r, timed = false)
+                    } else {
+                        return sheet
+                    }
+                }
                 NotFound -> Unit
                 else -> Unit       // HTTP/network trouble: [get] already logged it
             }
@@ -222,6 +251,11 @@ object Lyrics {
                 val d = o.optDouble("duration", -1.0)
                 val near = if (d > 0 && sec > 0) kotlin.math.abs(d - sec) else if (d > 0) 20.0 else 0.0
                 if (near > 15.0 && !sameTitle) continue     // a different recording
+                // Same title but another length is another edit: its lines land at other times.
+                if (sheet.synced && sec > 0 && d > 0 && near > MAX_DURATION_DELTA_S) {
+                    if (untimed == null) untimed = parse(o, timed = false)
+                    continue
+                }
                 var score = near
                 if (!sameTitle) score += 40.0              // prefer the song that was asked for
                 if (sheet.synced) score -= 10.0
@@ -232,7 +266,7 @@ object Lyrics {
             }
             if (best != null) break                        // first search that produced a hit
         }
-        return best
+        return best ?: untimed
     }
 
     /** A song found by a line of its lyrics. */
@@ -255,6 +289,13 @@ object Lyrics {
             if (out.size >= limit) break
         }
         return out
+    }
+
+    /** Does the record's length match the song's, as far as both are known? */
+    private fun lengthAgrees(o: JSONObject, sec: Long): Boolean {
+        val d = o.optDouble("duration", -1.0)
+        if (sec <= 0 || d <= 0) return true       // nothing to compare: take the name match
+        return kotlin.math.abs(d - sec) <= MAX_DURATION_DELTA_S
     }
 
     private fun get(path: String): Any? {
@@ -286,8 +327,9 @@ object Lyrics {
         return o.optString(key).trim().takeIf { it.isNotEmpty() && it != "null" }
     }
 
-    private fun parse(o: JSONObject): Sheet? {
-        str(o, "syncedLyrics")?.let { synced ->
+    /** [timed] false skips the timings: the words of an edit whose lines would land elsewhere. */
+    private fun parse(o: JSONObject, timed: Boolean = true): Sheet? {
+        if (timed) str(o, "syncedLyrics")?.let { synced ->
             val lines = parseLrc(synced)
             if (lines.size > 1) return Sheet(lines, plain = false, source = "LRCLIB")
         }
@@ -345,9 +387,10 @@ object Lyrics {
 
     /** ISRC is the stable identity; the fallback ignores the album so a compilation still hits. */
     private fun keyOf(title: String, artist: String?, durationMs: Long, isrc: String?): String {
-        isrc?.takeIf { it.isNotBlank() }?.let { return "isrc:" + it.trim().uppercase() }
+        // "v2": sheets cached before lookups checked the length may be another edit's timings.
+        isrc?.takeIf { it.isNotBlank() }?.let { return "v2|isrc:" + it.trim().uppercase() }
         val sec = if (durationMs > 5_000) (durationMs / 1000).toString() else "?"
-        return norm(title) + "|" + norm(artist.orEmpty()) + "|" + sec
+        return "v2|" + norm(title) + "|" + norm(artist.orEmpty()) + "|" + sec
     }
 
     private fun norm(s: String): String = cleanTitle(s).lowercase()

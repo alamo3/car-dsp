@@ -997,7 +997,7 @@ class MusicActivity : Activity() {
     private fun updateLyricsHighlight(force: Boolean = false) {
         val sheet = lyricSheet ?: return
         if (!sheet.synced || lyricViews.isEmpty()) return
-        val idx = sheet.indexAt(player.positionMs)
+        val idx = sheet.indexAt(player.audiblePositionMs)
         if (idx != lyricIndex || force) {
             lyricIndex = idx
             lyricViews.forEachIndexed { i, v ->

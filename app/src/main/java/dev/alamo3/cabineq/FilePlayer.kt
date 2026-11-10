@@ -62,6 +62,12 @@ class FilePlayer private constructor(private val context: Context) {
     @Volatile var lastProgressAt = 0L
         private set
     @Volatile var durationMs = 0L
+    /**
+     * True once [durationMs] is the decoder's own length rather than what the catalogue
+     * claimed. Lyrics are matched by length, so they wait for this.
+     */
+    @Volatile var durationExact = false
+        private set
         private set
     /** e.g. "FLAC 44.1 kHz / 16-bit · lossless" */
     @Volatile var formatInfo: String? = null
@@ -866,6 +872,7 @@ class FilePlayer private constructor(private val context: Context) {
                     lastProgressAt = SystemClock.elapsedRealtime()
                     // Known length from the source until the decoder reports the real one.
                     durationMs = track.durationMs
+                    durationExact = false
                     formatInfo = null
                     if (state != State.PAUSED) setState(State.LOADING) else version++
                     extendRadioIfNeeded()
@@ -1006,6 +1013,7 @@ class FilePlayer private constructor(private val context: Context) {
                 val mime = inFormat.getString(MediaFormat.KEY_MIME) ?: return Outcome.Failed("unknown format")
                 if (inFormat.containsKey(MediaFormat.KEY_DURATION)) {
                     durationMs = inFormat.getLong(MediaFormat.KEY_DURATION) / 1000
+                    durationExact = true
                 }
                 val sourceBits = if (inFormat.containsKey(KEY_BITS_PER_SAMPLE)) inFormat.getInteger(KEY_BITS_PER_SAMPLE) else 0
 
@@ -1312,6 +1320,22 @@ class FilePlayer private constructor(private val context: Context) {
     }
 
     fun routedDevice(): AudioDeviceInfo? = liveOutput?.routed()
+
+    /**
+     * Where the *listener* is in the track, for lyrics. [positionMs] is how far the decoder has
+     * got: it is ahead of the speaker by everything still queued in the AudioTrack (~200 ms,
+     * more after a gapless hand-over), so lines highlighted from it arrive early.
+     */
+    val audiblePositionMs: Long
+        get() {
+            val pos = positionMs
+            val o = liveOutput ?: return pos
+            val queued = runCatching {
+                val played = o.track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+                (o.framesWritten - played).coerceIn(0L, o.rate * 2L)
+            }.getOrDefault(0L)
+            return (pos - queued * 1000L / o.rate).coerceAtLeast(0)
+        }
 
     val outputSampleRate: Int? get() = liveOutput?.trackRate()
 
