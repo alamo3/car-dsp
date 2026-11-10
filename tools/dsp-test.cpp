@@ -90,5 +90,19 @@ int main() {
     float m5[5];
     run(spiked, 1.0f, false, m5);
     std::printf("clicks on an injected spike: %.0f (should be >= 1)\n", m5[4]);
-    return 0;
+
+    // Pass/fail, so CI and tools/check.sh can use this as a gate rather than a printout.
+    int bad = 0;
+    auto check = [&](const char* what, bool ok) {
+        std::printf("%-42s %s\n", what, ok ? "ok" : "FAIL");
+        if (!ok) ++bad;
+    };
+    check("limiter lands on its threshold", peak(lim) <= 0.8914f + 2e-3f);
+    check("limiter adds no discontinuity", maxJump(lim) <= maxJump(burst) + 1e-4);
+    check("fade-in reaches full scale in 15 ms", std::fabs(faded[2*721] - 0.5f) < 1e-3f);
+    check("true peak within 0.3 dB of ideal",
+          std::fabs(20*std::log10((double)m3[3] / 0.5)) < 0.3);
+    check("no clicks on a fast tone", m4[4] == 0);
+    check("click detector catches a spike", m5[4] >= 1);
+    return bad == 0 ? 0 : 1;
 }

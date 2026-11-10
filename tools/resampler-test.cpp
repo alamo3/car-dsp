@@ -80,7 +80,8 @@ int twoTrackCheck() {
 }
 
 int main() {
-    twoTrackCheck();
+    int bad = 0;
+    if (twoTrackCheck() != 0) ++bad;
     for (int block : {1, 37, 512, 1024, 4096}) {
         for (double f : {100.0, 1000.0, 10000.0, 19000.0}) {
             const int inRate = 44100, outRate = 48000, frames = 44100;
@@ -91,9 +92,14 @@ int main() {
             }
             auto out = run(inRate, outRate, in, block);
             const size_t n = out.size()/2;
-            std::printf("block %4d  %6.0f Hz  frames %zu (expect %d)  SNR %6.1f dB\n",
-                        block, f, n, frames*48000/44100, snr(out, outRate, f, 300, n-300));
+            const double quality = snr(out, outRate, f, 300, n - 300);
+            // 110 dB is far below what this filter does (~120) and far above the resampler it
+            // replaced; a regression that breaks the kernel lands here.
+            if (quality < 110.0) ++bad;
+            std::printf("block %4d  %6.0f Hz  frames %zu (expect %d)  SNR %6.1f dB%s\n",
+                        block, f, n, frames*48000/44100, quality, quality < 110.0 ? "  FAIL" : "");
         }
     }
-    return 0;
+    if (bad > 0) std::printf("%d resampler check(s) FAILED\n", bad);
+    return bad == 0 ? 0 : 1;
 }

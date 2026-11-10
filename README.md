@@ -291,6 +291,34 @@ under-correct deliberately. A proper least-squares solve (evaluate the designed 
 until the residual is minimal) is the next step — under-correcting sounds like a smaller
 improvement, over-correcting sounds broken.
 
+### Testing without a phone
+
+**`tools/check.sh`** is the closed loop: it builds and runs the two native harnesses
+(`dsp-test`, `resampler-test`), then the JVM tests and lint, and exits non-zero on the first
+regression. Both native harnesses now *assert* rather than print — the limiter must land on its
+threshold with no added discontinuity, the fade-in must reach full scale in 15 ms, the true-peak
+meter must be within 0.3 dB, the click detector must ignore a 19 kHz tone and catch a spike, and
+the resampler must stay above 110 dB SNR (it does ~120) with a second track starting clean.
+
+```
+tools/check.sh          # everything
+tools/check.sh native   # the C++ harnesses only, seconds, no Gradle
+tools/check.sh gradle   # tests + lint
+```
+
+**`tools/dhu.sh [serial] [1080p|720p]`** runs Google's Desktop Head Unit against the phone over
+USB: the car's screen becomes a window on this machine, so it can be screenshot with
+`adb exec-out screencap -p` and clicked without reaching for the phone. It loads the DHU's own
+libraries (`extras/google/auto/libs`), which it needs to start at all.
+
+**Emulators do not work on this machine** (recorded here so nobody re-discovers it): both the
+phone image (API 37, Play) and the AAOS image (API 35) core-dump right after GPU init, in five
+configurations — headless and windowed, software GPU, Vulkan disabled, KVM on and off, 1.5 GB
+RAM — with KVM itself reported healthy and ~2 GB free. When that changes, an AAOS AVD is the
+useful one for layout work; it will **not** reproduce "the car does not list our app", because
+emulators advertise a modern host capability set (which is exactly why OpenHeadUnit self-mode
+showed the app fine while the real car did not).
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are
