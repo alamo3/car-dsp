@@ -311,13 +311,31 @@ USB: the car's screen becomes a window on this machine, so it can be screenshot 
 `adb exec-out screencap -p` and clicked without reaching for the phone. It loads the DHU's own
 libraries (`extras/google/auto/libs`), which it needs to start at all.
 
-**Emulators do not work on this machine** (recorded here so nobody re-discovers it): both the
-phone image (API 37, Play) and the AAOS image (API 35) core-dump right after GPU init, in five
-configurations — headless and windowed, software GPU, Vulkan disabled, KVM on and off, 1.5 GB
-RAM — with KVM itself reported healthy and ~2 GB free. When that changes, an AAOS AVD is the
-useful one for layout work; it will **not** reproduce "the car does not list our app", because
-emulators advertise a modern host capability set (which is exactly why OpenHeadUnit self-mode
-showed the app fine while the real car did not).
+**`tools/emulator.sh`** is the emulator loop, and it works now:
+
+```
+tools/emulator.sh                        # boot (if needed), build x86_64, install, launch, screenshot
+SEED_PREFS=/tmp/seed.xml tools/emulator.sh   # …and seed prefs first (e.g. the addon link)
+tools/emulator.sh --shot                 # screenshot the running emulator
+tools/emulator.sh --stop                 # shut it down
+```
+
+Three things had to be discovered to make it work, all recorded in the script:
+
+- **`-gpu host`, not SwiftShader.** With `-gpu swiftshader_indirect` (or `-gpu guest`) QEMU
+  segfaults in SwiftShader's `libGLESv2.so` on a RenderThread about two seconds into boot — found
+  with gdb, not guessed. `-gpu host` boots the AAOS image in ~12 s. Memory was never the problem.
+- **AAOS runs the app as user 10**, the driver profile. Seeding prefs with `run-as` writes user 0
+  and the app still looks unconfigured; the script uses `adb root` (the AOSP image allows it) to
+  write the file for every user the app is installed under, with the app's own uid.
+- **The car-app screens can't be opened on AAOS through the media card.** The system logs
+  `MediaDispatcherActivity: Application did not set CarAppActivity component`, because the
+  dispatcher looks for `androidx.car.app.activity.CarAppActivity`, which the CAL 1.9 artifact no
+  longer ships. The media UI, playback, the DSP, search and the app's own screens all work in the
+  emulator; for the template (grid/lyrics) screens, use `tools/dhu.sh` against the phone.
+
+Verified in the emulator: install, launch in the car's window, the Nebula addon search returning
+real results with artwork, and screenshots via `screencap`.
 
 ## Android Auto / Automotive
 
