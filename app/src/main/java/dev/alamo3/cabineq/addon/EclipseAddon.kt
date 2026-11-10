@@ -329,6 +329,8 @@ class EclipseAddon(link: String) {
         trackId: String,
         maxWaitMs: Long = 5 * 60_000L,
         isCancelled: () -> Boolean = { false },
+        /** False: a "not ready" reply throws [AddonNotReady] at once instead of waiting it out. */
+        waitIfPending: Boolean = true,
         onNotice: (Notice?) -> Unit = {},
     ): Stream {
         val deadline = System.currentTimeMillis() + maxWaitMs
@@ -337,6 +339,7 @@ class EclipseAddon(link: String) {
                 is StreamResult.Ready -> return r.stream
                 is StreamResult.Pending -> {
                     onNotice(r.notice)
+                    if (!waitIfPending) throw AddonNotReady(r.notice, r.retryAfterSec)
                     if (System.currentTimeMillis() + r.retryAfterSec * 1000L > deadline) {
                         throw AddonException(
                             "Still not ready after ${maxWaitMs / 1000}s" + (r.notice?.message?.let { ": $it" } ?: ""), 503,
@@ -519,4 +522,8 @@ class EclipseAddon(link: String) {
     }
 }
 
-class AddonException(message: String, val status: Int, cause: Throwable? = null) : IOException(message, cause)
+open class AddonException(message: String, val status: Int, cause: Throwable? = null) : IOException(message, cause)
+
+/** The source answered "not ready yet" (TorBox is still caching the file) and the caller chose not to wait. */
+class AddonNotReady(val notice: EclipseAddon.Notice?, val retryAfterSec: Int) :
+    AddonException(notice?.message ?: "Still being prepared", 503)

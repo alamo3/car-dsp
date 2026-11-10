@@ -854,6 +854,8 @@ class FilePlayer private constructor(private val context: Context) {
         object Cancelled : Outcome()
         class Jump(val index: Int) : Outcome()
         class Failed(val message: String) : Outcome()
+        /** The source is still caching this song: play on, and come back when it is ready. */
+        class NotReady(val message: String) : Outcome()
     }
 
     private inner class Worker(private val gen: Int, private val start: Int, private var startAtMs: Long) : Runnable {
@@ -880,13 +882,49 @@ class FilePlayer private constructor(private val context: Context) {
             var index = start
             var consecutiveFailures = 0
             var lastOutcomeFailed = false
+            // Songs the source was still caching when their turn came (media id → when they were
+            // set aside). The first song and a song picked by a skip are waited for, with their
+            // progress shown; one reached by itself is set aside so the music does not stop.
+            val deferred = LinkedHashMap<String, Long>()
+            var explicit = true
+            var returning = false
+            var resumeAt = -1
             try {
                 while (live) {
+                    // A song that was still caching comes back as soon as it is on the phone.
+                    if (!returning && deferred.isNotEmpty()) {
+                        val back = readyDeferredIndex(deferred)
+                        if (back >= 0) {
+                            Log.i(TAG, "\"${queue[back].title}\" is ready now: playing it before the rest")
+                            resumeAt = index
+                            index = back
+                            returning = true
+                            explicit = false
+                        }
+                    }
                     if (index !in queue.indices) {
                         // End of the queue: loop it, or stop.
-                        if (repeat == Repeat.ALL && queue.isNotEmpty() && !lastOutcomeFailed) {
+                        if (repeat == Repeat.ALL && queue.isNotEmpty() && !lastOutcomeFailed && deferred.isEmpty()) {
                             index = 0
                             continue
+                        }
+                        // Songs still caching: wait for them rather than going silent.
+                        if (!returning && deferred.isNotEmpty()) {
+                            val back = waitForDeferred(deferred)
+                            if (back >= 0) {
+                                resumeAt = queue.size
+                                index = back
+                                returning = true
+                                explicit = false
+                                continue
+                            }
+                            val jump = jumpTo
+                            if (jump >= 0 && live) {
+                                jumpTo = -1
+                                index = jump
+                                explicit = true
+                                continue
+                            }
                         }
                         break
                     }
@@ -914,7 +952,7 @@ class FilePlayer private constructor(private val context: Context) {
                     queue.getOrNull(index + 1)?.let { MediaCache.prefetch(context, it) }
                     queue.getOrNull(index + 2)?.let { MediaCache.prefetch(context, it) }
                     val outcome = try {
-                        playTrack(track)
+                        playTrack(track, deferIfNotReady = !explicit && queue.size > 1)
                     } catch (e: Exception) {
                         Log.e(TAG, "Track ${queue.getOrNull(index)?.title} failed", e)
                         Outcome.Failed(e.message ?: e.javaClass.simpleName)
@@ -927,6 +965,8 @@ class FilePlayer private constructor(private val context: Context) {
                         consecutiveFailures = 0
                         reportSkip()
                         index = pendingJump
+                        returning = false
+                        explicit = true
                         continue
                     }
                     lastOutcomeFailed = outcome is Outcome.Failed
@@ -937,7 +977,22 @@ class FilePlayer private constructor(private val context: Context) {
                             if (repeat != Repeat.ONE) index++   // ONE: replay the same track
                         }
                         Outcome.Cancelled -> return
-                        is Outcome.Jump -> { consecutiveFailures = 0; reportSkip(); index = outcome.index }
+                        is Outcome.Jump -> {
+                            consecutiveFailures = 0
+                            reportSkip()
+                            index = outcome.index
+                            returning = false
+                            explicit = true
+                        }
+                        is Outcome.NotReady -> {
+                            consecutiveFailures = 0
+                            Log.i(TAG, "\"${track.title}\" is still caching (${outcome.message}): playing the next song, will come back to it")
+                            deferred[track.mediaId] = SystemClock.elapsedRealtime()
+                            // The request itself started the caching; keep fetching it in the
+                            // background so it is on the phone when its turn comes round again.
+                            MediaCache.prefetch(context, track, waitMs = DEFERRED_WAIT_MS)
+                            index++
+                        }
                         is Outcome.Failed -> {
                             lastError = "${queue.getOrNull(index)?.title}: ${outcome.message}"
                             if (++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -945,6 +1000,14 @@ class FilePlayer private constructor(private val context: Context) {
                                 return
                             }
                             index++
+                        }
+                    }
+                    if (outcome !is Outcome.Jump) {
+                        explicit = false
+                        // A song that came back from being set aside: carry on where the queue was.
+                        if (returning) {
+                            returning = false
+                            index = resumeAt
                         }
                     }
                 }
@@ -992,6 +1055,56 @@ class FilePlayer private constructor(private val context: Context) {
             }
         }
 
+        /** Index of a set-aside song that is on the phone now (removing it from [deferred]), else -1. */
+        private fun readyDeferredIndex(deferred: MutableMap<String, Long>): Int {
+            val q = queue
+            val now = SystemClock.elapsedRealtime()
+            val iter = deferred.entries.iterator()
+            var found = -1
+            while (iter.hasNext()) {
+                val entry = iter.next()
+                val i = q.indexOfFirst { it.mediaId == entry.key }
+                // Gone from the queue, or set aside too long ago to still be worth waiting for.
+                if (i < 0 || now - entry.value > DEFERRED_MAX_AGE_MS) {
+                    iter.remove()
+                    continue
+                }
+                if (found < 0 && MediaCache.fileFor(context, q[i]) != null) {
+                    found = i
+                    iter.remove()
+                }
+            }
+            return found
+        }
+
+        /**
+         * The queue has run out but songs were set aside while the source cached them: wait for
+         * the first to be ready. Returns its index, or -1 on a skip, a stop, or giving up.
+         */
+        private fun waitForDeferred(deferred: MutableMap<String, Long>): Int {
+            val giveUpAt = SystemClock.elapsedRealtime() + DEFERRED_WAIT_MS
+            var lastKick = 0L
+            while (live && SystemClock.elapsedRealtime() < giveUpAt) {
+                if (jumpTo >= 0) return -1
+                val back = readyDeferredIndex(deferred)
+                if (back >= 0) return back
+                if (deferred.isEmpty()) return -1
+                val now = SystemClock.elapsedRealtime()
+                val first = queue.firstOrNull { it.mediaId in deferred }
+                setNote("“${first?.title ?: "A song"}” is still caching on TorBox…")
+                if (state != State.PAUSED && state != State.LOADING) setState(State.LOADING)
+                if (now - lastKick > 15_000L) {
+                    lastKick = now
+                    // A no-op while its download is still running; restarts one that gave up.
+                    queue.filter { it.mediaId in deferred }
+                        .forEach { MediaCache.prefetch(context, it, waitMs = DEFERRED_WAIT_MS) }
+                }
+                SystemClock.sleep(300)
+            }
+            setNote(null)
+            return -1
+        }
+
         private fun outputFor(rate: Int): Output {
             output?.let { if (it.rate == rate) return it }
             output?.let { drain(it); it.release() }
@@ -1011,7 +1124,7 @@ class FilePlayer private constructor(private val context: Context) {
             }
         }
 
-        private fun playTrack(item: Track): Outcome {
+        private fun playTrack(item: Track, deferIfNotReady: Boolean = false): Outcome {
             // Resolving can block for minutes (TorBox caching, addon 503/Retry-After), so it runs
             // here on the player thread and publishes progress through the note.
             // A pending skip must abandon a slow resolve (TorBox can wait minutes), otherwise
@@ -1020,12 +1133,18 @@ class FilePlayer private constructor(private val context: Context) {
             // song on the phone starts at once and plays with no network at all.
             val cached = MediaCache.fileFor(context, item)
             val url = if (cached != null) "" else {
-                val resolved = TrackResolver.resolve(
-                    context,
-                    item,
-                    onNote = { setNote(it) },
-                    isCancelled = { !live || jumpTo >= 0 },
-                )
+                val resolved = try {
+                    TrackResolver.resolve(
+                        context,
+                        item,
+                        onNote = { setNote(it) },
+                        isCancelled = { !live || jumpTo >= 0 },
+                        waitIfPending = !deferIfNotReady,
+                    )
+                } catch (e: dev.alamo3.cabineq.addon.AddonNotReady) {
+                    note = null
+                    return Outcome.NotReady(e.message ?: "still caching")
+                }
                 declaredQuality = resolved.quality
                 resolved.url
             }
@@ -1430,6 +1549,10 @@ class FilePlayer private constructor(private val context: Context) {
         private const val STALL_MS = 4_000L
         /** How long a skip may wait for the busy worker before a fresh one takes over. */
         private const val SKIP_PICKUP_MS = 600L
+        /** How long to wait for set-aside songs once nothing else is left to play. */
+        private const val DEFERRED_WAIT_MS = 5 * 60_000L
+        /** A song set aside this long ago is dropped from the list of ones to come back to. */
+        private const val DEFERRED_MAX_AGE_MS = 10 * 60_000L
         /** A rebuilt sink gets this long before another stall is treated as fatal. */
         private const val STALL_REBUILD_WINDOW_MS = 30_000L
 

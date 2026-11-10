@@ -67,7 +67,7 @@ object MediaCache {
      * Downloads [track] in the background unless it is already cached, caching is off, or the
      * network policy forbids it. [url] skips resolution when the caller already has one.
      */
-    fun prefetch(context: Context, track: Track, url: String? = null) {
+    fun prefetch(context: Context, track: Track, url: String? = null, waitMs: Long = PREFETCH_WAIT_MS) {
         val app = context.applicationContext
         val settings = Settings(app)
         if (!settings.cacheEnabled) return
@@ -86,7 +86,7 @@ object MediaCache {
             try {
                 val max = settings.cacheMaxMb.toLong() * 1024 * 1024
                 val resolvedUrl = url ?: runCatching {
-                    TrackResolver.resolve(app, track, { }, { false }, PREFETCH_WAIT_MS).url
+                    TrackResolver.resolve(app, track, { }, { false }, waitMs).url
                 }.getOrNull()
                 if (resolvedUrl == null) {
                     Log.i(TAG, "skip ${track.title}: no stream URL")

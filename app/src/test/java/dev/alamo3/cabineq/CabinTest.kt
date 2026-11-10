@@ -205,6 +205,8 @@ class CabinTest {
     check("stream: notice progress parsed", notices[0]?.title == "Waiting on TorBox" && notices[1]?.progress == 0.8, notices)
     check("stream: waited ~2s", System.currentTimeMillis() - t0 in 1800..6000)
     check("stream: metadata", st.sampleRate == 44100 && st.bitDepth == 16 && st.format == "flac")
+    val notReady = runCatching { EclipseAddon(addonLink).resolveStream("fresh2", waitIfPending = false) }.exceptionOrNull()
+    check("stream: a not-ready song can be set aside instead of waited for", notReady is dev.alamo3.cabineq.addon.AddonNotReady, notReady)
     val cancelled = runCatching { EclipseAddon(addonLink).resolveStream("fresh", isCancelled = { true }) }.exceptionOrNull()
     check("stream: cancellable while waiting", cancelled is AddonException && cancelled.message == "Cancelled", cancelled)
     val missing = runCatching { nebula.streamOnce("missing") }.exceptionOrNull()

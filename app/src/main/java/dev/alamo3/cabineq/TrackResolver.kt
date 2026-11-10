@@ -33,6 +33,8 @@ object TrackResolver {
         onNote: (String?) -> Unit,
         isCancelled: () -> Boolean,
         maxWaitMs: Long = 5 * 60_000L,
+        /** False: throw [dev.alamo3.cabineq.addon.AddonNotReady] when the source is still caching. */
+        waitIfPending: Boolean = true,
     ): Resolved {
         track.streamUrl?.let { return Resolved(it) }
         val settings = Settings(context)
@@ -52,6 +54,7 @@ object TrackResolver {
                     maxWaitMs = maxWaitMs,
                     isCancelled = isCancelled,
                     onNotice = { onNote(describe(it)) },
+                    waitIfPending = waitIfPending,
                 ).let { Resolved(it.url, it.quality) }
             }
             Track.Source.TORBOX -> {
