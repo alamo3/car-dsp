@@ -55,6 +55,8 @@ object Taste {
         val events = ArrayList<Event>()
         val liked = HashSet<String>()
         val disliked = HashSet<String>()
+        /** Artist key -> name as written. */
+        val blocked = HashMap<String, String>()
     }
 
     private val io = Executors.newSingleThreadExecutor { r ->
@@ -127,6 +129,47 @@ object Taste {
             s.disliked.removeAll(ks.toSet())
         }
         record(context, track, Kind.LIKE, 1f)
+        runCatching { Library.setLiked(context, track, true) }
+    }
+
+    /** Takes a like back: the song leaves Liked songs and its like stops counting. */
+    fun unlike(context: Context, track: Track) {
+        val s = store(context)
+        val ks = keys(track).toSet()
+        synchronized(s) {
+            s.liked.removeAll(ks)
+            s.events.removeAll { it.kind == Kind.LIKE && it.matches(ks) }
+        }
+        version++
+        ui.removeCallbacks(saveTask)
+        ui.postDelayed(saveTask, 1500)
+        runCatching { Library.setLiked(context, track, false) }
+    }
+
+    // ---------------------------------------------------------------- blocked artists
+
+    /** Artists the listener said never to recommend, as they wrote them. */
+    fun blockedArtists(context: Context): List<String> =
+        synchronized(store(context)) { store(context).blocked.values.sorted() }
+
+    fun isArtistBlocked(context: Context, artist: String?): Boolean {
+        val k = artistKey(artist) ?: return false
+        return synchronized(store(context)) { k in store(context).blocked }
+    }
+
+    /**
+     * "Never play this artist": an explicit choice, unlike a dislike (which is about one song).
+     * Only recommendations are affected — search and your own playlists still play them.
+     */
+    fun setArtistBlocked(context: Context, artist: String, blocked: Boolean) {
+        val k = artistKey(artist) ?: return
+        val s = store(context)
+        synchronized(s) {
+            if (blocked) s.blocked[k] = artist.split(',').first().trim() else s.blocked.remove(k)
+        }
+        version++
+        ui.removeCallbacks(saveTask)
+        ui.postDelayed(saveTask, 1500)
     }
 
     fun dislike(context: Context, track: Track) {
@@ -137,6 +180,7 @@ object Taste {
             s.liked.removeAll(ks.toSet())
         }
         record(context, track, Kind.DISLIKE, 1f)
+        runCatching { Library.setLiked(context, track, false) }
     }
 
     fun isLiked(context: Context, track: Track): Boolean {
@@ -256,6 +300,7 @@ object Taste {
         val albums = HashMap<String, Float>()
         val liked: Set<String>
         val disliked: Set<String>
+        val blocked: Set<String>
         val skippedRecently = HashSet<String>()
         /** Last time each song was played (any key), for the "not again so soon" rule. */
         val lastPlayed = HashMap<String, Long>()
@@ -267,6 +312,7 @@ object Taste {
         synchronized(s) {
             liked = HashSet(s.liked)
             disliked = HashSet(s.disliked)
+            blocked = HashSet(s.blocked.keys)
             for (e in s.events) {
                 val ks = listOfNotNull(e.key, e.alt)
                 // What you just skipped is the loudest "not this" there is, for this session.
@@ -292,7 +338,7 @@ object Taste {
         // takes a decaying penalty through the affinity above (-3.6 per dislike, fading over
         // weeks), which the radio caps, so their other songs can still come up.
         skippedRecently.removeAll(liked)
-        val p = Profile(tracks, artists, albums, liked, disliked, skippedRecently, lastPlayed, heard, knownArtists, artistNames)
+        val p = Profile(tracks, artists, albums, liked, disliked, skippedRecently, lastPlayed, heard, knownArtists, artistNames, blocked)
         cached = p
         cachedVersion = v
         return p
@@ -343,6 +389,12 @@ object Taste {
                     }
                     o.optJSONArray("liked")?.let { for (i in 0 until it.length()) s.liked.add(normalizeStored(it.optString(i))) }
                     o.optJSONArray("disliked")?.let { for (i in 0 until it.length()) s.disliked.add(normalizeStored(it.optString(i))) }
+                    o.optJSONArray("blockedArtists")?.let {
+                        for (i in 0 until it.length()) {
+                            val name = it.optString(i)
+                            artistKey(name)?.let { k -> s.blocked[k] = name }
+                        }
+                    }
                 }.onFailure { Log.w(TAG, "Couldn't read the taste file: ${it.message}") }
             }
             store = s
@@ -371,6 +423,7 @@ object Taste {
                     })
                     .put("liked", JSONArray(s.liked.toList()))
                     .put("disliked", JSONArray(s.disliked.toList()))
+                    .put("blockedArtists", JSONArray(s.blocked.values.toList()))
                     .toString()
             }
             runCatching { s.file.writeText(text) }
@@ -394,13 +447,21 @@ class Profile(
     private val heard: Map<String, Int> = emptyMap(),
     private val knownArtists: Set<String> = emptySet(),
     private val artistNames: Map<String, String> = emptyMap(),
+    private val blockedArtists: Set<String> = emptySet(),
 ) {
     private fun artistKey(t: Track) = Taste.artistKey(t.artist)
 
     fun isLiked(t: Track): Boolean = Taste.keys(t).any { it in liked }
 
     /** This song was disliked. Its artist is not: see [Taste.profile]. */
-    fun isDisliked(t: Track): Boolean = Taste.keys(t).any { it in disliked }
+    fun isDisliked(t: Track): Boolean = Taste.keys(t).any { it in disliked } || isBlocked(t)
+
+    /** By an artist the listener blocked — every credited artist counts, not just the first. */
+    fun isBlocked(t: Track): Boolean {
+        if (blockedArtists.isEmpty()) return false
+        val names = t.artist?.split(',', '&')?.flatMap { it.split(Regex("(?i)\\s+(feat|ft|featuring|x)\\.?\\s+")) }.orEmpty()
+        return names.any { Taste.artistKey(it) in blockedArtists } || Taste.artistKey(t.artist) in blockedArtists
+    }
 
     fun skippedRecently(t: Track): Boolean = !isLiked(t) && Taste.keys(t).any { it in skippedRecently }
 
@@ -422,7 +483,7 @@ class Profile(
      * independent of what is playing (the caller adds the session term).
      */
     fun score(t: Track): Float {
-        if (Taste.keys(t).any { it in disliked }) return -10f
+        if (Taste.keys(t).any { it in disliked } || isBlocked(t)) return -10f
         // Skipped in the last half hour: don't offer it again in this session.
         if (skippedRecently(t)) return -6f
         var s = trackAffinity(t)

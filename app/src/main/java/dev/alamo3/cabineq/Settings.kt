@@ -99,6 +99,14 @@ class Settings(context: Context) {
         set(v) = prefs.edit().putFloat(KEY_SIM_KMH, v).apply()
 
     /** TorBox API key (TorBox dashboard → Settings → API). Stored in app-private prefs. */
+    /**
+     * Shifts timed lyrics: positive shows lines earlier. For what the app can't measure — a
+     * Bluetooth link's delay, a car screen's refresh.
+     */
+    var lyricsOffsetMs: Int
+        get() = prefs.getInt("lyrics_offset_ms", 0)
+        set(v) = prefs.edit().putInt("lyrics_offset_ms", v.coerceIn(-5000, 5000)).apply()
+
     var torboxApiKey: String
         get() = secrets.getString(KEY_TORBOX_KEY, "") ?: ""
         set(v) = secrets.edit().putString(KEY_TORBOX_KEY, v.trim()).apply()

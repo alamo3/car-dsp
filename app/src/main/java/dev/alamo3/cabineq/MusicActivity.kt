@@ -111,6 +111,11 @@ class MusicActivity : Activity() {
                 shownDownloads = v
                 downloadRefresh?.invoke()
             }
+            val lv = Library.version
+            if (lv != shownLibrary) {
+                shownLibrary = lv
+                libraryRefresh?.invoke()
+            }
             handler.postDelayed(this, 500)
         }
     }
@@ -123,6 +128,12 @@ class MusicActivity : Activity() {
             handler.postDelayed(this, 100)
         }
     }
+
+    private lateinit var fullLike: TextView
+    private lateinit var fullWhy: TextView
+    /** Redraws a library page when the library changes underneath it. */
+    private var libraryRefresh: (() -> Unit)? = null
+    private var shownLibrary = -1
 
     /** Redraws the download status on the page being shown, when there is one. */
     private var downloadRefresh: (() -> Unit)? = null
@@ -352,6 +363,9 @@ class MusicActivity : Activity() {
         fullArtist = Ui.text(this, "", 17f, Ui.ACCENT)
         titles.addView(fullTitle)
         titles.addView(fullArtist)
+        // Why the radio picked this one; empty for songs the listener chose.
+        fullWhy = Ui.text(this, "", 12f, Ui.TEXT_2, lines = 2).apply { setPadding(0, dp(4), 0, 0) }
+        titles.addView(fullWhy)
         col.addView(titles, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         fullSeek = SeekBar(this).apply {
@@ -401,20 +415,25 @@ class MusicActivity : Activity() {
             gravity = Gravity.CENTER
             setPadding(0, 0, 0, dp(12))
         }
-        feedback.addView(Ui.pill(this, "♡  Like", filled = false) {
+        fullLike = Ui.pill(this, "♡  Like", filled = false) {
             player.currentTrack?.let {
-                Taste.like(this, it)
-                showMessage("More like this")
+                // A toggle: liked songs live in the library, and a like can be taken back.
+                if (Library.isLiked(this, it)) Taste.unlike(this, it) else Taste.like(this, it)
+                shownVersion = -1
                 refreshSoon()
             }
-        }, wrapLp().apply { rightMargin = dp(10) })
+        }
+        feedback.addView(fullLike, wrapLp().apply { rightMargin = dp(8) })
         feedback.addView(Ui.pill(this, "✕  Not for me", filled = false) {
             player.currentTrack?.let {
                 Taste.dislike(this, it)
-                showMessage("Got it — less like this")
-                refreshSoon()
+                toast("Less like this — skipping")
+                transport { player.next() }
             }
-        }, wrapLp().apply { leftMargin = dp(10) })
+        }, wrapLp().apply { rightMargin = dp(8) })
+        feedback.addView(Ui.pill(this, "⋯", filled = false) {
+            player.currentTrack?.let { showTrackMenu(it, nowPlaying = true) }
+        }, wrapLp())
         col.addView(feedback)
 
         // Queue loop: off -> all -> one, persisted and also honoured by the car.
@@ -470,6 +489,7 @@ class MusicActivity : Activity() {
         lyricsOpen = false
         handler.removeCallbacks(lyricTicker)
         downloadRefresh = null
+        libraryRefresh = null
         lyricsBlock = null
         lyricViews = ArrayList()
     }
@@ -488,6 +508,19 @@ class MusicActivity : Activity() {
                 "Paste the Nebula link you installed in Eclipse (Settings → Connections). Search uses Apple Music's catalog; audio streams from your TorBox.",
                 "Connect",
             ) { navigate { renderSettings() } })
+        }
+
+        // The listener's own collection.
+        val likedCount = Library.liked(this).size
+        val playlistCount = Library.playlists(this).size
+        val albumCount = Library.albums(this).size
+        page.addView(sectionTitle("Library"))
+        page.addView(simpleRow("Liked songs", if (likedCount == 0) "Tap ♡ on a song to keep it here" else "$likedCount songs",
+            android.R.drawable.btn_star_big_on) { navigate { renderLiked() } })
+        page.addView(simpleRow("Playlists", if (playlistCount == 0) "Make your own, or import one" else "$playlistCount playlists",
+            android.R.drawable.ic_menu_sort_by_size) { navigate { renderPlaylists() } })
+        if (albumCount > 0) {
+            page.addView(simpleRow("Albums", "$albumCount saved", android.R.drawable.ic_menu_gallery) { navigate { renderSavedAlbums() } })
         }
 
         // On the phone already: first, because it is what works with no signal.
@@ -630,6 +663,7 @@ class MusicActivity : Activity() {
         val sub = listOfNotNull(t.artist.ifBlank { null }, t.album).joinToString(" · ")
         if (sub.isNotBlank()) texts.addView(Ui.text(this, sub, 13f, Ui.TEXT_2).apply { setPadding(0, dp(3), 0, 0) })
         row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.setOnLongClickListener { showTrackMenu(t.toTrack(), nowPlaying = false); true }
         // "⤓": already on the phone (downloaded or prefetched), so it starts instantly.
         val local = runCatching { MediaCache.fileFor(this, t.toTrack()) != null }.getOrDefault(false)
         val right = listOfNotNull("⤓".takeIf { local },
@@ -817,6 +851,14 @@ class MusicActivity : Activity() {
             } else {
                 holder.addView(Ui.text(this, downloadLine(Downloads.status(this, c)), 13f, Ui.TEXT_2, lines = 2)
                     .apply { gravity = Gravity.CENTER })
+                // The list grew since it was downloaded (new likes, songs added to a playlist).
+                val have = c.tracks.map { it.mediaId }.toHashSet()
+                val fresh = queue.count { it.mediaId !in have && (it.sourceId != null || it.source == Track.Source.TORBOX) }
+                if (fresh > 0) {
+                    holder.addView(Ui.pill(this, "⤓  Download $fresh new", filled = false) {
+                        Downloads.add(this, title, artworkUrl, queue)
+                    }, wrapLp(top = 8))
+                }
             }
         }
         draw()
@@ -869,6 +911,216 @@ class MusicActivity : Activity() {
         c.tracks.forEachIndexed { i, t ->
             box.addView(numberedRow(i + 1, t.title, t.artist, if (t.durationMs > 0) Ui.mmss(t.durationMs) else null) {
                 play(c.tracks, i, c.title)
+            })
+        }
+    }
+
+    private fun toast(text: String) =
+        android.widget.Toast.makeText(this, text, android.widget.Toast.LENGTH_SHORT).show()
+
+    // ---------------------------------------------------------------------------------
+    // Library
+
+    /** Actions for one song: from the player's "⋯" and from a long-press on a song row. */
+    private fun showTrackMenu(track: Track, nowPlaying: Boolean) {
+        val artist = track.artist?.split(',')?.first()?.trim()?.takeIf { it.isNotBlank() }
+        val liked = Library.isLiked(this, track)
+        val blocked = artist != null && Taste.isArtistBlocked(this, artist)
+        val why = Radio.reasonFor(track)
+        val labels = ArrayList<String>()
+        val actions = ArrayList<() -> Unit>()
+        fun item(label: String, action: () -> Unit) { labels += label; actions += action }
+        item("Add to playlist…") { choosePlaylist(track) }
+        if (!nowPlaying) {
+            item("Add to queue") { player.enqueue(listOf(track)); toast("Added to the queue") }
+            item(if (liked) "Remove from Liked songs" else "Like") {
+                if (liked) Taste.unlike(this, track) else Taste.like(this, track)
+            }
+        }
+        if (track.sourceId != null) item("Start radio from this song") { play(listOf(track), 0, track.title, radio = track) }
+        if (artist != null) {
+            item(if (blocked) "Allow $artist in recommendations" else "Never recommend $artist") {
+                Taste.setArtistBlocked(this, artist, !blocked)
+                toast(if (blocked) "$artist can be recommended again" else "$artist won't be recommended")
+                // Blocking the artist that is playing from the radio moves on at once.
+                if (!blocked && nowPlaying && why != null) transport { player.next() }
+            }
+        }
+        if (why != null) {
+            item("Why this song?") {
+                android.app.AlertDialog.Builder(this).setTitle(track.title)
+                    .setMessage("The radio picked it: $why.\n\n♡ pulls recommendations towards songs like it; " +
+                        "“Not for me” removes it for good and makes its artist come up less.")
+                    .setPositiveButton("OK", null).show()
+            }
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle(listOfNotNull(track.title, artist).joinToString(" — "))
+            .setItems(labels.toTypedArray()) { _, which -> actions[which]() }
+            .show()
+    }
+
+    private fun choosePlaylist(track: Track) {
+        val lists = Library.playlists(this)
+        val labels = (listOf("＋  New playlist…") + lists.map { "${it.name}  (${it.tracks.size})" }).toTypedArray()
+        android.app.AlertDialog.Builder(this).setTitle("Add to playlist")
+            .setItems(labels) { _, which ->
+                if (which == 0) {
+                    askPlaylistName { name ->
+                        Library.createPlaylist(this, name, listOf(track))?.let { toast("Added to ${it.name}") }
+                    }
+                } else {
+                    val p = lists[which - 1]
+                    toast(if (Library.addToPlaylist(this, p.id, track)) "Added to ${p.name}" else "Already in ${p.name}")
+                }
+            }.show()
+    }
+
+    private fun askPlaylistName(onName: (String) -> Unit) {
+        val input = EditText(this).apply {
+            hint = "Playlist name"
+            isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        val frame = android.widget.FrameLayout(this).apply {
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(input)
+        }
+        android.app.AlertDialog.Builder(this).setTitle("New playlist").setView(frame)
+            .setPositiveButton("Create") { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isNotEmpty()) onName(name)
+            }
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    /** A list of songs from the library: play, shuffle, download, and per-song actions. */
+    private fun addLibraryTracks(
+        box: LinearLayout,
+        title: String,
+        artworkUrl: String?,
+        tracks: List<Track>,
+        onRemove: ((Track) -> Unit)?,
+    ) {
+        addPlayShuffle(box, tracks, title, "${tracks.size} songs")
+        addDownloadRow(box, title, artworkUrl ?: tracks.firstNotNullOfOrNull { it.artworkUrl }, tracks)
+        tracks.forEachIndexed { i, t ->
+            val local = runCatching { MediaCache.fileFor(this, t) != null }.getOrDefault(false)
+            val right = listOfNotNull("⤓".takeIf { local }, if (t.durationMs > 0) Ui.mmss(t.durationMs) else null).joinToString("  ")
+            val row = numberedRow(i + 1, t.title, t.artist, right.ifBlank { null }) { play(tracks, i, title) }
+            row.setOnLongClickListener {
+                if (onRemove == null) showTrackMenu(t, nowPlaying = false) else {
+                    android.app.AlertDialog.Builder(this).setTitle(t.title)
+                        .setItems(arrayOf("Remove from “$title”", "More…")) { _, which ->
+                            if (which == 0) onRemove(t) else showTrackMenu(t, nowPlaying = false)
+                        }.show()
+                }
+                true
+            }
+            box.addView(row)
+        }
+    }
+
+    private fun renderLiked() {
+        clearPage()
+        page.addView(backRow())
+        page.addView(Ui.text(this, "Liked songs", 24f, bold = true).apply { setPadding(0, dp(4), 0, dp(8)) })
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        page.addView(box)
+        val draw = {
+            box.removeAllViews()
+            val tracks = Library.liked(this)
+            if (tracks.isEmpty()) {
+                box.addView(Ui.text(this, "Nothing here yet. Tap ♡ in the player (or in the car) and the song is kept here.",
+                    14f, Ui.TEXT_2, lines = 3).apply { setPadding(0, dp(12), 0, 0) })
+            } else {
+                addLibraryTracks(box, "Liked songs", null, tracks) { Taste.unlike(this, it) }
+                box.addView(Ui.text(this, "Hold a song to remove it or add it to a playlist.", 12f, Ui.TEXT_2)
+                    .apply { setPadding(0, dp(12), 0, 0) })
+            }
+        }
+        draw()
+        libraryRefresh = { draw() }
+    }
+
+    private fun renderPlaylists() {
+        clearPage()
+        page.addView(backRow())
+        page.addView(Ui.text(this, "Playlists", 24f, bold = true).apply { setPadding(0, dp(4), 0, dp(8)) })
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, 0, 0, dp(8)) }
+        actions.addView(Ui.pill(this, "＋  New playlist", filled = true) {
+            askPlaylistName { name -> Library.createPlaylist(this, name)?.let { p -> navigate { renderUserPlaylist(p.id) } } }
+        }, wrapLp().apply { rightMargin = dp(8) })
+        actions.addView(Ui.pill(this, "Import…", filled = false) { navigate { renderImport() } }, wrapLp())
+        page.addView(actions)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        page.addView(box)
+        val draw = {
+            box.removeAllViews()
+            val lists = Library.playlists(this)
+            if (lists.isEmpty()) {
+                box.addView(Ui.text(this, "No playlists yet. Hold any song (or use ⋯ in the player) to add it to one.",
+                    14f, Ui.TEXT_2, lines = 3).apply { setPadding(0, dp(12), 0, 0) })
+            }
+            for (p in lists) {
+                box.addView(simpleRow(p.name, "${p.tracks.size} songs", android.R.drawable.ic_menu_sort_by_size) {
+                    navigate { renderUserPlaylist(p.id) }
+                })
+            }
+        }
+        draw()
+        libraryRefresh = { draw() }
+    }
+
+    private fun renderUserPlaylist(id: String) {
+        clearPage()
+        page.addView(backRow())
+        val first = Library.playlist(this, id)
+        if (first == null) {
+            page.addView(Ui.text(this, "This playlist was deleted.", 15f, Ui.TEXT_2).apply { setPadding(0, dp(16), 0, 0) })
+            return
+        }
+        page.addView(Ui.text(this, first.name, 24f, bold = true, lines = 2).apply { setPadding(0, dp(4), 0, dp(8)) })
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        page.addView(box)
+        val draw = {
+            box.removeAllViews()
+            val p = Library.playlist(this, id)
+            if (p != null) {
+                if (p.tracks.isEmpty()) {
+                    box.addView(Ui.text(this, "Empty. Hold any song (or use ⋯ in the player) and choose “Add to playlist”.",
+                        14f, Ui.TEXT_2, lines = 3).apply { setPadding(0, dp(12), 0, dp(12)) })
+                } else {
+                    addLibraryTracks(box, p.name, null, p.tracks) { Library.removeFromPlaylist(this, id, it) }
+                }
+                box.addView(Ui.pill(this, "Delete playlist", filled = false) {
+                    android.app.AlertDialog.Builder(this).setTitle("Delete “${p.name}”?")
+                        .setPositiveButton("Delete") { _, _ ->
+                            Library.deletePlaylist(this, id)
+                            onBackPressedCompat()
+                        }
+                        .setNegativeButton("Cancel", null).show()
+                }, wrapLp(top = 16))
+            }
+        }
+        draw()
+        libraryRefresh = { draw() }
+    }
+
+    private fun renderSavedAlbums() {
+        clearPage()
+        page.addView(backRow())
+        page.addView(Ui.text(this, "Albums", 24f, bold = true).apply { setPadding(0, dp(4), 0, dp(8)) })
+        val albums = Library.albums(this)
+        if (albums.isEmpty()) {
+            page.addView(Ui.text(this, "No saved albums. Open an album and tap “Save to library”.", 14f, Ui.TEXT_2, lines = 2))
+            return
+        }
+        for (al in albums) {
+            page.addView(simpleRow(al.title, listOfNotNull(al.artist.takeIf { it.isNotBlank() }, al.year?.take(4)).joinToString(" · "),
+                android.R.drawable.ic_menu_gallery) {
+                val a = addon()
+                if (a == null) toast("Connect Nebula in Settings to open albums") else navigate { renderAlbum(a, al.toAddon()) }
             })
         }
     }
@@ -1023,6 +1275,15 @@ class MusicActivity : Activity() {
                     EngineState.playerInPeakDb, EngineState.playerOutPeakDb, EngineState.playerLimiterDb))
             }
             if (::fullRepeat.isInitialized) fullRepeat.text = repeatLabel()
+            val now = p.currentTrack
+            if (::fullLike.isInitialized) {
+                fullLike.text = if (now != null && Library.isLiked(this, now)) "♥  Liked" else "♡  Like"
+            }
+            if (::fullWhy.isInitialized) {
+                val why = now?.let { Radio.reasonFor(it) }
+                fullWhy.text = why?.let { "Picked for you: $it" } ?: ""
+                fullWhy.visibility = if (why == null) View.GONE else View.VISIBLE
+            }
             fullInfo.text = info
             val note = p.note?.let { "⏳ $it" } ?: (EngineState.playerMessage ?: p.lastError)?.let { "⚠ $it" }
             fullNote.text = note ?: ""
@@ -1061,7 +1322,32 @@ class MusicActivity : Activity() {
             return
         }
         val label = listOfNotNull(t.title, t.artist ?: p.currentInfo?.artist).joinToString(" — ")
-        page.addView(Ui.text(this, label, 15f, Ui.TEXT_2, lines = 2).apply { setPadding(0, 0, 0, dp(16)) })
+        page.addView(Ui.text(this, label, 15f, Ui.TEXT_2, lines = 2).apply { setPadding(0, 0, 0, dp(8)) })
+
+        // Timing nudge, for delay the app can't measure (Bluetooth, the car's screen).
+        val timing = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(12))
+        }
+        val timingLabel = Ui.text(this, "", 12f, Ui.TEXT_2)
+        fun describe() {
+            val ms = settings.lyricsOffsetMs
+            timingLabel.text = when {
+                ms == 0 -> "Lyrics timing: as is"
+                ms > 0 -> String.format(Locale.US, "Lyrics %.2f s earlier", ms / 1000f)
+                else -> String.format(Locale.US, "Lyrics %.2f s later", -ms / 1000f)
+            }
+        }
+        describe()
+        timing.addView(Ui.pill(this, "Later", filled = false) {
+            settings.lyricsOffsetMs -= 250; describe(); updateLyricsHighlight(force = true)
+        }, wrapLp().apply { rightMargin = dp(8) })
+        timing.addView(Ui.pill(this, "Earlier", filled = false) {
+            settings.lyricsOffsetMs += 250; describe(); updateLyricsHighlight(force = true)
+        }, wrapLp().apply { rightMargin = dp(12) })
+        timing.addView(timingLabel)
+        page.addView(timing)
 
         val holder = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         holder.addView(Ui.text(this, "Looking for lyrics…", 15f, Ui.TEXT_2))
@@ -1116,7 +1402,7 @@ class MusicActivity : Activity() {
     private fun updateLyricsHighlight(force: Boolean = false) {
         val sheet = lyricSheet ?: return
         if (!sheet.synced || lyricViews.isEmpty()) return
-        val idx = sheet.indexAt(player.audiblePositionMs + Lyrics.LEAD_MS)
+        val idx = sheet.indexAt(player.audiblePositionMs + Lyrics.LEAD_MS + settings.lyricsOffsetMs)
         if (idx != lyricIndex || force) {
             lyricIndex = idx
             lyricViews.forEachIndexed { i, v ->
@@ -1312,6 +1598,8 @@ class MusicActivity : Activity() {
                 return@execute
             }
             val added = Taste.importPlaylist(this, result.matched, label)
+            // The import is also a playlist you can open and play, not only a taste hint.
+            runCatching { Library.createPlaylist(this, label, result.matched) }
             runOnUiThread {
                 if (token != importToken) return@runOnUiThread
                 lastImportStatus = buildString {
@@ -1320,6 +1608,7 @@ class MusicActivity : Activity() {
                     if (result.unmatched > 0) append(" · ${result.unmatched} not in the catalogue")
                     if (result.withIsrc > 0) append(" · ${result.withIsrc} with ISRC")
                     append("\n$added new tracks added to your taste profile.")
+                    if (result.matched.isNotEmpty()) append("\nSaved as the playlist “$label” in your library.")
                 }
                 importStatus.text = lastImportStatus
                 showMessage("Imported $label")
@@ -1589,6 +1878,17 @@ class MusicActivity : Activity() {
             val queue = d.tracks.map { addonTrack(a, it) }
             addPlayShuffle(tracksBox, queue, queueTitle, "${d.tracks.size} songs" + (al.year?.let { " · $it" } ?: ""))
             addDownloadRow(tracksBox, queueTitle, al.artworkUrl ?: album.artworkUrl, queue)
+            lateinit var savePill: TextView
+            savePill = Ui.pill(this, if (Library.isAlbumSaved(this, album.id)) "✓  In your library" else "＋  Save to library", filled = false) {
+                val saved = !Library.isAlbumSaved(this, album.id)
+                Library.setAlbumSaved(this, if (al.artworkUrl != null) al else al.copy(artworkUrl = album.artworkUrl), saved)
+                savePill.text = if (saved) "✓  In your library" else "＋  Save to library"
+            }
+            tracksBox.addView(LinearLayout(this).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, 0, 0, dp(8))
+                addView(savePill)
+            })
             d.tracks.forEachIndexed { i, t ->
                 tracksBox.addView(numberedRow(i + 1, t.title, t.artist.takeIf { it != al.artist }, t.durationSec?.let { Ui.mmss(it * 1000L) }) {
                     play(queue, i, queueTitle)
@@ -1860,6 +2160,16 @@ class MusicActivity : Activity() {
             Radio.lastReason?.let {
                 page.addView(Ui.text(this, "Last pick: $it", 12f, Ui.ACCENT, lines = 2)
                     .apply { setPadding(0, dp(6), 0, 0) })
+            }
+        }
+        val blocked = Taste.blockedArtists(this)
+        if (blocked.isNotEmpty()) {
+            page.addView(Ui.text(this, "Never recommended — tap to allow again", 13f, Ui.TEXT_2).apply { setPadding(0, dp(12), 0, dp(4)) })
+            for (name in blocked) {
+                page.addView(simpleRow(name, "Blocked artist", android.R.drawable.ic_menu_close_clear_cancel) {
+                    Taste.setArtistBlocked(this, name, false)
+                    renderSettings()
+                })
             }
         }
         page.addView(Ui.pill(this, "Forget what CabinEQ learned", filled = false) {

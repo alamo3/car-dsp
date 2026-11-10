@@ -43,6 +43,10 @@ object MediaBrowse {
     private const val SAVED_SEARCH = "srch:"
     private const val RECENT_ITEM = "q:"
     private const val DOWNLOADS = "downloads"
+    /** "Library": liked songs, the listener's playlists, downloads and the TorBox account. */
+    private const val MY = "my"
+    private const val LIKED = "liked"
+    private const val USER_PLAYLIST = "upl:"
     private const val DOWNLOAD = "dl:"
 
     private const val ART_PX = 512
@@ -76,6 +80,10 @@ object MediaBrowse {
         parentId == FOR_YOU -> forYou(context)
         parentId == SEARCH_NODE -> savedSearches(context)
         parentId == DOWNLOADS -> downloads(context)
+        parentId == MY -> myLibrary(context)
+        parentId == LIKED -> trackItems(LIKED, Library.liked(context), null)
+        parentId.startsWith(USER_PLAYLIST) ->
+            trackItems(parentId, Library.playlist(context, parentId.removePrefix(USER_PLAYLIST))?.tracks.orEmpty(), null)
         parentId.startsWith(DOWNLOAD) -> downloadTracks(context, parentId)
         parentId.startsWith(TORRENT) -> memoized(parentId) { torrentTracks(context, parentId) }
         parentId.startsWith(ALBUM) -> memoized(parentId) { albumTracks(context, parentId) }
@@ -140,9 +148,9 @@ object MediaBrowse {
         val hasAddon = settings.addonLink.isNotBlank()
         val hasHistory = settings.playHistory().isNotEmpty()
         val nodes = ArrayList<MediaBrowser.MediaItem>(4)
-        // First: the one tab that works in a dead zone.
-        if (Downloads.collections(context).isNotEmpty()) {
-            nodes += item(DOWNLOADS, "Downloads", "On this phone — plays offline", browsable = true)
+        // One tab for everything that is the listener's own (hosts show four tabs at most).
+        if (myLibrary(context).isNotEmpty()) {
+            nodes += item(MY, "Library", "Liked songs, playlists, downloads", browsable = true)
         }
         if (hasAddon && hasHistory) {
             nodes += item(FOR_YOU, "For you", "More from the artists you play", browsable = true)
@@ -153,9 +161,6 @@ object MediaBrowse {
         // A car has no keyboard: give it the searches that already worked, one tap away.
         if (hasAddon && settings.recentSearches.isNotEmpty()) {
             nodes += item(SEARCH_NODE, "Search", "Your recent searches", browsable = true)
-        }
-        if (settings.torboxApiKey.isNotBlank()) {
-            nodes += item(LIBRARY, "My TorBox", "Albums on your TorBox account", browsable = true)
         }
         return nodes
     }
@@ -184,6 +189,11 @@ object MediaBrowse {
             parent.startsWith(TORRENT) -> torrentPlayback(context, parent, child)
             parent.startsWith(ALBUM) -> albumPlayback(context, parent, child)
             parent.startsWith(PLAYLIST) -> playlistPlayback(context, parent, child)
+            parent == LIKED -> listPlayback("Liked songs", Library.liked(context), child)
+            parent.startsWith(USER_PLAYLIST) -> {
+                val p = Library.playlist(context, parent.removePrefix(USER_PLAYLIST)) ?: return null
+                listPlayback(p.name, p.tracks, child)
+            }
             parent.startsWith(DOWNLOAD) -> {
                 val c = Downloads.find(context, parent.removePrefix(DOWNLOAD)) ?: return null
                 val index = c.tracks.indexOfFirst { it.mediaId == Uri.decode(child) }
@@ -536,6 +546,41 @@ object MediaBrowse {
             // only reliable identity; fall back to the title/artist pair when it is missing.
             .distinctBy { it.isrc ?: "${it.title.trim().lowercase()}|${it.artist?.trim()?.lowercase().orEmpty()}" }
             .take(MAX_ROWS)
+    }
+
+    private fun myLibrary(context: Context): List<MediaBrowser.MediaItem> {
+        val nodes = ArrayList<MediaBrowser.MediaItem>()
+        val liked = Library.liked(context)
+        if (liked.isNotEmpty()) nodes += item(LIKED, "Liked songs", "${liked.size} songs", browsable = true)
+        if (Downloads.collections(context).isNotEmpty()) {
+            nodes += item(DOWNLOADS, "Downloads", "On this phone — plays offline", browsable = true)
+        }
+        Library.playlists(context).filter { it.tracks.isNotEmpty() }.take(30).forEach { p ->
+            nodes += item(USER_PLAYLIST + p.id, p.name, "${p.tracks.size} songs", browsable = true)
+        }
+        if (Settings(context).torboxApiKey.isNotBlank()) {
+            nodes += item(LIBRARY, "My TorBox", "Albums on your TorBox account", browsable = true)
+        }
+        return nodes
+    }
+
+    private fun trackItems(parentId: String, tracks: List<Track>, art: String?): List<MediaBrowser.MediaItem> =
+        tracks.take(MAX_ROWS).map { t ->
+            item(
+                id = "$parentId#" + Uri.encode(t.mediaId),
+                title = t.title,
+                subtitle = listOfNotNull(t.artist, t.album).joinToString(" · "),
+                iconUrl = t.artworkUrl ?: art,
+                fallbackQuery = "${t.artist.orEmpty()} ${t.title}".trim(),
+                durationMs = t.durationMs,
+                playable = true,
+            )
+        }
+
+    private fun listPlayback(title: String, tracks: List<Track>, child: String): Playback? {
+        if (tracks.isEmpty()) return null
+        val index = tracks.indexOfFirst { it.mediaId == Uri.decode(child) }
+        return Playback(title, tracks, index.coerceAtLeast(0))
     }
 
     private fun downloads(context: Context): List<MediaBrowser.MediaItem> =

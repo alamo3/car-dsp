@@ -36,6 +36,8 @@ class LyricsScreen(carContext: CarContext) : Screen(carContext) {
     @Volatile private var done = false
 
     private var shownIndex = Int.MIN_VALUE
+    /** The listener's own correction (set on the phone's lyrics page). */
+    private val offsetMs: Int by lazy { dev.alamo3.cabineq.Settings(carContext).lyricsOffsetMs }
 
     private companion object {
         /** Rows per template: enough to read ahead, few enough to fit a compact host. */
@@ -133,7 +135,7 @@ class LyricsScreen(carContext: CarContext) : Screen(carContext) {
         val p = FilePlayer.peek() ?: return -1
         // The host redraws about once a second, so a line can show up to a second after its time:
         // look half of that ahead, so on average it is on time.
-        return s.indexAt(p.audiblePositionMs + Lyrics.LEAD_MS + CAR_REFRESH_LEAD_MS)
+        return s.indexAt(p.audiblePositionMs + Lyrics.LEAD_MS + CAR_REFRESH_LEAD_MS + offsetMs)
     }
 
     /** One lookup per screen; the cache in [Lyrics] makes a repeat open instant. */

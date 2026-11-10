@@ -42,6 +42,14 @@ object Radio {
 
     @Volatile private var pool: Pool? = null
 
+    /** Why each recent pick was made, by song: what the player shows under "Why this song". */
+    private val reasons = object : LinkedHashMap<String, String>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > 60
+    }
+
+    /** Why the radio queued [t], or null when the listener chose it themselves. */
+    fun reasonFor(t: Track): String? = synchronized(reasons) { Taste.keys(t).firstNotNullOfOrNull { reasons[it] } }
+
     /** Why the last pick was made, shown in settings so the engine is never a black box. */
     @Volatile var lastReason: String? = null
         private set
@@ -110,7 +118,9 @@ object Radio {
             "similar" -> "similar to $artist"
             else -> "similar to artists you play"
         }
-        lastReason = "${t.title} — $source · ${profile.why(best.first.track, sessionArtists)}"
+        val why = "$source · ${profile.why(best.first.track, sessionArtists)}"
+        lastReason = "${t.title} — $why"
+        synchronized(reasons) { reasons[key(t)] = why }
         Log.i(TAG, "pick: ${t.title} (${t.artist}) score=${"%.2f".format(best.second)} [$source]")
         return t
     }

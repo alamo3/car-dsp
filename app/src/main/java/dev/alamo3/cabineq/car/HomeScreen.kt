@@ -190,14 +190,21 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         }
 
         val downloads = dev.alamo3.cabineq.Downloads.collections(carContext)
-        // Downloads lead: they are what plays when the signal drops.
-        if (downloads.isNotEmpty()) builder.addSection(downloadSection(downloads))
+        val liked = dev.alamo3.cabineq.Library.liked(carContext)
+        val playlists = dev.alamo3.cabineq.Library.playlists(carContext).filter { it.tracks.isNotEmpty() }
+        // The listener's own things lead: liked songs, playlists, and downloads (which are what
+        // plays when the signal drops).
+        if (downloads.isNotEmpty() || liked.isNotEmpty() || playlists.isNotEmpty()) {
+            builder.addSection(librarySection(liked, playlists, downloads))
+        }
         if (rows.isNotEmpty()) builder.addSection(recentSection(rows))
         if (picks.isNotEmpty()) builder.addSection(recommendedSection(picks))
         if (you.albums.isNotEmpty()) builder.addSection(albumSection(you))
 
         // A SectionedItemTemplate must have at least one section.
-        if (rows.isEmpty() && picks.isEmpty() && you.albums.isEmpty() && downloads.isEmpty()) {
+        if (rows.isEmpty() && picks.isEmpty() && you.albums.isEmpty() && downloads.isEmpty() &&
+            liked.isEmpty() && playlists.isEmpty()
+        ) {
             return MessageTemplate.Builder("Nothing to play yet — search for something, or start a song on your phone.")
                 .setHeaderAction(searchAction())
                 .build()
@@ -299,19 +306,38 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         .setOnClickListener { screenManager.push(SearchScreen(carContext)) }
         .build()
 
-    private fun downloadSection(downloads: List<dev.alamo3.cabineq.Downloads.Collection>): GridSection {
+    private fun librarySection(
+        liked: List<Track>,
+        playlists: List<dev.alamo3.cabineq.Library.Playlist>,
+        downloads: List<dev.alamo3.cabineq.Downloads.Collection>,
+    ): GridSection {
         val section = GridSection.Builder()
-        section.setTitle("Downloads")
+        section.setTitle("Library")
         section.setItemSize(GridSection.ITEM_SIZE_LARGE)
-        downloads.take(10).forEach { c ->
+        fun tile(title: String, count: Int, art: String?, tracks: () -> List<Track>) {
             section.addItem(
                 GridItem.Builder()
-                    .setTitle(c.title)
-                    .setText("${c.tracks.size} songs")
-                    .setImage(carIcon(carContext, c.artworkUrl, c.title))
-                    .setOnClickListener { screenManager.push(DownloadScreen(carContext, c.id)) }
+                    .setTitle(title)
+                    .setText("$count songs")
+                    .setImage(carIcon(carContext, art, title))
+                    .setOnClickListener { screenManager.push(TrackListScreen(carContext, title, art, tracks)) }
                     .build()
             )
+        }
+        if (liked.isNotEmpty()) {
+            tile("Liked songs", liked.size, liked.firstNotNullOfOrNull { it.artworkUrl }) {
+                dev.alamo3.cabineq.Library.liked(carContext)
+            }
+        }
+        playlists.take(4).forEach { p ->
+            tile(p.name, p.tracks.size, p.tracks.firstNotNullOfOrNull { it.artworkUrl }) {
+                dev.alamo3.cabineq.Library.playlist(carContext, p.id)?.tracks.orEmpty()
+            }
+        }
+        downloads.take(5).forEach { c ->
+            tile(c.title, c.tracks.size, c.artworkUrl) {
+                dev.alamo3.cabineq.Downloads.find(carContext, c.id)?.tracks.orEmpty()
+            }
         }
         return section.build()
     }
@@ -400,28 +426,33 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
     }
 }
 
-/** A downloaded album or playlist, read from the phone: no network involved. */
-class DownloadScreen(carContext: CarContext, private val id: String) : Screen(carContext) {
+/** Liked songs, a playlist or a download, read from the phone: no network involved. */
+class TrackListScreen(
+    carContext: CarContext,
+    private val title: String,
+    private val artworkUrl: String?,
+    private val load: () -> List<Track>,
+) : Screen(carContext) {
     override fun onGetTemplate(): Template {
-        val c = dev.alamo3.cabineq.Downloads.find(carContext, id)
-        if (c == null) {
-            return MessageTemplate.Builder("This download was removed.")
+        val tracks = load()
+        if (tracks.isEmpty()) {
+            return MessageTemplate.Builder("Nothing here any more.")
                 .setHeaderAction(Action.BACK)
                 .build()
         }
         val items = ItemList.Builder()
-        c.tracks.take(100).forEachIndexed { i, track ->
+        tracks.take(100).forEachIndexed { i, track ->
             items.addItem(
                 Row.Builder()
                     .setTitle(track.title)
-                    .addText(track.subtitle().ifBlank { c.title })
-                    .setImage(carIcon(carContext, track.artworkUrl ?: c.artworkUrl, artQuery(track.artist, track.album, track.title)))
-                    .setOnClickListener { CarPlayback.playTracks(carContext, c.tracks, i, c.title, ::openPlayer) }
+                    .addText(track.subtitle().ifBlank { title })
+                    .setImage(carIcon(carContext, track.artworkUrl ?: artworkUrl, artQuery(track.artist, track.album, track.title)))
+                    .setOnClickListener { CarPlayback.playTracks(carContext, tracks, i, title, ::openPlayer) }
                     .build()
             )
         }
         return ListTemplate.Builder()
-            .setTitle(c.title)
+            .setTitle(title)
             .setHeaderAction(Action.BACK)
             .setSingleList(items.build())
             .build()
