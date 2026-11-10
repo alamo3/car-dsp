@@ -39,6 +39,11 @@ object Taste {
     class Event(
         val at: Long,
         val key: String,
+        /**
+         * The title|artist key when [key] is an ISRC. The addon only sends ISRCs with some
+         * results, so the same song arrives keyed either way; events carry both.
+         */
+        val alt: String? = null,
         val artist: String?,
         val album: String?,
         val kind: Kind,
@@ -64,8 +69,55 @@ object Taste {
     @Volatile private var cachedVersion = -1
 
     /** Same identity the queue uses: a recording, not a release. */
-    fun key(t: Track): String = t.isrc?.lowercase()
-        ?: "${t.title.trim().lowercase()}|${t.artist?.trim()?.lowercase().orEmpty()}"
+    fun key(t: Track): String = t.isrc?.lowercase()?.takeIf { it.isNotBlank() } ?: nameKey(t)
+
+    fun nameKey(t: Track): String = nameKey(t.title, t.artist)
+
+    /** "(feat. X)", "[with Y]", " ft. Z" */
+    private val FEATURING = Regex("""(?i)\s*[(\[](feat|ft|featuring|with)\b[^)\]]*[)\]]|\s+(feat|ft|featuring)\.?\s.*$""")
+    /** "(Remastered 2011)", "[Radio Edit]", " - Single Version" */
+    private val DECORATION = Regex(
+        """(?i)\s*[(\[][^)\]]*\b(remaster(ed)?|radio edit|single version|album version|mono|stereo)\b[^)\]]*[)\]]""" +
+            """|\s+-\s+[^-]*\b(remaster(ed)?|radio edit|single version|album version|mono|stereo)\b.*$"""
+    )
+
+    /**
+     * Title|primary-artist, with credits and release decorations removed: the same song is
+     * "Get Lucky" in one catalogue and "Get Lucky (feat. Pharrell Williams) - Radio Edit" in
+     * another, and history must treat them as one.
+     */
+    fun nameKey(title: String, artist: String?): String {
+        val t = title.replace(FEATURING, "").replace(DECORATION, "")
+        // Primary artist only; "&" stays ("Simon & Garfunkel" is one act).
+        val a = artist.orEmpty().split(',').first().split(Regex("(?i)\\s+(feat|ft|featuring)\\.?\\s+")).first()
+        return "${simplify(t).ifBlank { simplify(title) }}|${simplify(a)}"
+    }
+
+    /** Primary artist, simplified: how artists are matched across catalogues. */
+    fun artistKey(name: String?): String? =
+        name?.split(',')?.first()?.split(Regex("(?i)\\s+(feat|ft|featuring)\\.?\\s+"))?.first()
+            ?.let(::simplify)?.ifBlank { null }
+
+    private fun simplify(s: String): String =
+        java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD).replace(Regex("\\p{M}+"), "")
+            .lowercase().replace("&", " and ").split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotEmpty() }
+            .joinToString(" ")
+
+    /** Keys saved before [nameKey] was normalised: same form as new ones (ISRCs unchanged). */
+    private fun normalizeStored(k: String): String {
+        val bar = k.lastIndexOf('|')
+        return if (bar < 0) k else nameKey(k.substring(0, bar), k.substring(bar + 1))
+    }
+
+    /** Every key this song can be recorded under: ISRC (when known) and title|artist. */
+    fun keys(t: Track): List<String> {
+        val isrc = t.isrc?.lowercase()?.takeIf { it.isNotBlank() }
+        return if (isrc != null) listOf(isrc, nameKey(t)) else listOf(nameKey(t))
+    }
+
+    private fun altKey(t: Track): String? = if (t.isrc.isNullOrBlank()) null else nameKey(t)
+
+    private fun Event.matches(ks: Collection<String>): Boolean = key in ks || (alt != null && alt in ks)
 
     // ---------------------------------------------------------------- recording
 
@@ -76,10 +128,10 @@ object Taste {
         if (ratio < 0.85f) return   // "finished" only when it really got to the end
         // Repeat-one can finish the same track a dozen times an hour; one completion per 20
         // minutes is what the listener actually told us.
-        val k = key(track)
+        val ks = keys(track)
         val now = System.currentTimeMillis()
         val duplicate = synchronized(store(context)) {
-            store(context).events.lastOrNull { it.key == k && it.kind == Kind.COMPLETE }
+            store(context).events.lastOrNull { it.kind == Kind.COMPLETE && it.matches(ks) }
                 ?.let { now - it.at < 20 * 60_000L } == true
         }
         if (duplicate) return
@@ -93,29 +145,28 @@ object Taste {
 
     fun like(context: Context, track: Track) {
         val s = store(context)
-        val k = key(track)
+        val ks = keys(track)
         synchronized(s) {
-            s.liked.add(k)
-            s.disliked.remove(k)
-            // Drop a standing dislike for the same artist if this is a change of heart.
-            val artist = track.artist?.trim()?.lowercase()
-            if (artist != null) s.disliked.removeAll { it.startsWith("artist:$artist") }
+            s.liked.addAll(ks)
+            s.disliked.removeAll(ks.toSet())
         }
         record(context, track, Kind.LIKE, 1f)
     }
 
     fun dislike(context: Context, track: Track) {
         val s = store(context)
-        val k = key(track)
+        val ks = keys(track)
         synchronized(s) {
-            s.disliked.add(k)
-            s.liked.remove(k)
+            s.disliked.addAll(ks)
+            s.liked.removeAll(ks.toSet())
         }
         record(context, track, Kind.DISLIKE, 1f)
     }
 
-    fun isLiked(context: Context, track: Track): Boolean =
-        key(track) in synchronized(store(context)) { HashSet(store(context).liked) }
+    fun isLiked(context: Context, track: Track): Boolean {
+        val ks = keys(track)
+        return synchronized(store(context)) { ks.any { it in store(context).liked } }
+    }
 
     fun reset(context: Context) {
         val s = store(context)
@@ -139,18 +190,20 @@ object Taste {
         val now = System.currentTimeMillis()
         val already = HashSet<String>()
         synchronized(s) {
-            for (e in s.events) if (e.kind == Kind.IMPORT) already.add(e.key)
+            for (e in s.events) if (e.kind == Kind.IMPORT) { already.add(e.key); e.alt?.let(already::add) }
         }
         var added = 0
         synchronized(s) {
             for (t in tracks) {
                 if (t.title.isBlank()) continue
                 val k = key(t)
-                if (!already.add(k)) continue
+                if (k in already || keys(t).any { it in already }) continue
+                already.addAll(keys(t))
                 s.events.add(
                     Event(
                         at = now,
                         key = k,
+                        alt = altKey(t),
                         artist = t.artist?.trim()?.takeIf { it.isNotBlank() },
                         album = t.album?.trim()?.takeIf { it.isNotBlank() },
                         kind = Kind.IMPORT,
@@ -199,6 +252,7 @@ object Taste {
                 Event(
                     at = System.currentTimeMillis(),
                     key = key(track),
+                    alt = altKey(track),
                     artist = track.artist?.trim()?.takeIf { it.isNotBlank() },
                     album = track.album?.trim()?.takeIf { it.isNotBlank() },
                     kind = kind,
@@ -227,33 +281,48 @@ object Taste {
         val liked: Set<String>
         val disliked: Set<String>
         val skippedRecently = HashSet<String>()
+        /** Last time each song was played (any key), for the "not again so soon" rule. */
+        val lastPlayed = HashMap<String, Long>()
+        /** Songs you already know: played, liked or in an imported playlist. */
+        val heard = HashMap<String, Int>()
+        /** Artist -> distinct songs of theirs you disliked. */
+        val dislikedSongs = HashMap<String, HashSet<String>>()
+        val knownArtists = HashSet<String>()
+        /** Key -> the name as last seen, for display and for searching. */
+        val artistNames = HashMap<String, String>()
         synchronized(s) {
             liked = HashSet(s.liked)
             disliked = HashSet(s.disliked)
             for (e in s.events) {
+                val ks = listOfNotNull(e.key, e.alt)
                 // What you just skipped is the loudest "not this" there is, for this session.
                 if (e.kind == Kind.SKIP && e.value < 0.5f && now - e.at < 30 * 60_000L) {
-                    skippedRecently.add(e.key)
+                    skippedRecently.addAll(ks)
                 }
-            }
-            for (e in s.events) {
+                if (e.kind == Kind.PLAY || e.kind == Kind.COMPLETE) {
+                    ks.forEach { k -> if (e.at > (lastPlayed[k] ?: 0L)) lastPlayed[k] = e.at }
+                }
+                if (e.kind == Kind.PLAY || e.kind == Kind.LIKE || e.kind == Kind.IMPORT) {
+                    ks.forEach { k -> heard[k] = (heard[k] ?: 0) + 1 }
+                }
+                val artistK = artistKey(e.artist)
+                artistK?.let { knownArtists.add(it); artistNames[it] = e.artist!!.split(',').first().trim() }
+                if (e.kind == Kind.DISLIKE) {
+                    artistK?.let { a -> dislikedSongs.getOrPut(a) { HashSet() }.add(e.key) }
+                }
                 val w = weight(e, now)
                 if (w == 0f) continue
-                tracks[e.key] = (tracks[e.key] ?: 0f) + w
-                e.artist?.lowercase()?.let { a -> artists[a] = (artists[a] ?: 0f) + w * 0.45f }
+                ks.forEach { k -> tracks[k] = (tracks[k] ?: 0f) + w }
+                artistK?.let { a -> artists[a] = (artists[a] ?: 0f) + w * 0.45f }
                 e.album?.lowercase()?.let { a -> albums[a] = (albums[a] ?: 0f) + w * 0.15f }
             }
         }
-        // Artists with two or more disliked tracks are out of the pool entirely.
-        val bannedArtists = HashSet<String>()
-        synchronized(s) {
-            for (e in s.events) {
-                if (e.kind == Kind.DISLIKE) e.artist?.lowercase()?.let { bannedArtists.add(it) }
-            }
-        }
+        // An artist is out of the pool after two disliked songs — one is about the song — unless
+        // you otherwise clearly play them.
+        val bannedArtists = dislikedSongs.filter { it.value.size >= 2 }.keys.toHashSet()
         bannedArtists.removeAll { a -> (artists[a] ?: 0f) > 4f }
         skippedRecently.removeAll(liked)
-        val p = Profile(tracks, artists, albums, liked, disliked, bannedArtists, skippedRecently)
+        val p = Profile(tracks, artists, albums, liked, disliked, bannedArtists, skippedRecently, lastPlayed, heard, knownArtists, artistNames)
         cached = p
         cachedVersion = v
         return p
@@ -292,7 +361,8 @@ object Taste {
                             s.events.add(
                                 Event(
                                     at = e.optLong("t"),
-                                    key = e.optString("id"),
+                                    key = normalizeStored(e.optString("id")),
+                                    alt = e.optString("n").takeIf { it.isNotBlank() }?.let(::normalizeStored),
                                     artist = e.optString("a").takeIf { it.isNotBlank() },
                                     album = e.optString("al").takeIf { it.isNotBlank() },
                                     kind = kind,
@@ -301,8 +371,8 @@ object Taste {
                             )
                         }
                     }
-                    o.optJSONArray("liked")?.let { for (i in 0 until it.length()) s.liked.add(it.optString(i)) }
-                    o.optJSONArray("disliked")?.let { for (i in 0 until it.length()) s.disliked.add(it.optString(i)) }
+                    o.optJSONArray("liked")?.let { for (i in 0 until it.length()) s.liked.add(normalizeStored(it.optString(i))) }
+                    o.optJSONArray("disliked")?.let { for (i in 0 until it.length()) s.disliked.add(normalizeStored(it.optString(i))) }
                 }.onFailure { Log.w(TAG, "Couldn't read the taste file: ${it.message}") }
             }
             store = s
@@ -321,6 +391,7 @@ object Taste {
                                 JSONObject()
                                     .put("t", e.at)
                                     .put("id", e.key)
+                                    .putOpt("n", e.alt)
                                     .putOpt("a", e.artist)
                                     .putOpt("al", e.album)
                                     .put("k", e.kind.name)
@@ -350,38 +421,60 @@ class Profile(
     private val disliked: Set<String>,
     private val bannedArtists: Set<String>,
     private val skippedRecently: Set<String>,
+    private val lastPlayed: Map<String, Long> = emptyMap(),
+    private val heard: Map<String, Int> = emptyMap(),
+    private val knownArtists: Set<String> = emptySet(),
+    private val artistNames: Map<String, String> = emptyMap(),
 ) {
-    fun isDisliked(t: Track): Boolean = Taste.key(t) in disliked || t.artist?.trim()?.lowercase() in bannedArtists
+    private fun artistKey(t: Track) = Taste.artistKey(t.artist)
 
-    fun skippedRecently(t: Track): Boolean = Taste.key(t) in skippedRecently && Taste.key(t) !in liked
+    fun isLiked(t: Track): Boolean = Taste.keys(t).any { it in liked }
+
+    fun isDisliked(t: Track): Boolean = Taste.keys(t).any { it in disliked } || artistKey(t) in bannedArtists
+
+    fun skippedRecently(t: Track): Boolean = !isLiked(t) && Taste.keys(t).any { it in skippedRecently }
+
+    /** When this song last played, or 0. */
+    fun lastPlayedAt(t: Track): Long = Taste.keys(t).maxOf { lastPlayed[it] ?: 0L }
+
+    /** How many times you've met this song (plays, likes, imports); 0 = new to you. */
+    fun heardCount(t: Track): Int = Taste.keys(t).maxOf { heard[it] ?: 0 }
+
+    /** Any history at all with this artist. */
+    fun knowsArtist(name: String?): Boolean = Taste.artistKey(name)?.let { it in knownArtists } == true
+
+    /** Decayed song-level evidence; the strongest of the song's keys. */
+    fun trackAffinity(t: Track): Float =
+        Taste.keys(t).mapNotNull { tracks[it] }.maxByOrNull { kotlin.math.abs(it) } ?: 0f
 
     /**
      * How much this track matches the profile. Roughly: "how much do I want this right now",
      * independent of what is playing (the caller adds the session term).
      */
     fun score(t: Track): Float {
-        val k = Taste.key(t)
-        if (k in disliked) return -10f
-        if (t.artist?.trim()?.lowercase() in bannedArtists) return -8f
+        if (Taste.keys(t).any { it in disliked }) return -10f
+        if (artistKey(t) in bannedArtists) return -8f
         // Skipped in the last half hour: don't offer it again in this session.
-        if (k in skippedRecently && k !in liked) return -6f
-        var s = tracks[k] ?: 0f
-        t.artist?.trim()?.lowercase()?.let { a -> s += (artists[a] ?: 0f) * 0.8f }
+        if (skippedRecently(t)) return -6f
+        var s = trackAffinity(t)
+        artistKey(t)?.let { a -> s += (artists[a] ?: 0f) * 0.8f }
         t.album?.trim()?.lowercase()?.let { a -> s += (albums[a] ?: 0f) * 0.2f }
-        if (k in liked) s += 6f
+        if (isLiked(t)) s += 6f
         return s
     }
 
     fun artistScore(name: String?): Float =
-        name?.trim()?.lowercase()?.let { artists[it] } ?: 0f
+        Taste.artistKey(name)?.let { artists[it] } ?: 0f
 
     /** Short, human explanation of why this track was picked. */
     fun why(t: Track, sessionArtists: Set<String>): String {
-        val k = Taste.key(t)
         val artist = t.artist?.trim()
-        if (k in liked) return "you liked this track"
-        if (artist != null && artist.lowercase() in sessionArtists) {
-            return if ((artists[artist.lowercase()] ?: 0f) > 1f) {
+        if (heardCount(t) == 0) {
+            return if (!knowsArtist(artist)) "new song, new artist" else "a song of theirs you haven't heard"
+        }
+        if (isLiked(t)) return "you liked this track"
+        if (artist != null && sessionArtists.any { Taste.artistKey(it) == Taste.artistKey(artist) }) {
+            return if (artistScore(artist) > 1f) {
                 "same artist as what you're playing, and you finish it"
             } else {
                 "same artist as what you're playing"
@@ -390,9 +483,9 @@ class Profile(
         val a = artistScore(artist)
         return when {
             a >= 4f -> "one of your favourites right now ($artist)"
-            (tracks[k] ?: 0f) >= 1.2f -> "you keep finishing this one"
+            trackAffinity(t) >= 1.2f -> "you keep finishing this one"
             a >= 1f -> "you've been playing $artist lately"
-            else -> "new to you"
+            else -> "back after a while"
         }
     }
 
@@ -401,5 +494,5 @@ class Profile(
         artists.entries.filter { it.value > 0f }
             .sortedByDescending { it.value }
             .take(n)
-            .map { it.key to it.value }
+            .map { (artistNames[it.key] ?: it.key) to it.value }
 }

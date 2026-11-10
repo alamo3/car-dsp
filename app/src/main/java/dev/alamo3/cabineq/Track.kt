@@ -40,7 +40,9 @@ data class Track(
      */
     val mediaId: String
         get() = when (source) {
-            Source.ADDON -> "a:" + (sourceId ?: streamUrl?.let(::stableHash) ?: stableHash(title))
+            // Title and artist: discovered songs have neither id nor URL, and the same title by
+            // two artists must not share a cache entry.
+            Source.ADDON -> "a:" + (sourceId ?: streamUrl?.let(::stableHash) ?: stableHash("$title|${artist.orEmpty()}"))
             Source.TORBOX -> "t:$torrentId:$fileId"
         }
 

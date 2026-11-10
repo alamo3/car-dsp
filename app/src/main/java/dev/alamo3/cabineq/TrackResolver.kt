@@ -33,8 +33,11 @@ object TrackResolver {
             Track.Source.ADDON -> {
                 val link = settings.addonLink
                 if (link.isBlank()) throw IllegalStateException("Connect Nebula in Settings to play this")
+                // A discovered song (Discover) is only a title and artist until now: find the
+                // same recording on the addon right before it plays.
                 val id = track.sourceId
-                    ?: throw IllegalStateException("“${track.title}” has no addon id")
+                    ?: dev.alamo3.cabineq.music.AddonMatch.find(EclipseAddon(link), track)?.id
+                    ?: throw IllegalStateException("Couldn't find “${track.title}” on Nebula")
                 EclipseAddon(link).resolveStream(
                     trackId = id,
                     maxWaitMs = maxWaitMs,
