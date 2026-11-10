@@ -404,6 +404,22 @@ class FilePlayer private constructor(private val context: Context) {
             userPaused = false
             jumpTo = index
             if (state == State.PAUSED) setState(State.LOADING)
+            // The worker only looks at jumpTo between steps. While it sits inside a network open
+            // or read (the extractor has no way to be interrupted), nothing looks, and the tap
+            // seems dead for as long as that connection takes. If the request is still pending
+            // shortly after, retire that worker and start a fresh one on the wanted track; the
+            // old one finishes on its own and releases what it holds.
+            if (state == State.LOADING) {
+                val genAtTap = generation
+                saveHandler.postDelayed({
+                    if (genAtTap == generation && jumpTo == index && state == State.LOADING &&
+                        index in queue.indices
+                    ) {
+                        Log.w(TAG, "skip to $index not picked up in ${SKIP_PICKUP_MS}ms (worker busy opening a stream): starting a fresh worker")
+                        play(queue, index, queueTitle, radio = radioSeed)
+                    }
+                }, SKIP_PICKUP_MS)
+            }
         } else {
             play(queue, index, queueTitle, radio = radioSeed)
         }
@@ -1412,6 +1428,8 @@ class FilePlayer private constructor(private val context: Context) {
         private const val SAVE_DELAY_MS = 1_500L
         private const val SAVE_INTERVAL_MS = 10_000L
         private const val STALL_MS = 4_000L
+        /** How long a skip may wait for the busy worker before a fresh one takes over. */
+        private const val SKIP_PICKUP_MS = 600L
         /** A rebuilt sink gets this long before another stall is treated as fatal. */
         private const val STALL_REBUILD_WINDOW_MS = 30_000L
 

@@ -17,6 +17,13 @@ import java.util.Locale
  */
 object TrackResolver {
 
+    /**
+     * Songs already found on the addon, by media id. The prefetch matches a discovered song a few
+     * minutes before it plays; without this the player repeated the same two or three searches at
+     * the moment it needed the audio, which is where the silence between songs came from.
+     */
+    private val foundOnAddon = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     /** A playable URL plus what the source claims it is (the addon tells us; TorBox doesn't). */
     class Resolved(val url: String, val quality: String? = null)
 
@@ -36,7 +43,9 @@ object TrackResolver {
                 // A discovered song (Discover) is only a title and artist until now: find the
                 // same recording on the addon right before it plays.
                 val id = track.sourceId
+                    ?: foundOnAddon[track.mediaId]
                     ?: dev.alamo3.cabineq.music.AddonMatch.find(EclipseAddon(link), track)?.id
+                        ?.also { foundOnAddon[track.mediaId] = it }
                     ?: throw IllegalStateException("Couldn't find “${track.title}” on Nebula")
                 EclipseAddon(link).resolveStream(
                     trackId = id,

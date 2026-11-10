@@ -42,6 +42,11 @@ import java.util.concurrent.atomic.AtomicInteger
 private val uiIo = Executors.newSingleThreadExecutor { r ->
     Thread(r, "CabinEQ-CarUI").apply { isDaemon = true }
 }
+// Home's two network lookups (artist shelf, recommendations) run side by side, not one after
+// the other, and apart from uiIo so another screen's load never waits behind them.
+private val homeIo = Executors.newFixedThreadPool(2) { r ->
+    Thread(r, "CabinEQ-CarHome").apply { isDaemon = true }
+}
 private val artIo = Executors.newFixedThreadPool(4) { r ->
     Thread(r, "CabinEQ-CarArt").apply { isDaemon = true }
 }
@@ -117,6 +122,8 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
     @Volatile private var recent: List<Track>? = null
     @Volatile private var recommended: List<Track>? = null
     @Volatile private var forYou: MediaBrowse.ForYou? = null
+    /** Counts the network lookups still running; the page is drawn from local data meanwhile. */
+    private val remoteLeft = AtomicInteger(0)
     private var loading = false
     private var loadStarted = false
     private var tokenTries = 0
@@ -140,10 +147,14 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
             load()
         }
 
+        // Local data (history, library, downloads) draws at once; the artist shelf and the
+        // recommendations need the network and are added when they arrive. Waiting for all of
+        // it before drawing anything was the slow first launch.
         val rows = recent
         val you = forYou
-        val picks = recommended
-        if (rows == null || you == null || picks == null) {
+        val picks = recommended.orEmpty()
+        val stillLoading = remoteLeft.get() > 0
+        if (rows == null) {
             return MessageTemplate.Builder("Loading your music…")
                 .setHeaderAction(Action.APP_ICON)
                 .setLoading(true)
@@ -154,7 +165,7 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         // search header 9. Sending a template the host doesn't know fails on the host side, so
         // older hosts get the closest thing they can draw.
         val api = carContext.carAppApiLevel
-        if (api < 8) return legacyHome(rows, picks)
+        if (api < 8) return legacyHome(rows, picks, stillLoading)
 
         val jamAction = Action.Builder()
             .setTitle(if (JamHost.running) "Jam ●" else "Jam")
@@ -199,12 +210,18 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         }
         if (rows.isNotEmpty()) builder.addSection(recentSection(rows))
         if (picks.isNotEmpty()) builder.addSection(recommendedSection(picks))
-        if (you.albums.isNotEmpty()) builder.addSection(albumSection(you))
+        if (you != null && you.albums.isNotEmpty()) builder.addSection(albumSection(you))
 
         // A SectionedItemTemplate must have at least one section.
-        if (rows.isEmpty() && picks.isEmpty() && you.albums.isEmpty() && downloads.isEmpty() &&
+        if (rows.isEmpty() && picks.isEmpty() && (you == null || you.albums.isEmpty()) && downloads.isEmpty() &&
             liked.isEmpty() && playlists.isEmpty()
         ) {
+            if (stillLoading) {
+                return MessageTemplate.Builder("Loading your music…")
+                    .setHeaderAction(Action.APP_ICON)
+                    .setLoading(true)
+                    .build()
+            }
             return MessageTemplate.Builder("Nothing to play yet — search for something, or start a song on your phone.")
                 .setHeaderAction(searchAction())
                 .build()
@@ -216,7 +233,7 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
     }
 
     /** Car API 7 hosts: one list of recent songs and picks, search and Jam in the header. */
-    private fun legacyHome(rows: List<Track>, picks: List<Track>): Template {
+    private fun legacyHome(rows: List<Track>, picks: List<Track>, stillLoading: Boolean = false): Template {
         val items = ItemList.Builder()
         fun add(tracks: List<Track>, label: String) {
             tracks.take(10).forEachIndexed { i, track ->
@@ -234,6 +251,12 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         }
         add(rows, "Recently played")
         add(picks, "For you")
+        if (rows.isEmpty() && picks.isEmpty() && stillLoading) {
+            return MessageTemplate.Builder("Loading your music…")
+                .setHeaderAction(Action.APP_ICON)
+                .setLoading(true)
+                .build()
+        }
         if (rows.isEmpty() && picks.isEmpty()) {
             return MessageTemplate.Builder("Nothing to play yet — search for something, or start a song on your phone.")
                 .setHeaderAction(searchAction())
@@ -259,41 +282,57 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
 
     private fun load() {
         val ctx = carContext.applicationContext
+        remoteLeft.set(2)
+
+        // 1. Local history: a disk read. The page can draw as soon as this is in.
         uiIo.execute {
-            val recentRaw = runCatching { MediaBrowse.recentTracks(ctx) }.getOrDefault(emptyList())
+            val local = runCatching { MediaBrowse.recentTracks(ctx) }.getOrDefault(emptyList())
+            recent = local
+            refresh()
+            warmArt(ctx, local.take(10).map { it.artworkUrl to artQuery(it.artist, it.album, it.title) }) { refresh() }
+        }
+
+        // 2. The artist shelf and 3. the recommendations: network lookups, in parallel. Each one
+        // adds its section when it lands; a slow or failing one no longer holds the page back.
+        homeIo.execute {
             val content = runCatching { MediaBrowse.forYouContent(ctx) }.getOrNull()
-            val picks = runCatching { Radio.recommend(ctx, 12) }.getOrDefault(emptyList())
-
-            // The same song can arrive from different places: a played track may only have a
-            // stream URL (no cover), while the addon's copy of it carries the real artwork.
-            // Reuse the known cover so a song looks the same in every section.
-            val artBySong = HashMap<String, String>()
-            content?.tracks?.forEach { t ->
-                t.artworkUrl?.let { artBySong[songKey(t.artist, t.title)] = it }
-            }
-            content?.albums?.forEach { a ->
-                a.artworkUrl?.let { artBySong[songKey(a.artist, a.title)] = it }
-            }
-            picks.forEach { t ->
-                t.artworkUrl?.let { artBySong[songKey(t.artist, t.title)] = it }
-            }
-            val recent = recentRaw.map { t ->
-                if (t.artworkUrl != null) t
-                else artBySong[songKey(t.artist, t.title)]?.let { t.copy(artworkUrl = it) } ?: t
-            }
-
-            // Warm the art cache for everything we are about to show, then publish.
-            val art = ArrayList<Pair<String?, String?>>(32)
-            recent.take(10).forEach { art += it.artworkUrl to artQuery(it.artist, it.album, it.title) }
-            picks.take(10).forEach { art += it.artworkUrl to artQuery(it.artist, it.album, it.title) }
+            forYou = content ?: MediaBrowse.ForYou("", emptyList(), emptyList())
+            remoteLeft.decrementAndGet()
+            enrichRecent()
+            refresh()
+            val art = ArrayList<Pair<String?, String?>>()
             content?.albums?.take(10)?.forEach { art += it.artworkUrl to artQuery(it.artist, it.title, null) }
-            warmArt(ctx, art) {
-                this.recent = recent
-                this.recommended = picks
-                forYou = content
-                loading = false
-                runCatching { invalidate() }
-            }
+            warmArt(ctx, art) { refresh() }
+        }
+        homeIo.execute {
+            val picks = runCatching { Radio.recommend(ctx, 12) }.getOrDefault(emptyList())
+            recommended = picks
+            remoteLeft.decrementAndGet()
+            enrichRecent()
+            refresh()
+            warmArt(ctx, picks.take(10).map { it.artworkUrl to artQuery(it.artist, it.album, it.title) }) { refresh() }
+        }
+    }
+
+    private fun refresh() {
+        main.post { runCatching { invalidate() } }
+    }
+
+    /**
+     * The same song can arrive from different places: a played track may only have a stream URL
+     * (no cover), while the addon's copy of it carries the real artwork. Reuse the known cover so
+     * a song looks the same in every section.
+     */
+    private fun enrichRecent() {
+        val rows = recent ?: return
+        val artBySong = HashMap<String, String>()
+        forYou?.tracks?.forEach { t -> t.artworkUrl?.let { artBySong[songKey(t.artist, t.title)] = it } }
+        forYou?.albums?.forEach { a -> a.artworkUrl?.let { artBySong[songKey(a.artist, a.title)] = it } }
+        recommended?.forEach { t -> t.artworkUrl?.let { artBySong[songKey(t.artist, t.title)] = it } }
+        if (artBySong.isEmpty()) return
+        recent = rows.map { t ->
+            if (t.artworkUrl != null) t
+            else artBySong[songKey(t.artist, t.title)]?.let { t.copy(artworkUrl = it) } ?: t
         }
     }
 

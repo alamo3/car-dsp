@@ -28,7 +28,9 @@ object MediaCache {
     private const val PREFETCH_WAIT_MS = 90_000L
     private const val MIN_FREE_BYTES = 256L * 1024 * 1024
 
-    private val io = Executors.newSingleThreadExecutor { r ->
+    // Two at a time: the next song and the one after it must not queue behind each other (one
+    // slow caching wait on a single thread used to hold up every download behind it).
+    private val io = Executors.newFixedThreadPool(2) { r ->
         Thread(r, "CabinEQ-Cache").apply { isDaemon = true }
     }
     private val inFlight = HashSet<String>()
