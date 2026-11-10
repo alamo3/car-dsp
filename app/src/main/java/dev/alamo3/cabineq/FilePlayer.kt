@@ -522,7 +522,9 @@ class FilePlayer private constructor(private val context: Context) {
         val seed = radioSeed ?: return
         if (radioBusy) return
         if (repeat != Repeat.OFF) return                   // looping is the user's chosen queue
-        if (!force && currentIndex != queue.lastIndex) return   // something is already queued ahead
+        // Keep two songs queued ahead, not one: a single slow lookup then no longer decides
+        // whether the music carries on, and the song after next can be fetched early too.
+        if (!force && currentIndex < queue.lastIndex - 1) return
         if (!force && state != State.PLAYING && state != State.LOADING) return
         radioBusy = true
         val gen = generation
@@ -539,6 +541,7 @@ class FilePlayer private constructor(private val context: Context) {
             }
             Log.i(TAG, "Radio: queuing \"${next.title}\" — ${next.artist}")
             enqueue(listOf(next))
+            MediaCache.prefetch(context, next)
             if (followNewTrack) {
                 // The user pressed "next" at the end of the queue: jump to what just arrived.
                 followNewTrack = false
@@ -547,6 +550,7 @@ class FilePlayer private constructor(private val context: Context) {
                 // Playback ran dry while we were fetching: pick the new track up.
                 skipTo(queue.lastIndex)
             }
+            extendRadioIfNeeded()   // top up to two ahead
         }
     }
 
@@ -909,13 +913,20 @@ class FilePlayer private constructor(private val context: Context) {
                             index = 0
                             continue
                         }
-                        // Songs still caching: wait for them rather than going silent.
-                        if (!returning && deferred.isNotEmpty()) {
-                            val back = waitForDeferred(deferred)
-                            if (back >= 0) {
+                        // The queue ran out, but more is on its way: songs set aside while the
+                        // source cached them, or the radio's next pick. The worker used to stop
+                        // here; a pick that arrived a moment later then sat in the queue unplayed.
+                        if (!returning && (deferred.isNotEmpty() || (radioSeed != null && repeat == Repeat.OFF))) {
+                            output?.let { drain(it) }
+                            val more = waitForMore(index, deferred)
+                            if (more >= 0) {
                                 resumeAt = queue.size
-                                index = back
+                                index = more
                                 returning = true
+                                explicit = false
+                                continue
+                            }
+                            if (more == QUEUE_GREW) {
                                 explicit = false
                                 continue
                             }
@@ -1079,31 +1090,49 @@ class FilePlayer private constructor(private val context: Context) {
         }
 
         /**
-         * The queue has run out but songs were set aside while the source cached them: wait for
-         * the first to be ready. Returns its index, or -1 on a skip, a stop, or giving up.
+         * The queue has run out. Waits for what can still arrive: a set-aside song finishing its
+         * caching (returns its index), or the radio adding its next pick ([QUEUE_GREW]). Returns
+         * -1 on a skip, a stop, or when nothing came.
          */
-        private fun waitForDeferred(deferred: MutableMap<String, Long>): Int {
-            val giveUpAt = SystemClock.elapsedRealtime() + DEFERRED_WAIT_MS
+        private fun waitForMore(index: Int, deferred: MutableMap<String, Long>): Int {
+            val started = SystemClock.elapsedRealtime()
             var lastKick = 0L
-            while (live && SystemClock.elapsedRealtime() < giveUpAt) {
-                if (jumpTo >= 0) return -1
-                val back = readyDeferredIndex(deferred)
-                if (back >= 0) return back
-                if (deferred.isEmpty()) return -1
-                val now = SystemClock.elapsedRealtime()
-                val first = queue.firstOrNull { it.mediaId in deferred }
-                setNote("“${first?.title ?: "A song"}” is still caching on TorBox…")
-                if (state != State.PAUSED && state != State.LOADING) setState(State.LOADING)
-                if (now - lastKick > 15_000L) {
-                    lastKick = now
-                    // A no-op while its download is still running; restarts one that gave up.
-                    queue.filter { it.mediaId in deferred }
-                        .forEach { MediaCache.prefetch(context, it, waitMs = DEFERRED_WAIT_MS) }
+            var lastAsk = 0L
+            var asks = 0
+            try {
+                while (live) {
+                    if (jumpTo >= 0) return -1
+                    if (index in queue.indices) return QUEUE_GREW
+                    val back = readyDeferredIndex(deferred)
+                    if (back >= 0) return back
+                    val now = SystemClock.elapsedRealtime()
+                    val radio = radioSeed != null && repeat == Repeat.OFF
+                    if (radio && !radioBusy && now - lastAsk > 1_500L) {
+                        // Not looking right now: ask (again). A lookup can come back empty.
+                        if (asks >= RADIO_ASKS && deferred.isEmpty()) return -1
+                        if (asks < RADIO_ASKS) {
+                            asks++
+                            lastAsk = now
+                            extendRadioIfNeeded(force = true)
+                        }
+                    }
+                    if (!radio && deferred.isEmpty()) return -1
+                    if (now - started > (if (deferred.isEmpty()) RADIO_WAIT_MS else DEFERRED_WAIT_MS)) return -1
+                    val waitingFor = queue.firstOrNull { it.mediaId in deferred }
+                    setNote(if (radio) "Finding the next song…" else "“${waitingFor?.title ?: "A song"}” is still caching on TorBox…")
+                    if (state != State.PAUSED && state != State.LOADING) setState(State.LOADING)
+                    if (deferred.isNotEmpty() && now - lastKick > 15_000L) {
+                        lastKick = now
+                        // A no-op while its download is still running; restarts one that gave up.
+                        queue.filter { it.mediaId in deferred }
+                            .forEach { MediaCache.prefetch(context, it, waitMs = DEFERRED_WAIT_MS) }
+                    }
+                    SystemClock.sleep(200)
                 }
-                SystemClock.sleep(300)
+                return -1
+            } finally {
+                setNote(null)
             }
-            setNote(null)
-            return -1
         }
 
         private fun outputFor(rate: Int): Output {
@@ -1132,6 +1161,7 @@ class FilePlayer private constructor(private val context: Context) {
             // pressing next while "preparing" does nothing until it finishes.
             // Downloaded or prefetched: play the local file. Checked before resolving, so a
             // song on the phone starts at once and plays with no network at all.
+            val beganAt = SystemClock.elapsedRealtime()
             val cached = MediaCache.fileFor(context, item)
             val cancelled = { !live || jumpTo >= 0 }
             // Not on the phone yet. One download serves both playing and keeping: the player
@@ -1168,6 +1198,7 @@ class FilePlayer private constructor(private val context: Context) {
                     }
                 }
             }
+            val lookupDoneAt = SystemClock.elapsedRealtime()
             if (!live) {
                 growing?.let { MediaCache.leave(it) }
                 return Outcome.Cancelled
@@ -1215,6 +1246,9 @@ class FilePlayer private constructor(private val context: Context) {
                 } else {
                     extractor.setDataSource(url, emptyMap<String, String>())
                 }
+                // Where the time between songs goes, for when a gap needs explaining.
+                Log.i(TAG, "\"${item.title}\" opened in ${SystemClock.elapsedRealtime() - beganAt} ms " +
+                    "(lookup ${lookupDoneAt - beganAt} ms, source: ${if (cached != null) "on the phone" else if (growing != null) "download" else "direct stream"})")
                 val trackIndex = (0 until extractor.trackCount).firstOrNull {
                     extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
                 } ?: return Outcome.Failed("no audio stream")
@@ -1632,6 +1666,11 @@ class FilePlayer private constructor(private val context: Context) {
         private const val STALL_MS = 4_000L
         /** How long a skip may wait for the busy worker before a fresh one takes over. */
         private const val SKIP_PICKUP_MS = 600L
+        /** [Worker.waitForMore]: the queue has a new entry at the index that was past its end. */
+        private const val QUEUE_GREW = -2
+        /** How long the end of a radio queue waits for the next pick, and how often it asks. */
+        private const val RADIO_WAIT_MS = 90_000L
+        private const val RADIO_ASKS = 4
         /** How long to wait for a new download's first reply before streaming directly instead. */
         private const val START_WAIT_MS = 20_000L
         /** How long to wait for an already-running download to show it has started. */
