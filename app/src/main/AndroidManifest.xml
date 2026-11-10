@@ -123,9 +123,13 @@
             </intent-filter>
         </service>
 
+        <!-- Car API level 7 is what this app actually uses: SectionedItemTemplate with
+             GridSections, SearchHeader, MediaPlaybackTemplate and header actions. It said 9,
+             which is CAL 1.9-alpha, and hosts that advertise a lower level hide the whole car
+             app from the launcher ("All vehicle apps") while still listing its media entry. -->
         <meta-data
             android:name="androidx.car.app.minCarApiLevel"
-            android:value="9" />
+            android:value="7" />
 
         <!-- Read-only album art for the car: a browse item's icon must be a URI the car's own
              process can open, and it has no way to reach our cache. -->
