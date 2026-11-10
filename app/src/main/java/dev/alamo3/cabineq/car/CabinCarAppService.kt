@@ -67,6 +67,13 @@ class CabinCarSession : Session() {
         // Which entry point did the host use? "The app looks wrong in the car" is impossible to
         // diagnose without knowing whether this was ever called, and with what.
         Log.i(CabinCarAppService.TAG, "onCreateScreen action=${intent.action} extras=${intent.extras?.keySet()?.joinToString() ?: "none"}")
+        // What the host negotiated for this session. This is the number minCarApiLevel is
+        // compared against, so "the car does not list our app" becomes a readable fact.
+        runCatching {
+            val host = carContext.hostInfo
+            Log.i(CabinCarAppService.TAG,
+                "host=${host?.packageName ?: "?"} uid=${host?.uid ?: -1} carAppApiLevel=${carContext.carAppApiLevel}")
+        }.onFailure { Log.w(CabinCarAppService.TAG, "could not read the host level: ${it.message}") }
         // The car needs our MediaSessionCompat token to render controls for this app. It lives in
         // EqService, so make sure that service is up before asking for it.
         CarPlayback.ensureService(carContext)
