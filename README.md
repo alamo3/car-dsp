@@ -273,6 +273,13 @@ comb filtering, not an analysis error.
 
 ### Correction (conservative for now)
 
+**Three levels, one walk-through.** "Measure all three levels" asks for the car's volume to be
+set LOW, NORMAL and LOUD in turn, measures once at each and stores the three curves under those
+names. Each curve carries the conditions it was measured under (delay, SNR, phone volume, time),
+and once Quiet and Loud exist the screen reports the largest difference between them: that number
+is the car's own loudness contour, because a correction is the inverse of the response. In a car
+whose EQ does not move with volume the difference is near zero, and one correction is enough.
+
 `CabinCorrection` fits the inverse as peaking biquads (Q 1.6, ten bands, 100 Hz–8 kHz, tapered at
 the edges), **cut-first**: cuts to −12 dB, boosts capped at +6 dB, and the preamp is lowered by the
 largest boost so the limiter does not work harder. It is applied as extra bands on top of the

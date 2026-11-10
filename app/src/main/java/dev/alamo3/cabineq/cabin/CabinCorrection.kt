@@ -33,12 +33,31 @@ object CabinCorrection {
 
     data class Band(val hz: Double, val gainDb: Double)
 
-    class Curve(val bands: List<Band>, val preampDb: Double) {
+    /** What was true when this curve was measured — needed to compare levels later. */
+    data class Meta(
+        val level: String = "",
+        val at: Long = 0,
+        val delayMs: Double = 0.0,
+        val snrDb: Double = 0.0,
+        /** Phone stream volume at the time. The car's own volume is not readable. */
+        val volume: Int = -1,
+    )
+
+    class Curve(val bands: List<Band>, val preampDb: Double, val meta: Meta = Meta()) {
 
         fun toJson(): String {
             val arr = JSONArray()
             for (b in bands) arr.put(JSONObject().put("hz", b.hz).put("db", b.gainDb))
-            return JSONObject().put("v", 1).put("preamp", preampDb).put("bands", arr).toString()
+            return JSONObject()
+                .put("v", 2)
+                .put("preamp", preampDb)
+                .put("bands", arr)
+                .put("level", meta.level)
+                .put("at", meta.at)
+                .put("delay", meta.delayMs)
+                .put("snr", meta.snrDb)
+                .put("volume", meta.volume)
+                .toString()
         }
 
         /** Biquad coefficients (5 per band) with the gains scaled by [amount] (0..1). */
@@ -78,7 +97,21 @@ object CabinCorrection {
                         // A NaN here would design a NaN filter and mute the chain.
                         if (!hz.isFinite() || hz <= 0.0 || !db.isFinite()) null else Band(hz, db)
                     }
-                    if (bands.isEmpty()) null else Curve(bands, o.optDouble("preamp", 0.0))
+                    if (bands.isEmpty()) {
+                        null
+                    } else {
+                        Curve(
+                            bands,
+                            o.optDouble("preamp", 0.0),
+                            Meta(
+                                level = o.optString("level", ""),
+                                at = o.optLong("at", 0L),
+                                delayMs = o.optDouble("delay", 0.0),
+                                snrDb = o.optDouble("snr", 0.0),
+                                volume = o.optInt("volume", -1),
+                            ),
+                        )
+                    }
                 }.getOrNull()
             }
         }
@@ -113,6 +146,22 @@ object CabinCorrection {
         // A band per octave and a half is already a lot of correction; refuse to chase dust.
         if (bands.none { abs(it.gainDb) >= 1.0 }) return null
         return Curve(bands, -maxBoost)
+    }
+
+    /**
+     * Largest difference between two levels' corrections. Because a correction is the inverse of
+     * the measured response, a difference here means the car itself changes with volume — its
+     * loudness contour — not that we measured badly.
+     */
+    fun levelDifference(a: Curve, b: Curve): Band? {
+        var worst: Band? = null
+        for (band in a.bands) {
+            val other = b.bands.minByOrNull { kotlin.math.abs(it.hz - band.hz) } ?: continue
+            if (kotlin.math.abs(other.hz - band.hz) > band.hz * 0.2) continue
+            val diff = Band(band.hz, other.gainDb - band.gainDb)
+            if (worst == null || kotlin.math.abs(diff.gainDb) > kotlin.math.abs(worst.gainDb)) worst = diff
+        }
+        return worst
     }
 
     // ----------------------------------------------------------------------------- helpers

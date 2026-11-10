@@ -41,6 +41,9 @@ class MainActivity : Activity() {
     private var cabinMeasuring = false
     private var cabinFit: dev.alamo3.cabineq.cabin.CabinCorrection.Curve? = null
     private var cabinProfile = "Normal"
+    /** Non-null while the three-level walk-through is running: the level being asked for. */
+    private var cabinStep: String? = null
+    private var lastResult: dev.alamo3.cabineq.cabin.CabinMeasure.Result? = null
     private lateinit var cabinFitText: TextView
     private lateinit var cabinPills: LinearLayout
     private val cabinExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
@@ -311,6 +314,10 @@ class MainActivity : Activity() {
         cabinPills = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         root.addView(cabinPills)
         root.addView(Button(this).apply {
+            text = "Measure all three levels"
+            setOnClickListener { startLevelWalkthrough() }
+        })
+        root.addView(Button(this).apply {
             text = "Save measurement as correction"
             setOnClickListener { applyCabinFit() }
         })
@@ -532,6 +539,7 @@ class MainActivity : Activity() {
             return
         }
         cabinMeasuring = true
+        val stepAtStart = cabinStep
         refreshCabinButton()
         cabinSummary.text = "Starting…"
         // Don't measure over music, and don't leave the player paused afterwards by accident.
@@ -557,8 +565,37 @@ class MainActivity : Activity() {
                     return@runOnUiThread
                 }
                 cabinView.set(result.points)
-                cabinFit = dev.alamo3.cabineq.cabin.CabinCorrection.fit(result.points)
+                lastResult = result
+                val fit = dev.alamo3.cabineq.cabin.CabinCorrection.fit(result.points)
+                cabinFit = fit
                 refreshCabinPills()
+                if (stepAtStart != null) {
+                    if (fit != null) {
+                        saveCurve(stepAtStart, fit)
+                    } else {
+                        android.widget.Toast.makeText(
+                            this, "$stepAtStart curve is too flat to correct",
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                    cabinStep = when (stepAtStart) {
+                        "Quiet" -> "Normal"
+                        "Normal" -> "Loud"
+                        else -> null
+                    }
+                    if (cabinStep == null) {
+                        // The middle level is the one to leave applied; the extremes are for
+                        // switching when the listener changes the car's volume.
+                        val normal = CabinCorrectionCurve("Normal")
+                        if (normal != null) {
+                            settings.cabinActive = "Normal"
+                            FilePlayer.peek()?.refreshRouteDependentParams()
+                        }
+                        android.widget.Toast.makeText(this, "All three levels measured",
+                            android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                    refreshCabinPills()
+                }
                 val worst = result.extremes(3)
                 cabinSummary.text = buildString {
                     append("SNR %.0f dB · delay %.0f ms · %d bands\n".format(
@@ -604,7 +641,7 @@ class MainActivity : Activity() {
             }
         }
         val fit = cabinFit
-        cabinFitText.text = when {
+        val proposed = when {
             fit != null -> "Proposed: " + fit.describe() + "  (preamp %+.1f dB)".format(
                 java.util.Locale.US, fit.preampDb)
             settings.cabinActive.isNotBlank() ->
@@ -612,6 +649,22 @@ class MainActivity : Activity() {
                     (CabinCorrectionCurve(settings.cabinActive)?.describe() ?: "unreadable curve")
             else -> "No correction measured yet."
         }
+        updateCabinGuidance(proposed)
+    }
+
+    private fun saveCurve(name: String, fit: dev.alamo3.cabineq.cabin.CabinCorrection.Curve) {
+        val result = lastResult
+        val volume = getSystemService(android.media.AudioManager::class.java)
+            ?.getStreamVolume(android.media.AudioManager.STREAM_MUSIC) ?: -1
+        val meta = dev.alamo3.cabineq.cabin.CabinCorrection.Meta(
+            level = name,
+            at = System.currentTimeMillis(),
+            delayMs = result?.delayMs ?: 0.0,
+            snrDb = result?.snrDb ?: 0.0,
+            volume = volume,
+        )
+        val withMeta = dev.alamo3.cabineq.cabin.CabinCorrection.Curve(fit.bands, fit.preampDb, meta)
+        settings.setCabinCurve(name, withMeta.toJson())
     }
 
     private fun CabinCorrectionSaved(name: String) = settings.cabinCurve(name) != null
@@ -619,12 +672,54 @@ class MainActivity : Activity() {
     private fun CabinCorrectionCurve(name: String) =
         dev.alamo3.cabineq.cabin.CabinCorrection.Curve.fromJson(settings.cabinCurve(name))
 
+    /** Quiet → Normal → Loud: one sweep each, prompting for the car's volume in between. */
+    private fun startLevelWalkthrough() {
+        if (cabinMeasuring) return
+        cabinStep = "Quiet"
+        updateCabinGuidance()
+        android.widget.Toast.makeText(
+            this, "Set the car's volume LOW, then press Measure", android.widget.Toast.LENGTH_LONG,
+        ).show()
+    }
+
+    private fun updateCabinGuidance(proposed: String? = null) {
+        if (!::cabinFitText.isInitialized) return
+        val step = cabinStep
+        if (step != null) {
+            val label = when (step) { "Quiet" -> "LOW"; "Normal" -> "NORMAL"; else -> "LOUD" }
+            cabinFitText.text = "Set the car's volume to $label, then measure.\nStep ${cabinStep}/3 of the walk-through."
+            cabinButton.text = "Measure at $label volume"
+            return
+        }
+        refreshCabinButton()
+        val quiet = CabinCorrectionCurve("Quiet")
+        val loud = CabinCorrectionCurve("Loud")
+        val diff = if (quiet != null && loud != null) {
+            dev.alamo3.cabineq.cabin.CabinCorrection.levelDifference(quiet, loud)
+        } else null
+        val active = settings.cabinActive
+        cabinFitText.text = buildString {
+            if (proposed != null) append(proposed).append('\n')
+            if (diff != null) {
+                append("Your car is volume-dependent: the correction differs by ")
+                append("%+.1f dB at %.0f Hz".format(java.util.Locale.US, diff.gainDb, diff.hz))
+                append(" between low and high volume.\n")
+            }
+            append(
+                when {
+                    active.isBlank() -> "No correction applied."
+                    else -> "Applied: $active"
+                }
+            )
+        }
+    }
+
     private fun applyCabinFit() {
         val fit = cabinFit ?: run {
             android.widget.Toast.makeText(this, "Measure first, then save.", android.widget.Toast.LENGTH_SHORT).show()
             return
         }
-        settings.setCabinCurve(cabinProfile, fit.toJson())
+        saveCurve(cabinProfile, fit)
         settings.cabinActive = cabinProfile
         FilePlayer.peek()?.refreshRouteDependentParams()
         android.widget.Toast.makeText(this, "Saved as $cabinProfile — applied",
