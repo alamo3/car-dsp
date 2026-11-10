@@ -131,6 +131,9 @@ dependencies {
     // Car App Library: the media templates Android Auto/AAOS render for YT Music and Spotify
     // (sections of tiles, tabs). 1.8 adds CATEGORY_MEDIA + MediaPlaybackManager.
     implementation("androidx.car.app:app:1.9.0-alpha03")
+    // The second player engine (Settings → Playback → Player engine). ExoPlayer only: no UI,
+    // session or streaming-format modules. The DSP engine plugs in as an audio processor.
+    implementation("androidx.media3:media3-exoplayer:1.10.1")
 
     // JVM tests (src/test): the framework's org.json is only a stub off-device, so tests bring
     // a real one.

@@ -453,6 +453,30 @@ class CabinTest {
             dir.deleteRecursively()
         }
 
+        // ---- PCM into the DSP: both players use this one conversion
+        run {
+            val P = dev.alamo3.cabineq.music.Pcm
+            fun le(n: Int) = java.nio.ByteBuffer.allocate(n).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val s16 = le(8).apply { putShort(0, 16384); putShort(2, (-32768).toShort()); putShort(4, 32767); putShort(6, 0) }
+            val out = FloatArray(4)
+            P.toStereoFloat(s16, P.ENCODING_16BIT, 2, 2, out)
+            check("pcm: 16-bit stereo maps to the exact float values", out[0] == 0.5f && out[1] == -1f && out[2] == 32767 / 32768f && out[3] == 0f, out.toList())
+            check("pcm: the buffer position is left alone", s16.position() == 0)
+            val mono = le(4).apply { putShort(0, 8192); putShort(2, -8192) }
+            P.toStereoFloat(mono, P.ENCODING_16BIT, 1, 2, out)
+            check("pcm: mono is duplicated to both channels", out[0] == 0.25f && out[1] == 0.25f && out[2] == -0.25f && out[3] == -0.25f, out.toList())
+            val six = le(24).apply { for (c in 0 until 6) putShort(c * 2, (c * 1000).toShort()) }
+            P.toStereoFloat(six, P.ENCODING_16BIT, 6, 1, out)
+            check("pcm: surround keeps front left and right", out[0] == 0f && out[1] == 1000 / 32768f, out.toList())
+            val s24 = le(6).apply { put(0, 0); put(1, 0); put(2, 0x40); put(3, 0); put(4, 0); put(5, 0x80.toByte()) }
+            P.toStereoFloat(s24, P.ENCODING_24BIT_PACKED, 2, 1, out)
+            check("pcm: 24-bit keeps its full precision and sign", out[0] == 0.5f && out[1] == -1f, out.toList())
+            val fl = le(8).apply { putFloat(0, Float.NaN); putFloat(4, 9f) }
+            P.toStereoFloat(fl, P.ENCODING_FLOAT, 2, 1, out)
+            check("pcm: bad samples never reach the filters", out[0] == 0f && out[1] == 4f, out.toList())
+            check("pcm: frame sizes", P.bytesPerSample(P.ENCODING_16BIT) == 2 && P.bytesPerSample(P.ENCODING_24BIT_PACKED) == 3 && P.bytesPerSample(P.ENCODING_FLOAT) == 4)
+        }
+
         // ---- Playlist import: a YouTube library export (channels, liked videos, one real playlist)
         val csv = """Track name,Artist name,Album,Playlist name,Type,ISRC
 "Katy Perry - Roar","","","Liked videos","Favorite",""

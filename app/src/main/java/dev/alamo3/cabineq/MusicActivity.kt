@@ -2330,6 +2330,14 @@ class MusicActivity : Activity() {
         }
 
         page.addView(sectionTitle("Playback"))
+        page.addView(Ui.pill(this, "Player engine: ${if (settings.media3Player) "Media3 (new)" else "built-in"}", filled = false) {
+            settings.media3Player = !settings.media3Player
+            renderSettings()
+        }, wrapLp(top = 4))
+        page.addView(Ui.text(this,
+            "Media3 is Google's player: it does the fetching, buffering and the hand-over between songs, and your EQ and limiter run on its audio exactly as before. " +
+                "It is new here and still being proven in the car. Loudness matching is not available with it yet. Applies from the next song you start.",
+            12f, Ui.TEXT_2, lines = 6).apply { setPadding(0, dp(8), 0, dp(12)) })
         page.addView(Ui.pill(this, "Play while downloading: ${if (settings.progressivePlayback) "on" else "off"}", filled = false) {
             settings.progressivePlayback = !settings.progressivePlayback
             renderSettings()

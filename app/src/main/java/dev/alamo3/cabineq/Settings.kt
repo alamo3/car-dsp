@@ -178,6 +178,14 @@ class Settings(context: Context) {
         get() = prefs.getBoolean("progressive_playback", true)
         set(v) = prefs.edit().putBoolean("progressive_playback", v).apply()
 
+    /**
+     * Play through Media3 (ExoPlayer) instead of the app's own decode loop. Off by default while
+     * the new engine is being proven in the car; the DSP engine is the same either way.
+     */
+    var media3Player: Boolean
+        get() = prefs.getBoolean("media3_player", false)
+        set(v) = prefs.edit().putBoolean("media3_player", v).apply()
+
     /** Prefetch only on Wi-Fi/Ethernet. Off by default: the user decides. */
     var cacheWifiOnly: Boolean
         get() = prefs.getBoolean(KEY_CACHE_WIFI_ONLY, false)

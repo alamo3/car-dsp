@@ -153,6 +153,7 @@ class FilePlayer private constructor(private val context: Context) {
     fun setRepeat(mode: Repeat) {
         if (repeat == mode) return
         repeat = mode
+        exo?.repeat(mode)
         version++
         persistPool.execute { runCatching { settings.repeatMode = mode.name } }
     }
@@ -184,6 +185,7 @@ class FilePlayer private constructor(private val context: Context) {
         if (r > 0 && r != deviceRate) {
             deviceRate = r
             routeEpoch++
+            if (exoActive) exo?.routeChanged()
             runCatching { refreshRouteDependentParams() }
             Log.i(TAG, "device mixes at $r Hz")
             runCatching { CarVolume.sync(context) }
@@ -227,6 +229,7 @@ class FilePlayer private constructor(private val context: Context) {
     fun onRateSettingChanged() {
         refreshDeviceRate()
         routeEpoch++
+        if (exoActive) exo?.routeChanged()
     }
     private var thread: Thread? = null
 
@@ -274,6 +277,101 @@ class FilePlayer private constructor(private val context: Context) {
     private var eqVersion = 0
     @Volatile private var current: Output? = null
     private val meterScratch = FloatArray(5)
+
+    /**
+     * Designs the whole chain for [rate] (user EQ, cabin correction, limiter, Bluetooth guard)
+     * and pushes it into the native engine at [handle]. One implementation for both players, so
+     * the engine is configured identically whichever one feeds it. Call under [eqLock].
+     */
+    private fun pushEqLocked(handle: Long, rate: Int, bluetooth: Boolean): Boolean {
+        val bands = eqBands ?: return false
+        if (handle == 0L) return false
+        val user = EqDesign.designAll(bands, rate.toDouble())
+        // Cabin correction rides on the same engine, as extra biquads after the user's bands.
+        val cabin = cabinCurve()
+        val coeffs = if (cabin == null) user else user + cabin.coeffs(rate.toDouble(), settings.cabinAmount)
+        val bandCount = bands.size + (cabin?.bands?.size ?: 0)
+        val preamp = eqPreampDb + (cabin?.preampFor(settings.cabinAmount) ?: 0.0).toFloat()
+        val guard = if (settings.bluetoothHfGuard && bluetooth) EqDesign.lowPass(rate.toDouble(), 15500.0) else null
+        NativeDsp.setParams(
+            handle, coeffs, bandCount, EqService.dbToLin(preamp), eqLimiterLin,
+            guard, if (guard == null) 0 else 2,
+        )
+        return true
+    }
+
+    /** The active cabin correction, unless it is off or bypassed. */
+    private fun cabinCurve(): dev.alamo3.cabineq.cabin.CabinCorrection.Curve? {
+        if (settings.cabinBypass || settings.cabinAmount <= 0f) return null
+        val name = settings.cabinActive
+        if (name.isBlank()) return null
+        return dev.alamo3.cabineq.cabin.CabinCorrection.Curve.fromJson(settings.cabinCurve(name))
+    }
+
+    // ---------------------------------------------------------------- the Media3 engine
+
+    /** The second player (Settings → Playback → Player engine). Created on first use. */
+    @Volatile private var exo: dev.alamo3.cabineq.player.ExoEngine? = null
+    /** True while the Media3 engine, not the worker below, is the one playing the queue. */
+    @Volatile private var exoActive = false
+
+    private fun exoEngine(): dev.alamo3.cabineq.player.ExoEngine =
+        exo ?: synchronized(this) {
+            exo ?: dev.alamo3.cabineq.player.ExoEngine(this, Bridge()).also { exo = it }
+        }
+
+    /**
+     * Everything the Media3 engine may do to this player's published state. The engine runs on
+     * one thread (the main looper) and reports through here; nothing else of the player is open
+     * to it.
+     */
+    internal inner class Bridge {
+        val context: Context get() = this@FilePlayer.context
+        val settings: Settings get() = this@FilePlayer.settings
+        val dspLock: Any get() = eqLock
+        val eqVersion: Int get() = this@FilePlayer.eqVersion
+        val radioOn: Boolean get() = radioSeed != null && repeat == Repeat.OFF
+        val radioLooking: Boolean get() = radioBusy
+
+        fun state(s: State, reason: String? = null) = setState(s, reason)
+        fun index(i: Int) {
+            currentIndex = i
+            version++
+        }
+        fun position(ms: Long) {
+            positionMs = ms
+            lastProgressAt = SystemClock.elapsedRealtime()
+        }
+        fun duration(ms: Long, exact: Boolean) {
+            durationMs = ms
+            durationExact = exact
+        }
+        fun error(text: String?) {
+            lastError = text
+        }
+        fun info(info: FileInfo?) {
+            currentInfo = info
+            version++
+        }
+        fun quality(q: String?) {
+            declaredQuality = q
+        }
+        fun format(mime: String, rate: Int, channels: Int) = updateFormatInfo(mime, rate, 0, channels)
+        fun clearFormat() {
+            formatInfo = null
+            declaredQuality = null
+        }
+        fun snapshot(): Pair<List<Track>, List<String>> = synchronized(eqLock) { queue to queueKeys }
+        fun trackStarted() {
+            extendRadioIfNeeded()
+            scheduleSave()
+        }
+        fun askRadio() = extendRadioIfNeeded(force = true)
+        fun targetRate(sourceRate: Int): Int = this@FilePlayer.targetRate(sourceRate)
+        fun pushEq(handle: Long, rate: Int, bluetooth: Boolean): Boolean = pushEqLocked(handle, rate, bluetooth)
+        fun seedEq() = seedEqFromSettings()
+        fun save() = saveQueue()
+    }
 
     // ---------------------------------------------------------------- controls
 
@@ -323,6 +421,17 @@ class FilePlayer private constructor(private val context: Context) {
         // picked while the player was paused (focus loss, speaker guard, prior pause) would never
         // even open — it looked like "tap a song, nothing happens".
         if (state != State.LOADING) setState(State.LOADING)
+        if (settings.media3Player) {
+            // The Media3 engine takes it from here: it owns fetching, buffering, decoding and
+            // the hand-over between songs. The worker stays retired (stopWorker above).
+            exoActive = true
+            exoEngine().start(startIndex.coerceIn(0, tracks.lastIndex), startAtMs.coerceAtLeast(0))
+            return
+        }
+        if (exoActive) {
+            exoActive = false
+            exo?.shutdown()
+        }
         val gen = ++generation
         val worker = Worker(gen, startIndex.coerceIn(0, tracks.lastIndex), startAtMs.coerceAtLeast(0))
         val begin = {
@@ -348,6 +457,11 @@ class FilePlayer private constructor(private val context: Context) {
 
     fun pause() {
         if (!isActive) return
+        if (exoActive) {
+            userPaused = true
+            exo?.pause()
+            return
+        }
         userPaused = true
         interrupted = false
         setState(State.PAUSED, "paused by user")
@@ -361,6 +475,11 @@ class FilePlayer private constructor(private val context: Context) {
             if (queue.isNotEmpty()) {
                 play(queue, max(0, currentIndex), queueTitle, startAtMs = positionMs, radio = radioSeed)
             }
+            return
+        }
+        if (exoActive) {
+            userPaused = false
+            exo?.resume()
             return
         }
         userPaused = false
@@ -401,6 +520,11 @@ class FilePlayer private constructor(private val context: Context) {
 
     fun skipTo(index: Int) {
         if (index !in queue.indices) return
+        if (exoActive && isActive) {
+            userPaused = false
+            exo?.skipTo(index)
+            return
+        }
         if (thread?.isAlive == true) {
             userPaused = false
             jumpTo = index
@@ -430,6 +554,13 @@ class FilePlayer private constructor(private val context: Context) {
     fun seekTo(ms: Long) {
         if (!isActive) return
         val target = if (durationMs > 0) ms.coerceIn(0, durationMs) else ms.coerceAtLeast(0)
+        if (exoActive) {
+            positionMs = target
+            version++
+            exo?.seekTo(target)
+            scheduleSave()
+            return
+        }
         seekToMs = target
         positionMs = target
         version++
@@ -461,11 +592,14 @@ class FilePlayer private constructor(private val context: Context) {
         synchronized(eqLock) {
             queue = queue + tracks
             queueKeys = queueKeys + keys
+            // Mirrored in the same order the lists change, so the two never disagree.
+            if (exoActive) exo?.added(tracks, keys)
         }
         version++
         saveQueue()
         // A guest or the radio just queued the immediate next track: start caching it now.
-        if (queue.size - tracks.size == currentIndex + 1) {
+        // (The Media3 engine buffers ahead through its own cache.)
+        if (!exoActive && queue.size - tracks.size == currentIndex + 1) {
             MediaCache.prefetch(context, tracks.first())
         }
         return keys
@@ -487,6 +621,7 @@ class FilePlayer private constructor(private val context: Context) {
             if (i <= currentIndex) return false
             queue = queue.toMutableList().also { it.removeAt(i) }
             queueKeys = queueKeys.toMutableList().also { it.removeAt(i) }
+            if (exoActive) exo?.removed(i)
         }
         version++
         saveQueue()
@@ -508,6 +643,7 @@ class FilePlayer private constructor(private val context: Context) {
             k.add(target, keyAt)
             queue = q
             queueKeys = k
+            if (exoActive) exo?.moved(from, target)
         }
         version++
         saveQueue()
@@ -541,7 +677,7 @@ class FilePlayer private constructor(private val context: Context) {
             }
             Log.i(TAG, "Radio: queuing \"${next.title}\" — ${next.artist}")
             enqueue(listOf(next))
-            MediaCache.prefetch(context, next)
+            if (!exoActive) MediaCache.prefetch(context, next)
             if (followNewTrack) {
                 // The user pressed "next" at the end of the queue: jump to what just arrived.
                 followNewTrack = false
@@ -558,6 +694,10 @@ class FilePlayer private constructor(private val context: Context) {
         followNewTrack = false
         radioSeed = null
         persistPool.execute { runCatching { settings.radioSeed = null } }
+        if (exoActive) {
+            exoActive = false
+            exo?.shutdown()
+        }
         stopWorker()
         abandonFocus()
         positionMs = 0
@@ -571,6 +711,7 @@ class FilePlayer private constructor(private val context: Context) {
      * unblock the worker and pause with a message the user can act on.
      */
     fun recoverStalledOutput(): Boolean {
+        if (exoActive) return false          // Media3 watches its own output
         if (state != State.PLAYING) return false
         val last = lastProgressAt
         val now = SystemClock.elapsedRealtime()
@@ -611,13 +752,14 @@ class FilePlayer private constructor(private val context: Context) {
             eqLimiterLin = limiterThresholdLin
             eqVersion++
             current?.applyEqLocked()
+            if (exoActive) exo?.processor?.applyEqLocked()
         }
     }
 
     /** [inPeak, outPeak, minLimiterGain] since the last call, or null if not playing. */
     fun readMeters(): FloatArray? {
         synchronized(eqLock) {
-            val h = current?.handle ?: 0L
+            val h = if (exoActive) exo?.processor?.handle ?: 0L else current?.handle ?: 0L
             if (h == 0L || state != State.PLAYING) return null
             NativeDsp.readMeters(h, meterScratch)
             return meterScratch.copyOf()
@@ -755,36 +897,10 @@ class FilePlayer private constructor(private val context: Context) {
         fun routed(): AudioDeviceInfo? = runCatching { track.routedDevice }.getOrNull()
 
         fun applyEqLocked() {
-            val bands = eqBands ?: return
             if (handle == 0L || appliedEq == eqVersion) return
-            val user = EqDesign.designAll(bands, rate.toDouble())
-            // Cabin correction rides on the same engine, as extra biquads after the user's bands.
-            val cabin = cabinCurve()
-            val coeffs = if (cabin == null) user else user + cabin.coeffs(rate.toDouble(), settings.cabinAmount)
-            val bandCount = bands.size + (cabin?.bands?.size ?: 0)
-            val preamp = eqPreampDb + (cabin?.preampFor(settings.cabinAmount) ?: 0.0).toFloat()
-            val guard = guardCoeffs()
-            NativeDsp.setParams(
-                handle, coeffs, bandCount, EqService.dbToLin(preamp), eqLimiterLin,
-                guard, if (guard == null) 0 else 2,
-            )
-            appliedEq = eqVersion
-        }
-
-        /** The active cabin correction, unless it is off or bypassed. */
-        private fun cabinCurve(): dev.alamo3.cabineq.cabin.CabinCorrection.Curve? {
-            if (settings.cabinBypass || settings.cabinAmount <= 0f) return null
-            val name = settings.cabinActive
-            if (name.isBlank()) return null
-            return dev.alamo3.cabineq.cabin.CabinCorrection.Curve.fromJson(settings.cabinCurve(name))
-        }
-
-        /** The Bluetooth guard, or null when it does not apply to this route. */
-        private fun guardCoeffs(): DoubleArray? {
-            if (!settings.bluetoothHfGuard) return null
-            val type = runCatching { track.routedDevice?.type }.getOrNull() ?: return null
+            val type = runCatching { track.routedDevice?.type }.getOrNull()
             val bt = type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-            return if (bt) EqDesign.lowPass(rate.toDouble(), 15500.0) else null
+            if (pushEqLocked(handle, rate, bt)) appliedEq = eqVersion
         }
 
         /** Re-evaluates the guard after a route change, without rebuilding the sink. */
@@ -1615,6 +1731,7 @@ class FilePlayer private constructor(private val context: Context) {
     /** Re-pushes EQ and the Bluetooth guard after a route or setting change; no sink rebuild. */
     fun refreshRouteDependentParams() {
         liveOutput?.refreshRouteDependentParams()
+        if (exoActive) exo?.processor?.refreshRouteDependentParams()
     }
 
     fun routedDevice(): AudioDeviceInfo? = liveOutput?.routed()
@@ -1626,6 +1743,7 @@ class FilePlayer private constructor(private val context: Context) {
      */
     val audiblePositionMs: Long
         get() {
+            if (exoActive) return exo?.audiblePositionMs() ?: positionMs
             val pos = positionMs
             val o = liveOutput ?: return pos
             val queued = runCatching {
@@ -1635,7 +1753,7 @@ class FilePlayer private constructor(private val context: Context) {
             return (pos - queued * 1000L / o.rate).coerceAtLeast(0)
         }
 
-    val outputSampleRate: Int? get() = liveOutput?.trackRate()
+    val outputSampleRate: Int? get() = if (exoActive) exo?.processor?.outputRate else liveOutput?.trackRate()
 
     private fun updateFormatInfo(mime: String, rate: Int, bits: Int, channels: Int) {
         sourceCodec = mimeLabel(mime)
@@ -1700,49 +1818,11 @@ class FilePlayer private constructor(private val context: Context) {
         /** The instance if one was ever created (doesn't create one). */
         fun peek(): FilePlayer? = instance
 
-        private fun bytesPerSample(encoding: Int): Int = when (encoding) {
-            AudioFormat.ENCODING_PCM_8BIT -> 1
-            AudioFormat.ENCODING_PCM_16BIT -> 2
-            AudioFormat.ENCODING_PCM_24BIT_PACKED -> 3
-            AudioFormat.ENCODING_PCM_32BIT, AudioFormat.ENCODING_PCM_FLOAT -> 4
-            else -> 2
-        }
+        // PCM conversion lives in [dev.alamo3.cabineq.music.Pcm], shared with the Media3 engine so
+        // both feed the DSP the same samples.
+        private fun bytesPerSample(encoding: Int): Int = dev.alamo3.cabineq.music.Pcm.bytesPerSample(encoding)
 
-        /**
-         * Converts [frames] interleaved frames of any PCM encoding / channel count into
-         * interleaved stereo float. Mono is duplicated; for >2 channels the front L/R are kept.
-         */
-        private fun toStereoFloat(buf: ByteBuffer, encoding: Int, channels: Int, frames: Int, out: FloatArray) {
-            val bps = bytesPerSample(encoding)
-            val base = buf.position()
-            for (i in 0 until frames) {
-                val p = base + i * channels * bps
-                val l = sanitize(readSample(buf, p, encoding))
-                val r = if (channels >= 2) sanitize(readSample(buf, p + bps, encoding)) else l
-                out[2 * i] = l
-                out[2 * i + 1] = r
-            }
-        }
-
-        /** One bad sample must never reach the IIR filters: NaN/Inf would poison them for good. */
-        private fun sanitize(x: Float): Float = when {
-            x.isNaN() || x.isInfinite() -> 0f
-            x > 4f -> 4f
-            x < -4f -> -4f
-            else -> x
-        }
-
-        private fun readSample(buf: ByteBuffer, p: Int, encoding: Int): Float = when (encoding) {
-            AudioFormat.ENCODING_PCM_FLOAT -> buf.getFloat(p)
-            AudioFormat.ENCODING_PCM_32BIT -> buf.getInt(p) / 2147483648f
-            AudioFormat.ENCODING_PCM_24BIT_PACKED -> {
-                val v = (buf.get(p).toInt() and 0xFF) or
-                    ((buf.get(p + 1).toInt() and 0xFF) shl 8) or
-                    (buf.get(p + 2).toInt() shl 16)   // sign comes from the top byte
-                v / 8388608f
-            }
-            AudioFormat.ENCODING_PCM_8BIT -> ((buf.get(p).toInt() and 0xFF) - 128) / 128f
-            else -> buf.getShort(p) / 32768f
-        }
+        private fun toStereoFloat(buf: ByteBuffer, encoding: Int, channels: Int, frames: Int, out: FloatArray) =
+            dev.alamo3.cabineq.music.Pcm.toStereoFloat(buf, encoding, channels, frames, out)
     }
 }
