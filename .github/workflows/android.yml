@@ -47,6 +47,16 @@ jobs:
           mkdir -p out
           cp app/build/outputs/apk/release/app-release.apk "out/cabineq-v$VERSION_NAME.apk"
 
+      # Google Play takes an app bundle, not an APK. Same key: it becomes the Play upload key.
+      - name: Build signed release bundle (Google Play)
+        if: env.HAS_SIGNING == 'true'
+        env:
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          ./gradlew --no-daemon bundleRelease \
+            -PcabinVersionCode=$VERSION_CODE -PcabinVersionName=$VERSION_NAME
+          cp app/build/outputs/bundle/release/app-release.aab "out/cabineq-v$VERSION_NAME.aab"
+
       - name: Build debug APK (no signing secrets configured)
         if: env.HAS_SIGNING != 'true'
         run: |
@@ -61,6 +71,13 @@ jobs:
         with:
           name: cabineq-apk
           path: out/*.apk
+
+      - name: Upload Play bundle artifact
+        if: env.HAS_SIGNING == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cabineq-play-bundle
+          path: out/*.aab
 
       - name: Publish GitHub release
         if: env.HAS_SIGNING == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
