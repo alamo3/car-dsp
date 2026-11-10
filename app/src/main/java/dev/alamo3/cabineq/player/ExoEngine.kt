@@ -67,7 +67,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
 
     private val context: Context = bridge.context
     private val main = Handler(Looper.getMainLooper())
-    val processor = DspAudioProcessor(bridge)
+    val sink = DspAudioSink(bridge)
 
     // ---- main-thread state ---------------------------------------------------------------
     private var player: ExoPlayer? = null
@@ -209,8 +209,8 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
 
     private fun rebuildFor(p: ExoPlayer, sourceRate: Int) {
         val want = bridge.targetRate(sourceRate)
-        if (processor.outputRate == null || processor.outputRate == want) {
-            processor.refreshRouteDependentParams()
+        if (sink.outputRate == null || sink.outputRate == want) {
+            sink.refreshRouteDependentParams()
             return
         }
         // The engine is built for the old rate. Stopping and preparing again keeps the playlist
@@ -251,24 +251,13 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     private fun ensurePlayer(): ExoPlayer {
         player?.let { return it }
         val renderers = object : DefaultRenderersFactory(context) {
+            // The DSP is the sink itself (see DspAudioSink): float in, float out, no processor
+            // chain for Media3 to skip.
             override fun buildAudioSink(
                 context: Context,
                 enableFloatOutput: Boolean,
                 enableAudioTrackPlaybackParams: Boolean,
-            ): AudioSink = DefaultAudioSink.Builder(context)
-                // The DSP is the only processor, and it emits float (that is what the native
-                // engine works in). The sink has to be told float is acceptable — with it off,
-                // Media3 rejects the processor's own output format and playback dies with
-                // UnhandledAudioFormatException, which is exactly what happened the first time
-                // this engine met a real decoder.
-                .setAudioProcessors(arrayOf(processor))
-                // Float output must stay OFF: Media3's sink adds toFloatPcmAudioProcessor and
-                // *skips the custom processor chain entirely* when it takes the float path
-                // (DefaultAudioSink.configureProcessing). With float on, the EQ simply does not
-                // run and audio plays at the source rate. The integer path is the only one that
-                // keeps our processor in the pipeline.
-                .setEnableFloatOutput(false)
-                .build()
+            ): AudioSink = sink
         }
         val built = ExoPlayer.Builder(context, renderers)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSources()))

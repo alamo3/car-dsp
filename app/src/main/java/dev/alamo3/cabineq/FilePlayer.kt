@@ -752,14 +752,14 @@ class FilePlayer private constructor(private val context: Context) {
             eqLimiterLin = limiterThresholdLin
             eqVersion++
             current?.applyEqLocked()
-            if (exoActive) exo?.processor?.applyEqLocked()
+            if (exoActive) exo?.sink?.applyEq()
         }
     }
 
     /** [inPeak, outPeak, minLimiterGain] since the last call, or null if not playing. */
     fun readMeters(): FloatArray? {
         synchronized(eqLock) {
-            val h = if (exoActive) exo?.processor?.handle ?: 0L else current?.handle ?: 0L
+            val h = if (exoActive) exo?.sink?.handleOrZero ?: 0L else current?.handle ?: 0L
             if (h == 0L || state != State.PLAYING) return null
             NativeDsp.readMeters(h, meterScratch)
             return meterScratch.copyOf()
@@ -1731,7 +1731,7 @@ class FilePlayer private constructor(private val context: Context) {
     /** Re-pushes EQ and the Bluetooth guard after a route or setting change; no sink rebuild. */
     fun refreshRouteDependentParams() {
         liveOutput?.refreshRouteDependentParams()
-        if (exoActive) exo?.processor?.refreshRouteDependentParams()
+        if (exoActive) exo?.sink?.refreshRouteDependentParams()
     }
 
     fun routedDevice(): AudioDeviceInfo? = liveOutput?.routed()
@@ -1753,7 +1753,7 @@ class FilePlayer private constructor(private val context: Context) {
             return (pos - queued * 1000L / o.rate).coerceAtLeast(0)
         }
 
-    val outputSampleRate: Int? get() = if (exoActive) exo?.processor?.outputRate else liveOutput?.trackRate()
+    val outputSampleRate: Int? get() = if (exoActive) exo?.sink?.outputRate else liveOutput?.trackRate()
 
     private fun updateFormatInfo(mime: String, rate: Int, bits: Int, channels: Int) {
         sourceCodec = mimeLabel(mime)

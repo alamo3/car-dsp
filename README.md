@@ -350,12 +350,18 @@ if (shouldUseFloatOutput(inputFormat.pcmEncoding)) {
 }
 ```
 
-So `setEnableFloatOutput(true)` silently removes the whole equaliser — audio plays, at the source
-rate, untouched. The engine therefore keeps float output off and hands the DSP's result back as
-16-bit (`DspAudioProcessor.onConfigure` returns `ENCODING_PCM_16BIT` at the device rate). The
-native engine still works in float internally and resamples to the rate the device mixes at, so
-the mixer still has nothing to convert — only the hand-over to Media3 is 16-bit, which is a
-precision trade the Media3 design forces (the built-in engine keeps float end to end).
+So an `AudioProcessor` cannot give us both float and the equaliser: float output silently drops
+the whole chain (audio plays, at the source rate, untouched — which is how it behaved before this
+was found), and the integer path runs it at 16-bit.
+
+The engine therefore **owns the sink**: `DspAudioSink` implements `AudioSink`, runs the native
+engine in float, resamples to the rate the device mixes at, and hands `DefaultAudioSink` — built
+with float output and *no* processors — a float buffer to buffer and play. The hard parts (the
+AudioTrack, its buffer, timestamps, drain, gapless) stay Media3's.
+
+Verified in the emulator: the mixer reports `00000005` (**PCM_FLOAT**) at **48000 Hz** for a 44.1
+and a 96 kHz track, `engine at 48000 Hz, resampling from …` in the log, position advancing, skips
+clean.
 
 ## Android Auto / Automotive
 
