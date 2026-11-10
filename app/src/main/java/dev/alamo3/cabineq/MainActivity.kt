@@ -39,6 +39,10 @@ class MainActivity : Activity() {
     private lateinit var cabinSummary: TextView
     private lateinit var cabinButton: Button
     private var cabinMeasuring = false
+    private var cabinFit: dev.alamo3.cabineq.cabin.CabinCorrection.Curve? = null
+    private var cabinProfile = "Normal"
+    private lateinit var cabinFitText: TextView
+    private lateinit var cabinPills: LinearLayout
     private val cabinExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "CabinEQ-Measure").apply { isDaemon = true }
     }
@@ -298,6 +302,31 @@ class MainActivity : Activity() {
             setOnClickListener { startCabinMeasure() }
         }
         root.addView(cabinButton)
+
+        cabinFitText = TextView(this).apply {
+            textSize = 12f
+            setPadding(0, dp(8), 0, dp(4))
+        }
+        root.addView(cabinFitText)
+        cabinPills = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        root.addView(cabinPills)
+        root.addView(Button(this).apply {
+            text = "Save measurement as correction"
+            setOnClickListener { applyCabinFit() }
+        })
+        slider(
+            root, format = { "Correction amount  ${it.roundToInt()}%" },
+            min = 0f, max = 100f, step = 5f, initial = settings.cabinAmount * 100f,
+        ) {
+            settings.cabinAmount = it / 100f
+            FilePlayer.peek()?.refreshRouteDependentParams()
+        }
+        root.addView(switch("Bypass cabin correction", settings.cabinBypass) { on ->
+            settings.cabinBypass = on
+            FilePlayer.peek()?.refreshRouteDependentParams()
+            refreshCabinPills()
+        })
+        refreshCabinPills()
         refreshCabinButton()
 
         // --- Speed compensation ---
@@ -528,15 +557,79 @@ class MainActivity : Activity() {
                     return@runOnUiThread
                 }
                 cabinView.set(result.points)
+                cabinFit = dev.alamo3.cabineq.cabin.CabinCorrection.fit(result.points)
+                refreshCabinPills()
                 val worst = result.extremes(3)
                 cabinSummary.text = buildString {
-                    append("SNR %.0f dB · %d bands\n".format(java.util.Locale.US, result.snrDb, result.points.size))
+                    append("SNR %.0f dB · delay %.0f ms · %d bands\n".format(
+                        java.util.Locale.US, result.snrDb, result.delayMs, result.points.size))
                     for (p in worst) append("  %5.0f Hz  %+.1f dB\n".format(java.util.Locale.US, p.hz, p.db))
                     if (result.snrDb < 20) append("Low SNR: turn the volume up and measure again.")
                 }
                 if (wasPlaying) player?.resume()
             }
         }
+    }
+
+    /** None / Quiet / Normal / Loud: which stored correction is applied right now. */
+    private fun refreshCabinPills() {
+        if (!::cabinPills.isInitialized) return
+        cabinPills.removeAllViews()
+        val active = settings.cabinActive
+        fun pill(label: String, selected: Boolean, onClick: () -> Unit) {
+            cabinPills.addView(Ui.pill(this, label, filled = selected, onClick = onClick)
+                .apply { setPadding(dp(16), dp(9), dp(16), dp(9)); textSize = 13f },
+                LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { rightMargin = dp(8) })
+        }
+        pill("Off", active.isBlank()) {
+            settings.cabinActive = ""
+            FilePlayer.peek()?.refreshRouteDependentParams()
+            refreshCabinPills()
+        }
+        for (level in listOf("Quiet", "Normal", "Loud")) {
+            val saved = CabinCorrectionSaved(level)
+            pill(level, active == level) {
+                cabinProfile = level
+                if (saved) {
+                    settings.cabinActive = level
+                    FilePlayer.peek()?.refreshRouteDependentParams()
+                } else {
+                    android.widget.Toast.makeText(this, "No $level measurement yet — measure, then save.",
+                android.widget.Toast.LENGTH_SHORT).show()
+                }
+                refreshCabinPills()
+            }
+        }
+        val fit = cabinFit
+        cabinFitText.text = when {
+            fit != null -> "Proposed: " + fit.describe() + "  (preamp %+.1f dB)".format(
+                java.util.Locale.US, fit.preampDb)
+            settings.cabinActive.isNotBlank() ->
+                "Active: " + (settings.cabinActive) + " · " +
+                    (CabinCorrectionCurve(settings.cabinActive)?.describe() ?: "unreadable curve")
+            else -> "No correction measured yet."
+        }
+    }
+
+    private fun CabinCorrectionSaved(name: String) = settings.cabinCurve(name) != null
+
+    private fun CabinCorrectionCurve(name: String) =
+        dev.alamo3.cabineq.cabin.CabinCorrection.Curve.fromJson(settings.cabinCurve(name))
+
+    private fun applyCabinFit() {
+        val fit = cabinFit ?: run {
+            android.widget.Toast.makeText(this, "Measure first, then save.", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        settings.setCabinCurve(cabinProfile, fit.toJson())
+        settings.cabinActive = cabinProfile
+        FilePlayer.peek()?.refreshRouteDependentParams()
+        android.widget.Toast.makeText(this, "Saved as $cabinProfile — applied",
+            android.widget.Toast.LENGTH_SHORT).show()
+        refreshCabinPills()
     }
 
     private fun refreshCabinButton() {

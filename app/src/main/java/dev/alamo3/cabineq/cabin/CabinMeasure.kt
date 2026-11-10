@@ -34,6 +34,13 @@ object CabinMeasure {
     const val TRUSTED_LOW_HZ = 100.0
     const val TRUSTED_HIGH_HZ = 8000.0
 
+    /**
+     * Below this the response is dominated by cabin modes, which an EQ can correct; above it by
+     * the direct sound and early reflections, where correcting interference does more harm than
+     * good. The curve blends between the two measurements here.
+     */
+    const val CROSSOVER_HZ = 250.0
+
     class Point(val hz: Double, val db: Double)
 
     class Result(
@@ -42,6 +49,12 @@ object CabinMeasure {
         val sweepSeconds: Double,
         /** Signal-to-noise: sweep level above the noise floor, in dB. */
         val snrDb: Double,
+        /**
+         * Round trip from writing a sample to hearing it: AudioTrack buffering, the car's link,
+         * its DSP, the speakers, the air, the microphone. Found from the deconvolved impulse
+         * response, so it is measured rather than assumed.
+         */
+        val delayMs: Double,
     ) {
         /** Peaks and dips inside the trusted band, worst first — what a correction would target. */
         fun extremes(count: Int = 4): List<Point> {
@@ -142,18 +155,57 @@ object CabinMeasure {
             fft(reX, imX)
             fft(reY, imY)
 
+            // Deconvolve: H = Y·conj(X) / (|X|² + ε). The impulse response's peak is the delay,
+            // and it separates the direct sound from the reflections that follow it.
+            val reH = DoubleArray(n)
+            val imH = DoubleArray(n)
+            for (b in 0 until n) {
+                val xr = reX[b]
+                val xi = -imX[b]                      // conj(X)
+                val denom = reX[b] * reX[b] + imX[b] * imX[b] + 1e-6 * sweep.size
+                reH[b] = (reY[b] * xr - imY[b] * xi) / denom
+                imH[b] = (reY[b] * xi + imY[b] * xr) / denom
+            }
+            // Inverse FFT: conjugate, forward, conjugate.
+            for (b in imH.indices) imH[b] = -imH[b]
+            fft(reH, imH)
+            for (b in imH.indices) imH[b] = -imH[b] / n
+
+            var peak = 0
+            for (b in 0 until n / 2) if (Math.abs(reH[b]) > Math.abs(reH[peak])) peak = b
+            val delayMs = (peak - leadMs).toDouble().coerceAtLeast(0.0)
+
             val binHz = SAMPLE_RATE.toDouble() / n
-            val transfer = DoubleArray(n / 2)
+            // Two views of the same measurement: the direct sound (gated, what an EQ can fix)
+            // and everything the microphone heard (ungated, which is what the cabin modes are).
+            val gated = DoubleArray(n / 2)
+            val full = DoubleArray(n / 2)
             for (b in 1 until n / 2) {
                 val mx = Math.hypot(reX[b], imX[b])
-                val my = Math.hypot(reY[b], imY[b])
-                transfer[b] = if (mx > 1e-9) my / mx else 0.0
+                full[b] = if (mx > 1e-9) Math.hypot(reY[b], imY[b]) / mx else 0.0
             }
-            val points = smooth(transfer, binHz)
+            val half = (0.020 * SAMPLE_RATE).toInt()      // ±20 ms: direct sound, no reflections
+            val window = DoubleArray(2 * half) { k -> 0.5 - 0.5 * Math.cos(2 * Math.PI * k / (2 * half - 1)) }
+            val reG = DoubleArray(n)
+            val imG = DoubleArray(n)
+            for (k in 0 until 2 * half) {
+                val idx = ((peak - half + k) % n + n) % n
+                reG[idx] = reH[idx] * window[k]
+                imG[idx] = imH[idx] * window[k]
+            }
+            fft(reG, imG)
+            for (b in 1 until n / 2) gated[b] = Math.hypot(reG[b], imG[b])
+
+            // Blend: below ~250 Hz use the full response (that is where the modes are and where
+            // the gate would truncate them); above it use the direct sound, because correcting
+            // interference patterns would only move them around.
+            val blend = DoubleArray(n / 2) { b -> b.toDouble() * binHz }
+            val points = smooth(full, gated, blend, binHz)
             val snr = snrDb(captured, from, sweep.size)
-            Log.i(TAG, "measured ${points.size} bands, snr %.1f dB".format(java.util.Locale.US, snr))
+            Log.i(TAG, "measured ${points.size} bands, delay %.0f ms, snr %.1f dB"
+                .format(java.util.Locale.US, delayMs, snr))
             onProgress("Done", 1f)
-            return Result(points, seconds, snr)
+            return Result(points, seconds, snr, delayMs)
         } finally {
             runCatching { record.stop() }
             runCatching { record.release() }
@@ -281,8 +333,17 @@ object CabinMeasure {
         }
     }
 
-    /** 1/6-octave power averaging, normalised to the median so the curve is relative. */
-    private fun smooth(transfer: DoubleArray, binHz: Double, pointsPerOctave: Int = 6): List<Point> {
+    /**
+     * 1/6-octave power averaging of the direct and full responses, blended at [CROSSOVER_HZ],
+     * then normalised to the median of the trusted band so the curve is relative.
+     */
+    private fun smooth(
+        full: DoubleArray,
+        gated: DoubleArray,
+        bins: DoubleArray,
+        binHz: Double,
+        pointsPerOctave: Int = 6,
+    ): List<Point> {
         val out = ArrayList<Point>()
         var f = 20.0
         val top = SAMPLE_RATE / 2.4
@@ -290,16 +351,24 @@ object CabinMeasure {
             val lo = f * Math.pow(2.0, -0.5 / pointsPerOctave)
             val hi = f * Math.pow(2.0, 0.5 / pointsPerOctave)
             val b0 = maxOf(1, (lo / binHz).toInt())
-            val b1 = minOf(transfer.size - 1, (hi / binHz).toInt())
+            val b1 = minOf(full.size - 1, (hi / binHz).toInt())
             if (b1 >= b0) {
-                var power = 0.0
-                for (b in b0..b1) power += transfer[b] * transfer[b]
-                power /= (b1 - b0 + 1)
+                var pf = 0.0
+                var pg = 0.0
+                for (b in b0..b1) {
+                    pf += full[b] * full[b]
+                    pg += gated[b] * gated[b]
+                }
+                val count = (b1 - b0 + 1).toDouble()
+                pf /= count
+                pg /= count
+                // Crossfade over one octave around the crossover.
+                val t = ((Math.log10(f / CROSSOVER_HZ)) / Math.log10(2.0) + 0.5).coerceIn(0.0, 1.0)
+                val power = pf * (1 - t) + pg * t
                 if (power > 0) out.add(Point(f, 10 * Math.log10(power)))
             }
             f *= Math.pow(2.0, 1.0 / pointsPerOctave)
         }
-        // Relative curve: the median inside the trusted band becomes 0 dB.
         val band = out.filter { it.hz in TRUSTED_LOW_HZ..TRUSTED_HIGH_HZ }.map { it.db }.sorted()
         if (band.isNotEmpty()) {
             val median = band[band.size / 2]

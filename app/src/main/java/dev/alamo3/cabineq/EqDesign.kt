@@ -30,6 +30,13 @@ object EqDesign {
         return out
     }
 
+    /** Public peaking-filter design, for callers that do not use the fixed band layout. */
+    fun peakingBand(f0: Double, gainDb: Double, q: Double, fs: Double): DoubleArray {
+        if (kotlin.math.abs(gainDb) < 0.01) return doubleArrayOf(1.0, 0.0, 0.0, 0.0, 0.0)
+        val f = if (f0 < fs * 0.45) f0 else fs * 0.45
+        return peaking(f, 10.0.pow(gainDb / 40.0), q, fs)
+    }
+
     fun design(band: Int, gainDb: Double, fs: Double): DoubleArray {
         if (kotlin.math.abs(gainDb) < 0.01) return doubleArrayOf(1.0, 0.0, 0.0, 0.0, 0.0)
         val a = 10.0.pow(gainDb / 40.0)

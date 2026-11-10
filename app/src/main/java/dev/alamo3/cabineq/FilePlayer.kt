@@ -711,13 +711,26 @@ class FilePlayer private constructor(private val context: Context) {
         fun applyEqLocked() {
             val bands = eqBands ?: return
             if (handle == 0L || appliedEq == eqVersion) return
-            val coeffs = EqDesign.designAll(bands, rate.toDouble())
+            val user = EqDesign.designAll(bands, rate.toDouble())
+            // Cabin correction rides on the same engine, as extra biquads after the user's bands.
+            val cabin = cabinCurve()
+            val coeffs = if (cabin == null) user else user + cabin.coeffs(rate.toDouble(), settings.cabinAmount)
+            val bandCount = bands.size + (cabin?.bands?.size ?: 0)
+            val preamp = eqPreampDb + (cabin?.preampFor(settings.cabinAmount) ?: 0.0).toFloat()
             val guard = guardCoeffs()
             NativeDsp.setParams(
-                handle, coeffs, bands.size, EqService.dbToLin(eqPreampDb), eqLimiterLin,
+                handle, coeffs, bandCount, EqService.dbToLin(preamp), eqLimiterLin,
                 guard, if (guard == null) 0 else 2,
             )
             appliedEq = eqVersion
+        }
+
+        /** The active cabin correction, unless it is off or bypassed. */
+        private fun cabinCurve(): dev.alamo3.cabineq.cabin.CabinCorrection.Curve? {
+            if (settings.cabinBypass || settings.cabinAmount <= 0f) return null
+            val name = settings.cabinActive
+            if (name.isBlank()) return null
+            return dev.alamo3.cabineq.cabin.CabinCorrection.Curve.fromJson(settings.cabinCurve(name))
         }
 
         /** The Bluetooth guard, or null when it does not apply to this route. */

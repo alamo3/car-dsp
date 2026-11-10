@@ -25,7 +25,7 @@
 
 namespace cabin {
 
-constexpr int kMaxBands = 16;
+constexpr int kMaxBands = 32;   // the user's 10 bands plus a cabin correction of up to ~12
 
 struct BiquadCoeffs {
     double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;

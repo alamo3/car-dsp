@@ -141,6 +141,29 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_CACHE_WIFI_ONLY, false)
         set(v) = prefs.edit().putBoolean(KEY_CACHE_WIFI_ONLY, v).apply()
 
+    /** Cabin correction curve saved under a level name ("Quiet", "Normal", "Loud"). */
+    fun cabinCurve(name: String): String? =
+        if (name.isBlank()) null else prefs.getString("cabin_curve_$name", null)
+
+    fun setCabinCurve(name: String, json: String?) {
+        if (name.isBlank()) return
+        prefs.edit().apply { if (json == null) remove("cabin_curve_$name") else putString("cabin_curve_$name", json) }.apply()
+    }
+
+    /** Which saved correction is applied, or blank for none. */
+    var cabinActive: String
+        get() = prefs.getString("cabin_active", "") ?: ""
+        set(v) = prefs.edit().putString("cabin_active", v).apply()
+
+    /** How much of the correction to apply, 0..1. */
+    var cabinAmount: Float
+        get() = prefs.getFloat("cabin_amount", 1f)
+        set(v) = prefs.edit().putFloat("cabin_amount", v.coerceIn(0f, 1f)).apply()
+
+    var cabinBypass: Boolean
+        get() = prefs.getBoolean("cabin_bypass", false)
+        set(v) = prefs.edit().putBoolean("cabin_bypass", v).apply()
+
     /** Playlists imported from another service, so they can be listed and forgotten. */
     fun importedPlaylists(): List<String> =
         (prefs.getStringSet(KEY_IMPORTED_PLAYLISTS, emptySet()) ?: emptySet()).sorted()

@@ -252,14 +252,37 @@ modes, speakers, the head unit's DSP, and the microphone itself. It is therefore
 curve, and only **100 Hz – 8 kHz** is trusted (those mics are roughly flat there); the view dims
 the rest. Peaks and dips inside the trusted band are listed under the curve.
 
-Validated offline against a synthetic "car" (two cabin modes, a 3 kHz dip, a high shelf): the
-measurement recovers it to **0.11 dB** from 100 Hz–1 kHz and 0.03 dB above, using the same
-formulas as `CabinMeasure`.
+### Delay, and why it is measured
 
-Volume dependence is the next problem, and it has a hard limit: **over Android Auto the car's
-volume is not readable by an app**. The plan is to measure at quiet/normal/loud, keep one curve
-per level, and let the listener pick — because we cannot pick for them. Correction (a limited
-inverse as an extra biquad layer) comes after the curve can be trusted per level.
+Everything in the chain adds latency: AudioTrack buffering, the car's link (Bluetooth alone is
+100–250 ms), its DSP, the speakers, the air, the microphone. The analysis therefore does not
+assume the recording lines up with the sweep — it **deconvolves** (`H = Y·conj(X)/(|X|²+ε)`) and
+takes the peak of the resulting impulse response as the delay, then reports it next to the curve.
+Verified against a synthetic response delayed by 0/120/250/600 ms: recovered **exactly** at all
+four, which also proves the window is wide enough for Bluetooth's worst case.
+
+Two magnitude views come out of the same measurement, and the curve blends them at 250 Hz:
+
+- **below 250 Hz, ungated** — cabin modes live there, and gating would truncate them;
+- **above 250 Hz, gated to ±20 ms** — the direct sound, because correcting interference patterns
+  (reflections comb-filtering the response) only moves the problem elsewhere.
+
+Measured offline: gated 1.2 dB and ungated 2.6 dB of error against a synthetic car with two
+reflections, versus 0.03 dB with no reflections — i.e. the residual is the actual acoustic
+comb filtering, not an analysis error.
+
+### Correction (conservative for now)
+
+`CabinCorrection` fits the inverse as peaking biquads (Q 1.6, ten bands, 100 Hz–8 kHz, tapered at
+the edges), **cut-first**: cuts to −12 dB, boosts capped at +6 dB, and the preamp is lowered by the
+largest boost so the limiter does not work harder. It is applied as extra bands on top of the
+user's 10-band EQ, with an amount slider and a bypass switch, and saved per level
+(None/Quiet/Normal/Loud) because the car's volume is not readable over AA.
+
+**Known limitation:** overlapping filters sum, so the band gains are scaled by 0.5 to
+under-correct deliberately. A proper least-squares solve (evaluate the designed cascade, adjust
+until the residual is minimal) is the next step — under-correcting sounds like a smaller
+improvement, over-correcting sounds broken.
 
 ## Android Auto / Automotive
 
