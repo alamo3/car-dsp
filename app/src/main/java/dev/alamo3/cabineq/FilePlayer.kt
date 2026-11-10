@@ -62,12 +62,12 @@ class FilePlayer private constructor(private val context: Context) {
     @Volatile var lastProgressAt = 0L
         private set
     @Volatile var durationMs = 0L
+        private set
     /**
      * True once [durationMs] is the decoder's own length rather than what the catalogue
      * claimed. Lyrics are matched by length, so they wait for this.
      */
     @Volatile var durationExact = false
-        private set
         private set
     /** e.g. "FLAC 44.1 kHz / 16-bit · lossless" */
     @Volatile var formatInfo: String? = null
