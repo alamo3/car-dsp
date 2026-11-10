@@ -335,6 +335,7 @@ private:
         if (!dirty_.load(std::memory_order_acquire)) return;
         if (!mutex_.try_lock()) return;  // control thread is writing; take it next block
         const int oldBands = active_.bandCount;
+        const int oldGuardCount = active_.guardCount;
         active_ = pending_;
         dirty_.store(false, std::memory_order_relaxed);
         mutex_.unlock();
@@ -342,6 +343,13 @@ private:
         for (int b = oldBands; b < active_.bandCount; ++b) {
             stateL_[b] = BiquadState{};
             stateR_[b] = BiquadState{};
+        }
+        // Same for the output guard: re-enabling it must not ring with old samples.
+        if (active_.guardCount != oldGuardCount) {
+            for (int g = 0; g < 2; ++g) {
+                guardL_[g] = BiquadState{};
+                guardR_[g] = BiquadState{};
+            }
         }
     }
 

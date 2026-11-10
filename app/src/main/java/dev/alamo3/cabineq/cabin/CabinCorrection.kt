@@ -46,6 +46,7 @@ object CabinCorrection {
             val out = DoubleArray(bands.size * 5)
             var i = 0
             for (b in bands) {
+                if (!b.hz.isFinite() || !b.gainDb.isFinite()) continue
                 val c = EqDesign.peakingBand(b.hz, b.gainDb * amount, Q, fs)
                 c.copyInto(out, i * 5)
                 i++
@@ -72,7 +73,10 @@ object CabinCorrection {
                     val arr = o.optJSONArray("bands") ?: return null
                     val bands = (0 until arr.length()).mapNotNull { i ->
                         val b = arr.optJSONObject(i) ?: return@mapNotNull null
-                        Band(b.optDouble("hz"), b.optDouble("db"))
+                        val hz = b.optDouble("hz", Double.NaN)
+                        val db = b.optDouble("db", Double.NaN)
+                        // A NaN here would design a NaN filter and mute the chain.
+                        if (!hz.isFinite() || hz <= 0.0 || !db.isFinite()) null else Band(hz, db)
                     }
                     if (bands.isEmpty()) null else Curve(bands, o.optDouble("preamp", 0.0))
                 }.getOrNull()

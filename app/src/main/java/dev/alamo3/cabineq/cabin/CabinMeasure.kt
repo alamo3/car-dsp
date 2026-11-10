@@ -173,7 +173,10 @@ object CabinMeasure {
 
             var peak = 0
             for (b in 0 until n / 2) if (Math.abs(reH[b]) > Math.abs(reH[peak])) peak = b
-            val delayMs = (peak - leadMs).toDouble().coerceAtLeast(0.0)
+            // The IR starts at the analysis window, which starts when the sweep was scheduled to
+            // play — so the peak *is* the round trip, in samples. (This used to subtract leadMs,
+            // a millisecond count, from a sample index: 48x wrong.)
+            val delayMs = peak * 1000.0 / SAMPLE_RATE
 
             val binHz = SAMPLE_RATE.toDouble() / n
             // Two views of the same measurement: the direct sound (gated, what an EQ can fix)
@@ -185,22 +188,30 @@ object CabinMeasure {
                 full[b] = if (mx > 1e-9) Math.hypot(reY[b], imY[b]) / mx else 0.0
             }
             val half = (0.020 * SAMPLE_RATE).toInt()      // ±20 ms: direct sound, no reflections
-            val window = DoubleArray(2 * half) { k -> 0.5 - 0.5 * Math.cos(2 * Math.PI * k / (2 * half - 1)) }
-            val reG = DoubleArray(n)
-            val imG = DoubleArray(n)
+            // Gate the impulse response: keep ±20 ms around the peak with a Hann taper, drop the
+            // rest (that is where the reflections live). The window is copied out, the big arrays
+            // are cleared, and the gated IR is placed at the start — a shift is only linear phase.
+            val gateRe = DoubleArray(2 * half)
+            val gateIm = DoubleArray(2 * half)
             for (k in 0 until 2 * half) {
                 val idx = ((peak - half + k) % n + n) % n
-                reG[idx] = reH[idx] * window[k]
-                imG[idx] = imH[idx] * window[k]
+                val w = 0.5 - 0.5 * Math.cos(2 * Math.PI * k / (2 * half - 1))
+                gateRe[k] = reH[idx] * w
+                gateIm[k] = imH[idx] * w
             }
-            fft(reG, imG)
-            for (b in 1 until n / 2) gated[b] = Math.hypot(reG[b], imG[b])
+            java.util.Arrays.fill(reH, 0.0)
+            java.util.Arrays.fill(imH, 0.0)
+            for (k in 0 until 2 * half) {
+                reH[k] = gateRe[k]
+                imH[k] = gateIm[k]
+            }
+            fft(reH, imH)
+            for (b in 1 until n / 2) gated[b] = Math.hypot(reH[b], imH[b])
 
             // Blend: below ~250 Hz use the full response (that is where the modes are and where
             // the gate would truncate them); above it use the direct sound, because correcting
             // interference patterns would only move them around.
-            val blend = DoubleArray(n / 2) { b -> b.toDouble() * binHz }
-            val points = smooth(full, gated, blend, binHz)
+            val points = smooth(full, gated, binHz)
             val snr = snrDb(captured, from, sweep.size)
             Log.i(TAG, "measured ${points.size} bands, delay %.0f ms, snr %.1f dB"
                 .format(java.util.Locale.US, delayMs, snr))
@@ -340,7 +351,6 @@ object CabinMeasure {
     private fun smooth(
         full: DoubleArray,
         gated: DoubleArray,
-        bins: DoubleArray,
         binHz: Double,
         pointsPerOctave: Int = 6,
     ): List<Point> {
