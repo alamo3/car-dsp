@@ -42,6 +42,8 @@ object MediaBrowse {
     private const val SEARCH_NODE = "searches"
     private const val SAVED_SEARCH = "srch:"
     private const val RECENT_ITEM = "q:"
+    private const val DOWNLOADS = "downloads"
+    private const val DOWNLOAD = "dl:"
 
     private const val ART_PX = 512
     private class Memo(val at: Long, val items: List<MediaBrowser.MediaItem>)
@@ -73,6 +75,8 @@ object MediaBrowse {
         parentId == RECENT -> recent(context)
         parentId == FOR_YOU -> forYou(context)
         parentId == SEARCH_NODE -> savedSearches(context)
+        parentId == DOWNLOADS -> downloads(context)
+        parentId.startsWith(DOWNLOAD) -> downloadTracks(context, parentId)
         parentId.startsWith(TORRENT) -> memoized(parentId) { torrentTracks(context, parentId) }
         parentId.startsWith(ALBUM) -> memoized(parentId) { albumTracks(context, parentId) }
         parentId.startsWith(PLAYLIST) -> memoized(parentId) { playlistTracks(context, parentId) }
@@ -135,7 +139,11 @@ object MediaBrowse {
         val settings = Settings(context)
         val hasAddon = settings.addonLink.isNotBlank()
         val hasHistory = settings.playHistory().isNotEmpty()
-        val nodes = ArrayList<MediaBrowser.MediaItem>(3)
+        val nodes = ArrayList<MediaBrowser.MediaItem>(4)
+        // First: the one tab that works in a dead zone.
+        if (Downloads.collections(context).isNotEmpty()) {
+            nodes += item(DOWNLOADS, "Downloads", "On this phone — plays offline", browsable = true)
+        }
         if (hasAddon && hasHistory) {
             nodes += item(FOR_YOU, "For you", "More from the artists you play", browsable = true)
         }
@@ -176,6 +184,11 @@ object MediaBrowse {
             parent.startsWith(TORRENT) -> torrentPlayback(context, parent, child)
             parent.startsWith(ALBUM) -> albumPlayback(context, parent, child)
             parent.startsWith(PLAYLIST) -> playlistPlayback(context, parent, child)
+            parent.startsWith(DOWNLOAD) -> {
+                val c = Downloads.find(context, parent.removePrefix(DOWNLOAD)) ?: return null
+                val index = c.tracks.indexOfFirst { it.mediaId == Uri.decode(child) }
+                Playback(c.title, c.tracks, index.coerceAtLeast(0))
+            }
             else -> null
         }
     }
@@ -523,6 +536,35 @@ object MediaBrowse {
             // only reliable identity; fall back to the title/artist pair when it is missing.
             .distinctBy { it.isrc ?: "${it.title.trim().lowercase()}|${it.artist?.trim()?.lowercase().orEmpty()}" }
             .take(MAX_ROWS)
+    }
+
+    private fun downloads(context: Context): List<MediaBrowser.MediaItem> =
+        Downloads.collections(context).map { c ->
+            val st = Downloads.status(context, c)
+            item(
+                id = DOWNLOAD + c.id,
+                title = c.title,
+                subtitle = if (st.complete) "${st.total} songs" else "${st.done} of ${st.total} downloaded",
+                iconUrl = c.artworkUrl,
+                fallbackQuery = c.title,
+                browsable = true,
+                style = GRID,
+            )
+        }
+
+    private fun downloadTracks(context: Context, parentId: String): List<MediaBrowser.MediaItem> {
+        val c = Downloads.find(context, parentId.removePrefix(DOWNLOAD)) ?: return emptyList()
+        return c.tracks.map { t ->
+            item(
+                id = "$parentId#" + Uri.encode(t.mediaId),
+                title = t.title,
+                subtitle = listOfNotNull(t.artist, t.album).joinToString(" · "),
+                iconUrl = t.artworkUrl ?: c.artworkUrl,
+                fallbackQuery = "${t.artist.orEmpty()} ${t.title}".trim(),
+                durationMs = t.durationMs,
+                playable = true,
+            )
+        }
     }
 
     /** The same search the phone uses (cached for two minutes, so a tap re-reads the same list). */

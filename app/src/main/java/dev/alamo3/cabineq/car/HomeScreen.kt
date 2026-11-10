@@ -189,12 +189,15 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
             )
         }
 
+        val downloads = dev.alamo3.cabineq.Downloads.collections(carContext)
+        // Downloads lead: they are what plays when the signal drops.
+        if (downloads.isNotEmpty()) builder.addSection(downloadSection(downloads))
         if (rows.isNotEmpty()) builder.addSection(recentSection(rows))
         if (picks.isNotEmpty()) builder.addSection(recommendedSection(picks))
         if (you.albums.isNotEmpty()) builder.addSection(albumSection(you))
 
         // A SectionedItemTemplate must have at least one section.
-        if (rows.isEmpty() && picks.isEmpty() && you.albums.isEmpty()) {
+        if (rows.isEmpty() && picks.isEmpty() && you.albums.isEmpty() && downloads.isEmpty()) {
             return MessageTemplate.Builder("Nothing to play yet — search for something, or start a song on your phone.")
                 .setHeaderAction(searchAction())
                 .build()
@@ -296,6 +299,23 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         .setOnClickListener { screenManager.push(SearchScreen(carContext)) }
         .build()
 
+    private fun downloadSection(downloads: List<dev.alamo3.cabineq.Downloads.Collection>): GridSection {
+        val section = GridSection.Builder()
+        section.setTitle("Downloads")
+        section.setItemSize(GridSection.ITEM_SIZE_LARGE)
+        downloads.take(10).forEach { c ->
+            section.addItem(
+                GridItem.Builder()
+                    .setTitle(c.title)
+                    .setText("${c.tracks.size} songs")
+                    .setImage(carIcon(carContext, c.artworkUrl, c.title))
+                    .setOnClickListener { screenManager.push(DownloadScreen(carContext, c.id)) }
+                    .build()
+            )
+        }
+        return section.build()
+    }
+
     private fun recentSection(tracks: List<Track>): GridSection {
         val section = GridSection.Builder()
         section.setTitle("Recently played")
@@ -377,6 +397,34 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
             )
         }
         return section.build()
+    }
+}
+
+/** A downloaded album or playlist, read from the phone: no network involved. */
+class DownloadScreen(carContext: CarContext, private val id: String) : Screen(carContext) {
+    override fun onGetTemplate(): Template {
+        val c = dev.alamo3.cabineq.Downloads.find(carContext, id)
+        if (c == null) {
+            return MessageTemplate.Builder("This download was removed.")
+                .setHeaderAction(Action.BACK)
+                .build()
+        }
+        val items = ItemList.Builder()
+        c.tracks.take(100).forEachIndexed { i, track ->
+            items.addItem(
+                Row.Builder()
+                    .setTitle(track.title)
+                    .addText(track.subtitle().ifBlank { c.title })
+                    .setImage(carIcon(carContext, track.artworkUrl ?: c.artworkUrl, artQuery(track.artist, track.album, track.title)))
+                    .setOnClickListener { CarPlayback.playTracks(carContext, c.tracks, i, c.title, ::openPlayer) }
+                    .build()
+            )
+        }
+        return ListTemplate.Builder()
+            .setTitle(c.title)
+            .setHeaderAction(Action.BACK)
+            .setSingleList(items.build())
+            .build()
     }
 }
 

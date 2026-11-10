@@ -148,6 +148,12 @@ object SmartSearch {
         Log.i(TAG, "\"${q.take(40)}\": ${hits.size} readings, ${extra.size} extra queries, " +
             "${mergedTracks.size} -> ${tracks.size} songs, lead=$lead" +
             (if (fromLyrics) ", by lyrics" else "") + (if (showingFor != null) ", corrected" else ""))
+        // Head start: asking for the top song's stream makes the source begin preparing it
+        // (TorBox caching) while the listener is still reading the results. Nothing is
+        // downloaded; a tap a few seconds later finds it ready or well on its way.
+        if (!typing) tracks.firstOrNull()?.let { top ->
+            pool.execute { runCatching { addon.streamOnce(top.id) } }
+        }
         val result = Result(EclipseAddon.SearchResults(tracks, albums, artists, playlists), lead, showingFor, fromLyrics)
         synchronized(cache) { cache[cacheKey] = Cached(SystemClock.elapsedRealtime(), result) }
         return result

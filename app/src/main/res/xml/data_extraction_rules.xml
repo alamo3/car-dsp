@@ -4,8 +4,12 @@
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="cabin_eq_secrets.xml" />
+        <!-- Downloaded audio is large and re-downloadable; the list of downloads is kept. -->
+        <exclude domain="file" path="downloads/" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="cabin_eq_secrets.xml" />
+        <!-- Downloaded audio is large and re-downloadable; the list of downloads is kept. -->
+        <exclude domain="file" path="downloads/" />
     </device-transfer>
 </data-extraction-rules>

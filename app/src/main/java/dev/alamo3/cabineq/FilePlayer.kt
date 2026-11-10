@@ -876,7 +876,10 @@ class FilePlayer private constructor(private val context: Context) {
                     formatInfo = null
                     if (state != State.PAUSED) setState(State.LOADING) else version++
                     extendRadioIfNeeded()
+                    // Two ahead: a skip lands on a song that is already on the phone, and the
+                    // one after it has had its TorBox caching started.
                     queue.getOrNull(index + 1)?.let { MediaCache.prefetch(context, it) }
+                    queue.getOrNull(index + 2)?.let { MediaCache.prefetch(context, it) }
                     val outcome = try {
                         playTrack(track)
                     } catch (e: Exception) {
@@ -980,18 +983,21 @@ class FilePlayer private constructor(private val context: Context) {
             // here on the player thread and publishes progress through the note.
             // A pending skip must abandon a slow resolve (TorBox can wait minutes), otherwise
             // pressing next while "preparing" does nothing until it finishes.
-            val resolved = TrackResolver.resolve(
-                context,
-                item,
-                onNote = { setNote(it) },
-                isCancelled = { !live || jumpTo >= 0 },
-            )
+            // Downloaded or prefetched: play the local file. Checked before resolving, so a
+            // song on the phone starts at once and plays with no network at all.
+            val cached = MediaCache.fileFor(context, item)
+            val url = if (cached != null) "" else {
+                val resolved = TrackResolver.resolve(
+                    context,
+                    item,
+                    onNote = { setNote(it) },
+                    isCancelled = { !live || jumpTo >= 0 },
+                )
+                declaredQuality = resolved.quality
+                resolved.url
+            }
             if (!live) return Outcome.Cancelled
             note = null
-            val url = resolved.url
-            declaredQuality = resolved.quality
-            // Prefetched ahead of time: open the local file instead of the network.
-            val cached = MediaCache.fileFor(context, item)
             // Files without source artwork (e.g. TorBox library tracks): read the cover and tags
             // embedded in the file itself, which is exact per song even on compilations.
             if (item.artworkUrl == null) readFileInfo(cached?.path ?: url, cached != null, gen, currentIndex)

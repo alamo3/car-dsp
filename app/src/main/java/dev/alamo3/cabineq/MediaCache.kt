@@ -38,8 +38,15 @@ object MediaCache {
 
     private fun name(track: Track): String = sha1(track.mediaId) + ".audio"
 
-    /** The cached audio for this track, or null when it hasn't been prefetched. */
-    fun fileFor(context: Context, track: Track): File? {
+    /**
+     * Local audio for this track — a download the listener asked for, else a prefetched copy —
+     * or null when it has to be streamed.
+     */
+    fun fileFor(context: Context, track: Track): File? =
+        Downloads.fileFor(context, track) ?: cacheFileFor(context, track)
+
+    /** The prefetched copy only (what this cache owns and may evict). */
+    fun cacheFileFor(context: Context, track: Track): File? {
         val f = File(dir(context), name(track))
         if (!f.exists() || f.length() <= 0L) return null
         // Opening a cached track counts as a use for the LRU (lastModified is the eviction key).
@@ -102,8 +109,14 @@ object MediaCache {
         io.execute { trim(context.applicationContext, max) }
     }
 
-    private fun download(context: Context, track: Track, url: String, max: Long): Long {
-        val target = File(dir(context), name(track))
+    private fun download(context: Context, track: Track, url: String, max: Long): Long =
+        downloadTo(File(dir(context), name(track)), url, max, track.title)
+
+    /**
+     * Streams [url] into [target] through a .part file, so a half-written download is never
+     * mistaken for a song. Returns the bytes written, or 0 when nothing usable arrived.
+     */
+    fun downloadTo(target: File, url: String, max: Long, label: String): Long {
         if (target.exists() && target.length() > 0L) return 0L
         var conn: HttpURLConnection? = null
         val tmp = File(target.parentFile, target.name + "." + System.nanoTime() + ".part")
@@ -116,12 +129,12 @@ object MediaCache {
             }
             val code = conn.responseCode
             if (code !in 200..299) {
-                Log.i(TAG, "prefetch ${track.title}: HTTP $code")
+                Log.i(TAG, "prefetch $label: HTTP $code")
                 return 0L
             }
             val expected = conn.contentLengthLong
             if (expected > 0 && expected > max) {
-                Log.i(TAG, "skip ${track.title}: ${expected / 1024 / 1024} MB exceeds the ${max / 1024 / 1024} MB cap")
+                Log.i(TAG, "skip $label: ${expected / 1024 / 1024} MB exceeds the ${max / 1024 / 1024} MB cap")
                 return 0L
             }
             var written = 0L

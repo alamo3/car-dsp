@@ -105,6 +105,12 @@ class MusicActivity : Activity() {
     private val ticker = object : Runnable {
         override fun run() {
             refreshPlayer()
+            // A download finishing (or stalling) updates the page that shows it.
+            val v = Downloads.version
+            if (v != shownDownloads) {
+                shownDownloads = v
+                downloadRefresh?.invoke()
+            }
             handler.postDelayed(this, 500)
         }
     }
@@ -117,6 +123,10 @@ class MusicActivity : Activity() {
             handler.postDelayed(this, 100)
         }
     }
+
+    /** Redraws the download status on the page being shown, when there is one. */
+    private var downloadRefresh: (() -> Unit)? = null
+    private var shownDownloads = -1
 
     private val searchRunnable = Runnable { runSearch(searchInput.text.toString().trim(), fromTyping = true) }
 
@@ -138,6 +148,8 @@ class MusicActivity : Activity() {
         navigate { renderHome() }
         startFromPlayFromSearch(intent)
         handleImportIntent(intent)
+        // A download interrupted by the app closing carries on from where it stopped.
+        runCatching { Downloads.resume(this) }
     }
 
     /**
@@ -457,6 +469,7 @@ class MusicActivity : Activity() {
         page.removeAllViews()
         lyricsOpen = false
         handler.removeCallbacks(lyricTicker)
+        downloadRefresh = null
         lyricsBlock = null
         lyricViews = ArrayList()
     }
@@ -475,6 +488,19 @@ class MusicActivity : Activity() {
                 "Paste the Nebula link you installed in Eclipse (Settings → Connections). Search uses Apple Music's catalog; audio streams from your TorBox.",
                 "Connect",
             ) { navigate { renderSettings() } })
+        }
+
+        // On the phone already: first, because it is what works with no signal.
+        val downloads = Downloads.collections(this)
+        if (downloads.isNotEmpty()) {
+            page.addView(sectionTitle("Downloads"))
+            for (c in downloads.take(6)) {
+                val st = Downloads.status(this, c)
+                val sub = if (st.complete) "${st.total} songs · on this phone" else "${st.done} of ${st.total} downloaded"
+                page.addView(simpleRow(c.title, sub, android.R.drawable.stat_sys_download_done) {
+                    navigate { renderDownload(c.id) }
+                })
+            }
         }
 
         // Recently played is local, so the page is never blank while the network is thinking.
@@ -604,7 +630,10 @@ class MusicActivity : Activity() {
         val sub = listOfNotNull(t.artist.ifBlank { null }, t.album).joinToString(" · ")
         if (sub.isNotBlank()) texts.addView(Ui.text(this, sub, 13f, Ui.TEXT_2).apply { setPadding(0, dp(3), 0, 0) })
         row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val right = listOfNotNull(t.format?.uppercase(Locale.ROOT)?.takeIf { it == "FLAC" || it == "WAV" || it == "ALAC" },
+        // "⤓": already on the phone (downloaded or prefetched), so it starts instantly.
+        val local = runCatching { MediaCache.fileFor(this, t.toTrack()) != null }.getOrDefault(false)
+        val right = listOfNotNull("⤓".takeIf { local },
+            t.format?.uppercase(Locale.ROOT)?.takeIf { it == "FLAC" || it == "WAV" || it == "ALAC" },
             t.durationSec?.let { Ui.mmss(it * 1000L) }).joinToString("  ")
         if (right.isNotBlank()) row.addView(Ui.text(this, right, 12f, Ui.TEXT_2))
         return row
@@ -723,6 +752,7 @@ class MusicActivity : Activity() {
                 else -> "${d.tracks.size} songs"
             }
             addPlayShuffle(box, queue, d.playlist.title, count)
+            addDownloadRow(box, d.playlist.title, d.playlist.artworkUrl ?: playlist.artworkUrl, queue)
             d.tracks.forEachIndexed { i, t ->
                 box.addView(numberedRow(i + 1, t.title, t.artist.ifBlank { d.playlist.title }.takeIf { it.isNotBlank() }, t.durationSec?.let { Ui.mmss(it * 1000L) }) {
                     play(queue, i, d.playlist.title)
@@ -764,6 +794,83 @@ class MusicActivity : Activity() {
         row.addView(Ui.pill(this, "⤮  Shuffle", filled = false) { play(queue.shuffled(), 0, title) },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(8) })
         into.addView(row)
+    }
+
+    /** "Download" under an album's or playlist's Play/Shuffle, with live progress once started. */
+    private fun addDownloadRow(into: LinearLayout, title: String, artworkUrl: String?, queue: List<Track>) {
+        if (queue.isEmpty()) return
+        val id = Downloads.idFor(title)
+        val holder = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, 0, 0, dp(8))
+        }
+        into.addView(holder)
+        val draw = {
+            holder.removeAllViews()
+            val c = Downloads.find(this, id)
+            if (c == null) {
+                holder.addView(Ui.pill(this, "⤓  Download", filled = false) {
+                    Downloads.add(this, title, artworkUrl, queue)
+                    android.widget.Toast.makeText(this, "Downloading — keep CabinEQ open or playing", android.widget.Toast.LENGTH_LONG).show()
+                })
+            } else {
+                holder.addView(Ui.text(this, downloadLine(Downloads.status(this, c)), 13f, Ui.TEXT_2, lines = 2)
+                    .apply { gravity = Gravity.CENTER })
+            }
+        }
+        draw()
+        downloadRefresh = { draw() }
+    }
+
+    private fun downloadLine(st: Downloads.Status): String = when {
+        st.complete -> "✓  Downloaded · plays offline"
+        st.problem != null -> "${st.done} of ${st.total} downloaded · ${st.problem}"
+        st.active -> "Downloading… ${st.done} of ${st.total}"
+        else -> "${st.done} of ${st.total} downloaded"
+    }
+
+    /** One downloaded album or playlist, from the phone's own index: works with no network. */
+    private fun renderDownload(id: String) {
+        clearPage()
+        page.addView(backRow())
+        val c = Downloads.find(this, id)
+        if (c == null) {
+            page.addView(Ui.text(this, "This download was removed.", 15f, Ui.TEXT_2).apply { setPadding(0, dp(16), 0, 0) })
+            return
+        }
+        page.addView(albumHeader(c.title, "", "Downloaded", c.artworkUrl, c.title))
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        page.addView(box)
+        addPlayShuffle(box, c.tracks, c.title, "${c.tracks.size} songs")
+        val status = Ui.text(this, "", 13f, Ui.TEXT_2, lines = 2).apply { gravity = Gravity.CENTER }
+        box.addView(status)
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        box.addView(actions)
+        val draw = {
+            val st = Downloads.status(this, c)
+            status.text = downloadLine(st)
+            actions.removeAllViews()
+            if (!st.complete && !st.active) {
+                actions.addView(Ui.pill(this, "Retry", filled = false) { Downloads.retry(this) },
+                    wrapLp(top = 0).apply { rightMargin = dp(8) })
+            }
+            actions.addView(Ui.pill(this, "Remove download", filled = false) {
+                Downloads.remove(this, c.id)
+                onBackPressedCompat()
+            }, wrapLp(top = 0))
+        }
+        draw()
+        downloadRefresh = { draw() }
+        c.tracks.forEachIndexed { i, t ->
+            box.addView(numberedRow(i + 1, t.title, t.artist, if (t.durationMs > 0) Ui.mmss(t.durationMs) else null) {
+                play(c.tracks, i, c.title)
+            })
+        }
     }
 
     private fun simpleRow(title: String, sub: String?, icon: Int, onClick: () -> Unit): View {
@@ -1481,6 +1588,7 @@ class MusicActivity : Activity() {
             val queueTitle = listOf(al.artist, al.title).filter { it.isNotBlank() }.joinToString(" — ")
             val queue = d.tracks.map { addonTrack(a, it) }
             addPlayShuffle(tracksBox, queue, queueTitle, "${d.tracks.size} songs" + (al.year?.let { " · $it" } ?: ""))
+            addDownloadRow(tracksBox, queueTitle, al.artworkUrl ?: album.artworkUrl, queue)
             d.tracks.forEachIndexed { i, t ->
                 tracksBox.addView(numberedRow(i + 1, t.title, t.artist.takeIf { it != al.artist }, t.durationSec?.let { Ui.mmss(it * 1000L) }) {
                     play(queue, i, queueTitle)
@@ -1649,6 +1757,17 @@ class MusicActivity : Activity() {
             MediaCache.clear(this)
             renderSettings()
         }, wrapLp(top = 10))
+        val downloaded = Downloads.collections(this)
+        if (downloaded.isNotEmpty()) {
+            page.addView(Ui.text(this,
+                "Downloads: ${downloaded.size} albums and playlists, ${Downloads.usedBytes(this) / (1024 * 1024)} MB. " +
+                    "These are never removed automatically and don't count towards the cache size.",
+                12f, Ui.TEXT_2, lines = 3).apply { setPadding(0, dp(14), 0, 0) })
+            page.addView(Ui.pill(this, "Remove all downloads", filled = false) {
+                Downloads.removeAll(this)
+                renderSettings()
+            }, wrapLp(top = 10))
+        }
         // The EQ/DSP screen is the secondary surface now that Music is the app.
         page.addView(sectionTitle("Equalizer & DSP"))
         page.addView(card(
