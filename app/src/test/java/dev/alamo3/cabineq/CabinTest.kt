@@ -381,5 +381,34 @@ class CabinTest {
         check("match: other artist's Die Young still rejected", am.best("Die Young", "Kesha", 212, listOf(at("Die Young", "Roddy Ricch", 212))) == null)
         check("match: AC/DC vs ACDC", am.best("Thunderstruck", "AC/DC", null, listOf(at("Thunderstruck", "ACDC"))) != null)
         check("match: misspelt artist tolerated", am.best("Halo", "Beyonce", null, listOf(at("Halo", "Beyoncee"))) != null)
+
+        // ---- Playlist import: a YouTube library export (channels, liked videos, one real playlist)
+        val csv = """Track name,Artist name,Album,Playlist name,Type,ISRC
+"Katy Perry - Roar","","","Liked videos","Favorite",""
+"Crawling [Official HD Music Video] - Linkin Park","","","Liked videos","Favorite",""
+"Holly x drivvin - Til The End | Trap | NCS - Copyright Free Music","","","Liked videos","Favorite",""
+"100 MEMES in 1 SONG (in 10 minutes)","","","Liked videos","Favorite",""
+"Linus Tech Tips","","","My Subscriptions (Artists)","Artist",""
+"Veritasium","","","My Subscriptions (Artists)","Artist",""
+"Shots Fired","Le Castle Vania","John Wick (Original Motion Picture Soundtrack)","John Wick Mode: Action Bass","Playlist","US3M51430918"
+"""
+        val pf = dev.alamo3.cabineq.Playlists.parseFile("lib.csv", csv)
+        check("import: channel subscriptions are skipped", pf.skipped == 2 && pf.rows.size == 5, "${pf.skipped} skipped, ${pf.rows.size} rows")
+        check("import: playlist names are kept", pf.rows.map { it.playlist }.toSet() == setOf("Liked videos", "John Wick Mode: Action Bass"), pf.rows.map { it.playlist })
+        check("import: real song keeps artist and ISRC", pf.rows.last().artist == "Le Castle Vania" && pf.rows.last().isrc == "US3M51430918")
+        val PL = dev.alamo3.cabineq.Playlists
+        check("import: video name cleaned", PL.videoQuery("Crawling [Official HD Music Video] - Linkin Park") == "Crawling Linkin Park" &&
+            PL.videoQuery("Beartooth \u2013 The Lines (Low Gain Mix) (Audio)") == "Beartooth The Lines" &&
+            PL.videoQuery("Holly x drivvin - Til The End | Trap | NCS - Copyright Free Music") == "Holly x drivvin Til The End",
+            PL.videoQuery("Holly x drivvin - Til The End | Trap | NCS - Copyright Free Music"))
+        fun vrow(t: String) = dev.alamo3.cabineq.Playlists.Row(null, t, null, null)
+        fun vm(t: String, vararg c: Track) = PL.bestVideoMatch(vrow(t), PL.videoQuery(t), c.toList())
+        fun trk(title: String, artist: String) = Track(title = title, artist = artist, source = Track.Source.ADDON)
+        check("import: 'Artist - Song' finds the song", vm("Katy Perry - Roar (Official Video)", trk("Roar", "Katy Perry"))?.title == "Roar")
+        check("import: 'Song - Artist' finds the song", vm("Crawling [Official HD Music Video] - Linkin Park", trk("Crawling", "Linkin Park"))?.title == "Crawling")
+        check("import: wrong artist is not accepted", vm("Katy Perry - Roar", trk("Roar", "Some Cover Band")) == null)
+        check("import: a longer different song is not accepted", vm("Hans Zimmer - Time", trk("Time After Time", "Hans Zimmer")) == null)
+        check("import: one-word titles are not guessed", vm("midnight", trk("Midnight", "Someone")) == null)
+        check("import: meme videos find nothing", vm("100 MEMES in 1 SONG (in 10 minutes)", trk("Memes", "Various")) == null)
     }
 }

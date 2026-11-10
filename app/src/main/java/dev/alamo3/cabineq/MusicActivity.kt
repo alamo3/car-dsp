@@ -1754,14 +1754,19 @@ class MusicActivity : Activity() {
         val token = ++importToken
         importStatus.text = "Parsing…"
         importExecutor.execute {
-            val rows = Playlists.parse(name, raw)
+            val parsed = Playlists.parseFile(name, raw)
+            val rows = parsed.rows
             if (rows.isEmpty()) {
-                runOnUiThread { if (token == importToken) importStatus.text = "No tracks found in that text." }
+                runOnUiThread {
+                    if (token == importToken) importStatus.text = if (parsed.skipped > 0)
+                        "No songs found: ${parsed.skipped} entries were channel subscriptions, which aren't music."
+                    else "No tracks found in that text."
+                }
                 return@execute
             }
             val label = Playlists.sourceName(name)
             val result = runCatching {
-                Playlists.match(EclipseAddon(link), rows, label, onProgress = { done, total ->
+                Playlists.match(EclipseAddon(link), rows, label, skipped = parsed.skipped, onProgress = { done, total ->
                     if (done % 5 == 0 || done == total) {
                         runOnUiThread {
                             if (token == importToken) importStatus.text = "Matching $done/$total…"
@@ -1773,17 +1778,26 @@ class MusicActivity : Activity() {
                 return@execute
             }
             val added = Taste.importPlaylist(this, result.matched, label)
-            // The import is also a playlist you can open and play, not only a taste hint.
-            runCatching { Library.createPlaylist(this, label, result.matched) }
+            // The import is also a playlist you can open and play, not only a taste hint. A file
+            // with several playlists in it becomes several playlists, named as they were.
+            val groups = result.byPlaylist.ifEmpty { mapOf(label to result.matched) }
+            for ((playlistName, tracks) in groups) {
+                if (tracks.isNotEmpty()) runCatching { Library.createPlaylist(this, playlistName, tracks) }
+            }
             runOnUiThread {
                 if (token != importToken) return@runOnUiThread
                 lastImportStatus = buildString {
                     append("${result.rows.size} rows")
                     append(" · ${result.matchedRows} matched")
                     if (result.unmatched > 0) append(" · ${result.unmatched} not in the catalogue")
+                    if (result.skipped > 0) append("\n${result.skipped} channel subscriptions skipped (not music).")
                     if (result.withIsrc > 0) append(" · ${result.withIsrc} with ISRC")
                     append("\n$added new tracks added to your taste profile.")
-                    if (result.matched.isNotEmpty()) append("\nSaved as the playlist “$label” in your library.")
+                    if (result.matched.isNotEmpty()) {
+                        val names = groups.filterValues { it.isNotEmpty() }.keys
+                        append(if (names.size > 1) "\nSaved ${names.size} playlists in your library: ${names.joinToString(", ") { "“$it”" }}."
+                        else "\nSaved as the playlist “${names.firstOrNull() ?: label}” in your library.")
+                    }
                 }
                 importStatus.text = lastImportStatus
                 showMessage("Imported $label")
