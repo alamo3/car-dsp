@@ -73,35 +73,11 @@ object Taste {
 
     fun nameKey(t: Track): String = nameKey(t.title, t.artist)
 
-    /** "(feat. X)", "[with Y]", " ft. Z" */
-    private val FEATURING = Regex("""(?i)\s*[(\[](feat|ft|featuring|with)\b[^)\]]*[)\]]|\s+(feat|ft|featuring)\.?\s.*$""")
-    /** "(Remastered 2011)", "[Radio Edit]", " - Single Version" */
-    private val DECORATION = Regex(
-        """(?i)\s*[(\[][^)\]]*\b(remaster(ed)?|radio edit|single version|album version|mono|stereo)\b[^)\]]*[)\]]""" +
-            """|\s+-\s+[^-]*\b(remaster(ed)?|radio edit|single version|album version|mono|stereo)\b.*$"""
-    )
-
-    /**
-     * Title|primary-artist, with credits and release decorations removed: the same song is
-     * "Get Lucky" in one catalogue and "Get Lucky (feat. Pharrell Williams) - Radio Edit" in
-     * another, and history must treat them as one.
-     */
-    fun nameKey(title: String, artist: String?): String {
-        val t = title.replace(FEATURING, "").replace(DECORATION, "")
-        // Primary artist only; "&" stays ("Simon & Garfunkel" is one act).
-        val a = artist.orEmpty().split(',').first().split(Regex("(?i)\\s+(feat|ft|featuring)\\.?\\s+")).first()
-        return "${simplify(t).ifBlank { simplify(title) }}|${simplify(a)}"
-    }
+    /** Title|primary-artist in the shared normal form ([SongKey]). */
+    fun nameKey(title: String, artist: String?): String = dev.alamo3.cabineq.music.SongKey.of(title, artist)
 
     /** Primary artist, simplified: how artists are matched across catalogues. */
-    fun artistKey(name: String?): String? =
-        name?.split(',')?.first()?.split(Regex("(?i)\\s+(feat|ft|featuring)\\.?\\s+"))?.first()
-            ?.let(::simplify)?.ifBlank { null }
-
-    private fun simplify(s: String): String =
-        java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD).replace(Regex("\\p{M}+"), "")
-            .lowercase().replace("&", " and ").split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotEmpty() }
-            .joinToString(" ")
+    fun artistKey(name: String?): String? = dev.alamo3.cabineq.music.SongKey.artist(name)
 
     /** Keys saved before [nameKey] was normalised: same form as new ones (ISRCs unchanged). */
     private fun normalizeStored(k: String): String {

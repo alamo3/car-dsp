@@ -235,6 +235,28 @@ object Lyrics {
         return best
     }
 
+    /** A song found by a line of its lyrics. */
+    class LyricHit(val title: String, val artist: String, val durationSec: Int)
+
+    /**
+     * "What's the song that goes …": LRCLIB's full-text search over lyrics. Blocking; empty on
+     * any failure.
+     */
+    fun searchText(query: String, limit: Int = 5): List<LyricHit> {
+        val arr = runCatching { get("/search?q=" + enc(query.trim())) }.getOrNull() as? JSONArray ?: return emptyList()
+        val out = ArrayList<LyricHit>()
+        val seen = HashSet<String>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val title = str(o, "trackName") ?: continue
+            val artist = str(o, "artistName") ?: continue
+            if (!seen.add(dev.alamo3.cabineq.music.SongKey.of(title, artist))) continue
+            out += LyricHit(title, artist, o.optDouble("duration", 0.0).toInt())
+            if (out.size >= limit) break
+        }
+        return out
+    }
+
     private fun get(path: String): Any? {
         val conn = (URL(BASE + path).openConnection() as HttpURLConnection).apply {
             connectTimeout = 8000

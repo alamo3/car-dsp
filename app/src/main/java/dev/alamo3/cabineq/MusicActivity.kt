@@ -1327,6 +1327,16 @@ class MusicActivity : Activity() {
 
     private fun renderSearchLoading(query: String) {
         clearPage()
+        // Instant, offline: what you've played that matches, while the real search runs.
+        val local = dev.alamo3.cabineq.music.SmartSearch.suggest(query, settings.playHistory())
+        if (local.isNotEmpty()) {
+            page.addView(sectionTitle("From your history"))
+            for (t in local) {
+                page.addView(simpleRow(t.title, t.artist, android.R.drawable.ic_menu_recent_history) {
+                    play(listOf(t), 0, "Search: $query", radio = t)
+                })
+            }
+        }
         page.addView(Ui.text(this, "Searching “$query”…", 14f, Ui.TEXT_2).apply { setPadding(0, dp(16), 0, 0) })
     }
 
@@ -1344,7 +1354,7 @@ class MusicActivity : Activity() {
         stack.addLast { renderSearchLoading(query) }
         searchPageOnTop = true
         renderSearchLoading(query)
-        background(id, { a.search(query, deep = !fromTyping) }) { r ->
+        background(id, { dev.alamo3.cabineq.music.SmartSearch.search(applicationContext, a, query, typing = fromTyping) }) { r ->
             val render = { renderSearch(a, query, r) }
             stack.removeLast()
             stack.addLast(render)
@@ -1353,15 +1363,21 @@ class MusicActivity : Activity() {
         }
     }
 
-    private fun renderSearch(a: EclipseAddon, query: String, r: EclipseAddon.SearchResults) {
+    private fun renderSearch(a: EclipseAddon, query: String, found: dev.alamo3.cabineq.music.SmartSearch.Result) {
         clearPage()
+        val r = found.results
         if (r.tracks.isEmpty() && r.albums.isEmpty() && r.artists.isEmpty()) {
             page.addView(Ui.text(this, "No results for “$query”.", 15f, Ui.TEXT_2).apply { setPadding(0, dp(16), 0, 0) })
             return
         }
-        if (r.tracks.isNotEmpty()) {
+        found.showingFor?.let {
+            page.addView(Ui.text(this, "Showing results for $it", 13f, Ui.TEXT_2, lines = 2).apply { setPadding(0, dp(8), 0, 0) })
+        }
+        val lead = found.lead
+        fun songs(title: String) {
+            if (r.tracks.isEmpty()) return
             val songs = r.tracks.take(MAX_TRACKS)
-            page.addView(sectionTitle("Songs", if (songs.size > 5) "See all" else null) {
+            page.addView(sectionTitle(title, if (songs.size > 5) "See all" else null) {
                 navigate { renderSongList("Songs · $query", a, songs, "Search: $query") }
             })
             songs.take(5).forEachIndexed { i, t ->
@@ -1371,12 +1387,40 @@ class MusicActivity : Activity() {
                 })
             }
         }
-        if (r.albums.isNotEmpty()) {
+        fun albums() {
+            if (r.albums.isEmpty()) return
             page.addView(sectionTitle("Albums"))
             page.addView(albumCarousel(r.albums.take(MAX_ALBUMS)) { al ->
                 settings.addRecentSearch(query)
                 navigate { renderAlbum(a, al) }
             })
+        }
+        fun artists(list: List<EclipseAddon.Artist>, title: String?) {
+            if (list.isEmpty()) return
+            title?.let { page.addView(sectionTitle(it)) }
+            for (ar in list.take(MAX_ARTISTS)) {
+                page.addView(artistRow(ar) {
+                    settings.addRecentSearch(query)
+                    navigate { renderArtist(a, ar) }
+                })
+            }
+        }
+        // What the query asked for goes first: an artist's name opens with the artist, an
+        // album's title with the album, anything else with songs.
+        when (lead) {
+            dev.alamo3.cabineq.music.SearchRank.Lead.ARTIST -> {
+                artists(r.artists.take(1), "Artist")
+                songs("Top songs")
+                albums()
+            }
+            dev.alamo3.cabineq.music.SearchRank.Lead.ALBUM -> {
+                albums()
+                songs("Songs")
+            }
+            else -> {
+                songs(if (found.fromLyrics) "Songs · matched by lyrics" else "Songs")
+                albums()
+            }
         }
         if (r.playlists.isNotEmpty()) {
             page.addView(sectionTitle("Playlists"))
@@ -1385,15 +1429,8 @@ class MusicActivity : Activity() {
                 navigate { renderPlaylist(a, pl) }
             })
         }
-        if (r.artists.isNotEmpty()) {
-            page.addView(sectionTitle("Artists"))
-            for (ar in r.artists.take(MAX_ARTISTS)) {
-                page.addView(artistRow(ar) {
-                    settings.addRecentSearch(query)
-                    navigate { renderArtist(a, ar) }
-                })
-            }
-        }
+        if (lead == dev.alamo3.cabineq.music.SearchRank.Lead.ARTIST) artists(r.artists.drop(1), "Other artists")
+        else artists(r.artists, "Artists")
     }
 
     private fun renderSongList(title: String, a: EclipseAddon, songs: List<EclipseAddon.Track>, queueTitle: String) {

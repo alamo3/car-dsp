@@ -81,6 +81,33 @@ object Discover {
         }
     }
 
+    /** A song as the search index knows it; [rank] is Deezer's popularity (0..~1,000,000). */
+    data class TrackHit(val title: String, val artist: String, val rank: Long)
+
+    /**
+     * Typo-tolerant song search: what the user probably meant, best first. This is only used to
+     * understand the query — results still come from the addon.
+     */
+    fun searchTracks(query: String, limit: Int = 8): List<TrackHit> {
+        val o = get("/search?q=" + URLEncoder.encode(query.trim(), "UTF-8") + "&limit=$limit") ?: return emptyList()
+        val data = o.optJSONArray("data") ?: return emptyList()
+        return (0 until data.length()).mapNotNull { i ->
+            val t = data.optJSONObject(i) ?: return@mapNotNull null
+            val title = t.optString("title_short").ifBlank { t.optString("title") }.trim()
+            val artist = t.optJSONObject("artist")?.optString("name")?.trim().orEmpty()
+            if (title.isEmpty() || artist.isEmpty()) null else TrackHit(title, artist, t.optLong("rank"))
+        }
+    }
+
+    /** Artist names matching the query, best first. */
+    fun searchArtists(query: String, limit: Int = 3): List<String> {
+        val o = get("/search/artist?q=" + URLEncoder.encode(query.trim(), "UTF-8") + "&limit=$limit") ?: return emptyList()
+        val data = o.optJSONArray("data") ?: return emptyList()
+        return (0 until data.length()).mapNotNull { i ->
+            data.optJSONObject(i)?.optString("name")?.trim()?.takeIf { it.isNotEmpty() }
+        }
+    }
+
     private fun tracks(path: String): List<Track> {
         val o = get(path) ?: return emptyList()
         val data = o.optJSONArray("data") ?: return emptyList()

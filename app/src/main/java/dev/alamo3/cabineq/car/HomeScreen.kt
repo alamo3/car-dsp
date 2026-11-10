@@ -461,7 +461,7 @@ class SearchScreen(carContext: CarContext, initialQuery: String? = null) : Scree
                 uiIo.execute {
                     val link = Settings(ctx).addonLink
                     val found = if (link.isBlank()) EclipseAddon.SearchResults(emptyList(), emptyList()) else
-                        runCatching { EclipseAddon(link).search(text) }
+                        runCatching { dev.alamo3.cabineq.music.SmartSearch.search(ctx, EclipseAddon(link), text).results }
                             .getOrDefault(EclipseAddon.SearchResults(emptyList(), emptyList()))
                     warmArt(ctx, found.tracks.take(20).map { it.artworkUrl to artQuery(it.artist, it.album, it.title) }) {
                         results = found
@@ -524,7 +524,7 @@ class SearchScreen(carContext: CarContext, initialQuery: String? = null) : Scree
                 uiIo.execute {
                     val link = Settings(ctx).addonLink
                     val found = if (link.isBlank()) EclipseAddon.SearchResults(emptyList(), emptyList()) else
-                        runCatching { EclipseAddon(link).search(searchText) }
+                        runCatching { dev.alamo3.cabineq.music.SmartSearch.search(ctx, EclipseAddon(link), searchText).results }
                             .getOrDefault(EclipseAddon.SearchResults(emptyList(), emptyList()))
                     warmArt(ctx, found.tracks.take(20).map { it.artworkUrl to artQuery(it.artist, it.album, it.title) }) {
                         results = found

@@ -100,12 +100,13 @@ object MediaBrowse {
     fun search(context: Context, query: String): List<MediaBrowser.MediaItem> {
         if (query.isBlank()) return emptyList()
         val addon = addon(context) ?: return emptyList()
-        val results = runCatching { addon.search(query, MAX_ROWS) }.getOrElse {
+        val results = runCatching { smartSearch(context, addon, query).results }.getOrElse {
             Log.w(TAG, "Search \"$query\" failed: ${it.message}")
             return emptyList()
         }
         val parentId = SEARCH + Uri.encode(query)
         val albums = results.albums.take(20).map { albumItem(it) }
+        val albumsFirst = smartSearch(context, addon, query).lead == dev.alamo3.cabineq.music.SearchRank.Lead.ALBUM
         val songs = results.tracks.take(MAX_ROWS).map { track ->
             item(
                 // The id, not the position: results are re-fetched when the car asks again and a
@@ -122,7 +123,8 @@ object MediaBrowse {
             )
         }
         val playlists = results.playlists.take(20).map { playlistItem(it) }
-        return albums + songs + playlists
+        // Songs first unless the query named an album: the top row is what was asked for.
+        return if (albumsFirst) albums + songs + playlists else songs + albums + playlists
     }
 
     /**
@@ -181,10 +183,29 @@ object MediaBrowse {
     /** "play <something>" from the car's assistant: queue all matches, start at the first. */
     fun searchPlayback(context: Context, query: String): Playback? {
         val addon = addon(context) ?: return null
-        val results = addon.search(query)
-        val tracks = results.tracks.take(MAX_ROWS).map { it.toTrack() }
+        val found = smartSearch(context, addon, query)
+        val tracks = found.results.tracks.take(MAX_ROWS).map { it.toTrack() }
         if (tracks.isEmpty()) return null
-        return Playback("Search: $query", tracks, 0)
+        return when (found.lead) {
+            // "Play Daft Punk": their top songs, in order.
+            dev.alamo3.cabineq.music.SearchRank.Lead.ARTIST -> {
+                val artist = found.results.artists.first().name
+                val theirs = tracks.filter {
+                    dev.alamo3.cabineq.music.SongKey.artist(it.artist) == dev.alamo3.cabineq.music.SongKey.artist(artist)
+                }.ifEmpty { tracks }
+                Playback(artist, theirs, 0)
+            }
+            // "Play the album …": the album itself.
+            dev.alamo3.cabineq.music.SearchRank.Lead.ALBUM -> {
+                val album = found.results.albums.first()
+                val detail = runCatching { addon.album(album.id) }.getOrNull()
+                val albumTracks = detail?.tracks?.map { it.toTrack() }.orEmpty()
+                if (albumTracks.isNotEmpty()) Playback(album.title, albumTracks, 0)
+                else Playback("Search: $query", listOf(tracks[0]), 0, radio = tracks[0])
+            }
+            // "Play <song>": that song, then radio from it — not twenty lookalikes.
+            else -> Playback("Search: $query", listOf(tracks[0]), 0, radio = tracks[0])
+        }
     }
 
     // ------------------------------------------------------------------ children
@@ -464,7 +485,7 @@ object MediaBrowse {
 
     private fun searchPlayback(context: Context, query: String, child: String): Playback? {
         val addon = addon(context) ?: return null
-        val tracks = addon.search(query, MAX_ROWS).tracks.take(MAX_ROWS).map { it.toTrack() }
+        val tracks = smartSearch(context, addon, query).results.tracks.take(MAX_ROWS).map { it.toTrack() }
         if (tracks.isEmpty()) return null
         val index = indexOfChild(tracks, child)
         if (index < 0) return null
@@ -503,6 +524,10 @@ object MediaBrowse {
             .distinctBy { it.isrc ?: "${it.title.trim().lowercase()}|${it.artist?.trim()?.lowercase().orEmpty()}" }
             .take(MAX_ROWS)
     }
+
+    /** The same search the phone uses (cached for two minutes, so a tap re-reads the same list). */
+    private fun smartSearch(context: Context, addon: EclipseAddon, query: String) =
+        dev.alamo3.cabineq.music.SmartSearch.search(context.applicationContext, addon, query)
 
     private fun addon(context: Context): EclipseAddon? {
         val link = Settings(context).addonLink
