@@ -27,6 +27,13 @@ object CarVolume {
 
     private const val TAG = "CabinEQ/CarVolume"
 
+    /**
+     * Set once this car session has been handed full scale (or found already there). Later syncs
+     * (route changes, car-mode broadcasts, screens opening) must not undo the listener turning
+     * it down. Cleared when car mode ends.
+     */
+    @Volatile private var sessionApplied = false
+
     fun inCar(context: Context): Boolean {
         val mode = runCatching {
             context.getSystemService(UiModeManager::class.java)?.currentModeType
@@ -39,17 +46,18 @@ object CarVolume {
         val settings = Settings(context)
         val am = context.getSystemService(AudioManager::class.java) ?: return
         if (!inCar(context) || !settings.maxVolumeInCar) {
+            sessionApplied = false
             restore(context, am, settings)
             return
         }
-        apply(context, am, settings)
+        apply(context, am, settings, force = false)
     }
 
     /** Manual override from the Output panel: does the same thing, ignores the car-mode test. */
     fun setMaxNow(context: Context) {
         val settings = Settings(context)
         val am = context.getSystemService(AudioManager::class.java) ?: return
-        apply(context, am, settings)
+        apply(context, am, settings, force = true)
     }
 
     fun restore(context: Context) {
@@ -58,7 +66,10 @@ object CarVolume {
         restore(context, am, settings)
     }
 
-    private fun apply(context: Context, am: AudioManager, settings: Settings) {
+    private fun apply(context: Context, am: AudioManager, settings: Settings, force: Boolean) {
+        // Once per car session (a record from before a restart counts too): turning it down
+        // afterwards sticks. The Output panel's button is an explicit ask and always applies.
+        if (!force && (sessionApplied || settings.preCarVolume >= 0)) return
         if (runCatching { am.isVolumeFixed }.getOrDefault(false)) {
             Log.i(TAG, "volume is fixed by the device (car head unit) — leaving it alone")
             return
@@ -78,6 +89,7 @@ object CarVolume {
         }
         val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val now = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        sessionApplied = true
         if (now >= max) return
         if (settings.preCarVolume < 0) settings.preCarVolume = now
         runCatching { am.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0) }
