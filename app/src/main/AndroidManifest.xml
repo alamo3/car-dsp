@@ -125,14 +125,14 @@
             </intent-filter>
         </service>
 
-        <!-- Hosts from car API level 7 may run us. The richer templates need more
-             (SectionedItemTemplate, GridSection, MediaPlaybackTemplate and Action.MEDIA_PLAYBACK
-             are 8, SearchHeader is 9), so the screens check carContext.carAppApiLevel and fall
-             back to list/pane templates on older hosts. A higher minimum would hide the whole
-             car app from the launcher on those hosts while still listing its media entry. -->
+        <!-- Car API level 8 or newer: Google Play requires it for media car apps, and the media
+             templates (MediaPlaybackTemplate, Action.MEDIA_PLAYBACK, SectionedItemTemplate,
+             GridSection) start at 8. The level comes from the Android Auto app on the phone, so
+             it is current on any phone that is kept up to date. SearchHeader is 9, and the
+             screens still check carContext.carAppApiLevel and fall back below that. -->
         <meta-data
             android:name="androidx.car.app.minCarApiLevel"
-            android:value="7" />
+            android:value="8" />
 
         <!-- Read-only album art for the car: a browse item's icon must be a URI the car's own
              process can open, and it has no way to reach our cache. -->
