@@ -18,18 +18,30 @@ class ImportActivity : android.app.Activity() {
             Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
             Intent.ACTION_VIEW -> intent.dataString
             else -> null
-        }
-        if (text.isNullOrBlank()) {
+        }?.takeIf { it.isNotBlank() }
+        // A shared playlist file (JSON/CSV) arrives as a stream, not text. Our read grant is for
+        // this activity only, so pass it on with the URI rather than reading it here on the main
+        // thread.
+        @Suppress("DEPRECATION")
+        val stream = if (text == null && intent?.action == Intent.ACTION_SEND) {
+            intent.getParcelableExtra<android.net.Uri>(Intent.EXTRA_STREAM)
+        } else null
+        if (text == null && stream == null) {
             Toast.makeText(this, "Nothing to import", Toast.LENGTH_SHORT).show()
             finish()
             return
         }
-        startActivity(
-            Intent(this, MusicActivity::class.java)
-                .setAction(MusicActivity.ACTION_IMPORT)
-                .putExtra(MusicActivity.EXTRA_IMPORT_TEXT, text)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        )
+        val forward = Intent(this, MusicActivity::class.java)
+            .setAction(MusicActivity.ACTION_IMPORT)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        if (text != null) {
+            forward.putExtra(MusicActivity.EXTRA_IMPORT_TEXT, text)
+        } else {
+            forward.putExtra(Intent.EXTRA_STREAM, stream)
+            forward.clipData = android.content.ClipData.newRawUri("playlist", stream)
+            forward.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivity(forward)
         finish()
     }
 }

@@ -1091,9 +1091,7 @@ class MusicActivity : Activity() {
         val uri = data?.data ?: return
         val name = runCatching { uri.lastPathSegment ?: "Imported playlist" }.getOrDefault("Imported playlist")
         importExecutor.execute {
-            val text = runCatching {
-                contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-            }.getOrNull()
+            val text = readImportFile(uri)
             runOnUiThread {
                 if (text.isNullOrBlank()) {
                     importStatus.text = "Couldn't read that file."
@@ -1104,31 +1102,63 @@ class MusicActivity : Activity() {
         }
     }
 
-    /** Shared text/links and cabineq://import land here. */
+    /** Shared text/links, shared playlist files and cabineq://import land here. */
     private fun handleImportIntent(intent: Intent?): Boolean {
         intent ?: return false
         val action = intent.action ?: return false
         val text = when (action) {
             ACTION_IMPORT -> intent.getStringExtra(EXTRA_IMPORT_TEXT)
             Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
-                ?.takeIf { it.isNotBlank() }
-                ?: intent.getParcelableExtra<android.net.Uri>(Intent.EXTRA_STREAM)?.let { uri ->
-                    runCatching {
-                        contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                    }.getOrNull()
-                }
             Intent.ACTION_VIEW -> intent.dataString
             else -> null
+        }?.takeIf { it.isNotBlank() }
+        if (text == null) {
+            // A shared file (ImportActivity forwards its URI with a read grant): read it off the
+            // main thread, then import as if it had been pasted.
+            val uri = if (action == ACTION_IMPORT || action == Intent.ACTION_SEND) {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra<android.net.Uri>(Intent.EXTRA_STREAM)
+            } else null
+            uri ?: return false
+            navigate { renderImport() }
+            importStatus.text = "Reading the shared file…"
+            importExecutor.execute {
+                val read = readImportFile(uri)
+                runOnUiThread {
+                    if (read.isNullOrBlank()) {
+                        importStatus.text = "Couldn't read that file."
+                        return@runOnUiThread
+                    }
+                    importText.setText(read)
+                    runImport(read, "Shared playlist")
+                }
+            }
+            return true
         }
-        if (text.isNullOrBlank()) return false
         navigate { renderImport() }
         importText.setText(text)
-        // Sharing a file or opening an import link is an explicit "do it", unlike pasting.
-        if (action == Intent.ACTION_SEND || action == ACTION_IMPORT || action == Intent.ACTION_VIEW) {
-            runImport(text, "Shared playlist")
-        }
+        // Sharing or opening an import link is an explicit "do it", unlike pasting.
+        runImport(text, "Shared playlist")
         return true
     }
+
+    /**
+     * Reads a playlist file as text, capped so a stray multi-gigabyte share can't run the app out
+     * of memory. A playlist is text; anything past the cap is not one.
+     */
+    private fun readImportFile(uri: android.net.Uri): String? = runCatching {
+        contentResolver.openInputStream(uri)?.use { input ->
+            val out = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                out.write(buf, 0, n)
+                if (out.size() > MAX_IMPORT_BYTES) return@runCatching null
+            }
+            out.toString(Charsets.UTF_8.name())
+        }
+    }.getOrNull()
 
     private fun runImport(text: String, name: String = "Pasted list") {
         val raw = text.trim()
@@ -1776,6 +1806,7 @@ class MusicActivity : Activity() {
         /** A playlist handed over by the share sheet or a cabineq://import link. */
         const val ACTION_IMPORT = "dev.alamo3.cabineq.action.IMPORT"
         const val EXTRA_IMPORT_TEXT = "import_text"
+        private const val MAX_IMPORT_BYTES = 4 * 1024 * 1024
 
         /** SAF request for the playlist file picker. */
         const val REQ_IMPORT_FILE = 4101
