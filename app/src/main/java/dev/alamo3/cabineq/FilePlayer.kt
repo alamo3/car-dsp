@@ -177,8 +177,15 @@ class FilePlayer private constructor(private val context: Context) {
             runCatching { refreshRouteDependentParams() }
             Log.i(TAG, "device mixes at $r Hz")
             runCatching { CarVolume.sync(context) }
-        // ENTER/EXIT_CAR_MODE are implicit broadcasts: a manifest receiver never sees them
-        // (API 26+), so register here — the player is alive exactly when the volume matters.
+        }
+    }
+
+    /**
+     * ENTER/EXIT_CAR_MODE are implicit broadcasts: a manifest receiver never sees them (API 26+),
+     * so register at runtime — the player is alive exactly when the volume matters. Once per
+     * player: this used to sit in [refreshDeviceRate] and added a receiver per route change.
+     */
+    private fun registerCarModeReceiver() {
         runCatching {
             val filter = android.content.IntentFilter().apply {
                 addAction(android.app.UiModeManager.ACTION_ENTER_CAR_MODE)
@@ -196,7 +203,6 @@ class FilePlayer private constructor(private val context: Context) {
                 @Suppress("UnspecifiedRegisterReceiverFlag")
                 context.registerReceiver(receiver, filter)
             }
-        }
         }
     }
 
@@ -230,6 +236,7 @@ class FilePlayer private constructor(private val context: Context) {
         // so the worker has to be told when it moves rather than guessing once at startup.
         runCatching { audioManager?.registerAudioDeviceCallback(deviceCallback, null) }
         refreshDeviceRate()
+        registerCarModeReceiver()
         // Car mode may already be on (Android Auto launched us): raise the stream now, and
         // again whenever the route moves, since "external output in a car" is the case that
         // should get full scale.
@@ -844,7 +851,11 @@ class FilePlayer private constructor(private val context: Context) {
                         }
                         break
                     }
-                    currentIndex = index
+                    // Claim the index under the queue lock: removeUpcoming/moveUpcoming decide
+                    // what is "upcoming" from currentIndex, so the two must not interleave.
+                    val track = synchronized(eqLock) {
+                        queue.getOrNull(index)?.also { currentIndex = index }
+                    } ?: continue
                     beganThisTrack = false
                     tasteReported = false
                     declaredQuality = null
@@ -854,13 +865,13 @@ class FilePlayer private constructor(private val context: Context) {
                     positionMs = 0
                     lastProgressAt = SystemClock.elapsedRealtime()
                     // Known length from the source until the decoder reports the real one.
-                    durationMs = queue.getOrNull(index)?.durationMs ?: 0
+                    durationMs = track.durationMs
                     formatInfo = null
                     if (state != State.PAUSED) setState(State.LOADING) else version++
                     extendRadioIfNeeded()
                     queue.getOrNull(index + 1)?.let { MediaCache.prefetch(context, it) }
                     val outcome = try {
-                        playTrack(queue[index])
+                        playTrack(track)
                     } catch (e: Exception) {
                         Log.e(TAG, "Track ${queue.getOrNull(index)?.title} failed", e)
                         Outcome.Failed(e.message ?: e.javaClass.simpleName)
@@ -1244,7 +1255,9 @@ class FilePlayer private constructor(private val context: Context) {
         if (t != null && t !== Thread.currentThread()) {
             // Unblocks a WRITE_BLOCKING write so the worker notices it's been retired.
             current?.let { runCatching { it.track.pause(); it.track.flush() } }
-            t.join(2000)
+            // Kept short: this runs on the caller's (often main) thread. A worker that is
+            // still inside a network read notices it was retired and releases its own output.
+            t.join(500)
             if (t.isAlive) Log.w(TAG, "Player thread slow to stop; it will release its own output")
         }
         synchronized(eqLock) { current = null }
@@ -1254,6 +1267,9 @@ class FilePlayer private constructor(private val context: Context) {
         if (s != state) {
             Log.i(TAG, "State ${state.name} -> ${s.name}" + (reason?.let { " ($it)" } ?: ""))
         }
+        // The stall watchdog measures time since the last write. A pause writes nothing, so
+        // entering PLAYING must restart that clock or a resume after >4 s looks like a stall.
+        if (s == State.PLAYING && state != State.PLAYING) lastProgressAt = SystemClock.elapsedRealtime()
         state = s
         version++
         scheduleSave()
