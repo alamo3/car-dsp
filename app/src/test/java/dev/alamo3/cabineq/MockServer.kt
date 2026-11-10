@@ -1,8 +1,9 @@
 package dev.alamo3.cabineq
 
-import com.sun.net.httpserver.HttpExchange
-import com.sun.net.httpserver.HttpServer
-import java.net.InetSocketAddress
+import java.io.ByteArrayOutputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.net.URLDecoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -10,44 +11,102 @@ import java.util.concurrent.Executors
 /**
  * A stand-in for TorBox's API and a Nebula-style addon, on a random local port. Canned answers
  * only: what the clients send and how they read the replies is what the tests are about.
+ *
+ * A bare socket server on purpose: Android unit tests compile against android.jar, which has
+ * no JDK HTTP server. One request per connection ("Connection: close") is all the clients need.
  */
 class MockServer : AutoCloseable {
-    private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
-    val port: Int get() = server.address.port
+    private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+    val port: Int get() = socket.localPort
     private val streamTries = ConcurrentHashMap<String, Int>()
+    private val workers = Executors.newCachedThreadPool { r -> Thread(r, "mock").apply { isDaemon = true } }
+
+    /** One parsed request and the socket to answer on. */
+    private class Exchange(val socket: Socket, val method: String, val rawPath: String, val rawQuery: String,
+                           val headers: Map<String, String>, val body: ByteArray)
 
     init {
-        server.createContext("/") { ex -> runCatching { handle(ex) }.onFailure { reply(ex, 500, """{"error":"mock crashed"}""") } }
-        server.executor = Executors.newCachedThreadPool { r -> Thread(r, "mock").apply { isDaemon = true } }
-        server.start()
+        Thread({
+            while (!socket.isClosed) {
+                val client = runCatching { socket.accept() }.getOrNull() ?: break
+                workers.execute {
+                    client.use { c ->
+                        runCatching {
+                            val ex = read(c) ?: return@runCatching
+                            runCatching { handle(ex) }.onFailure { reply(ex, 500, """{"error":"mock crashed"}""") }
+                        }
+                    }
+                }
+            }
+        }, "mock-accept").apply { isDaemon = true }.start()
     }
 
-    override fun close() = server.stop(0)
+    override fun close() {
+        runCatching { socket.close() }
+        workers.shutdownNow()
+    }
 
-    private fun reply(ex: HttpExchange, status: Int, json: String, retryAfter: String? = null) {
+    private fun read(c: Socket): Exchange? {
+        val input = c.getInputStream()
+        // Headers end at the first blank line; read byte by byte so the body is left untouched.
+        val head = ByteArrayOutputStream()
+        var last4 = 0
+        while (true) {
+            val b = input.read()
+            if (b < 0) return null
+            head.write(b)
+            last4 = (last4 shl 8) or b
+            if (last4 == 0x0D0A0D0A) break
+        }
+        val lines = head.toString("ISO-8859-1").split("\r\n").filter { it.isNotEmpty() }
+        val request = lines.firstOrNull()?.split(' ') ?: return null
+        if (request.size < 2) return null
+        val headers = lines.drop(1).associate {
+            it.substringBefore(':').trim().lowercase() to it.substringAfter(':').trim()
+        }
+        val length = headers["content-length"]?.toIntOrNull() ?: 0
+        val body = ByteArray(length)
+        var got = 0
+        while (got < length) {
+            val n = input.read(body, got, length - got)
+            if (n < 0) break
+            got += n
+        }
+        val target = request[1]
+        return Exchange(c, request[0], target.substringBefore('?'), target.substringAfter('?', ""), headers, body)
+    }
+
+    private fun reply(ex: Exchange, status: Int, json: String, retryAfter: String? = null) {
         val data = json.toByteArray()
-        ex.responseHeaders.add("Content-Type", "application/json")
-        retryAfter?.let { ex.responseHeaders.add("Retry-After", it) }
-        ex.sendResponseHeaders(status, data.size.toLong())
-        ex.responseBody.use { it.write(data) }
+        val head = StringBuilder("HTTP/1.1 $status ${if (status in 200..299) "OK" else "Error"}\r\n")
+            .append("Content-Type: application/json\r\n")
+            .append("Content-Length: ${data.size}\r\n")
+            .append("Connection: close\r\n")
+        retryAfter?.let { head.append("Retry-After: $it\r\n") }
+        head.append("\r\n")
+        ex.socket.getOutputStream().apply {
+            write(head.toString().toByteArray(Charsets.ISO_8859_1))
+            write(data)
+            flush()
+        }
     }
 
-    private fun query(ex: HttpExchange): Map<String, String> =
-        ex.requestURI.rawQuery.orEmpty().split('&').filter { it.isNotEmpty() }.associate {
+    private fun query(ex: Exchange): Map<String, String> =
+        ex.rawQuery.split('&').filter { it.isNotEmpty() }.associate {
             val k = it.substringBefore('=')
             URLDecoder.decode(k, "UTF-8") to URLDecoder.decode(it.substringAfter('=', ""), "UTF-8")
         }
 
-    private fun handle(ex: HttpExchange) {
+    private fun handle(ex: Exchange) {
         // The raw path on purpose: the clients' percent-encoding is part of what is tested.
-        val path = ex.requestURI.rawPath
+        val path = ex.rawPath
         val q = query(ex)
-        val body = ex.requestBody.readBytes()
+        val body = ex.body
         if (path.startsWith("/addon/")) return addon(ex, path.removePrefix("/addon/"), q)
-        if (ex.requestHeaders.getFirst("Authorization") != "Bearer good-key") {
+        if (ex.headers["authorization"] != "Bearer good-key") {
             return reply(ex, 403, """{"success":false,"error":"BAD_TOKEN","detail":"Invalid token.","data":null}""")
         }
-        if (ex.requestMethod == "POST") {
+        if (ex.method == "POST") {
             if (path == "/v1/api/torrents/createtorrent") {
                 val text = String(body, Charsets.ISO_8859_1)
                 if ("name=\"magnet\"" in text && "dup" in text) {
@@ -78,7 +137,7 @@ class MockServer : AutoCloseable {
 
     private fun ok(data: String) = """{"success":true,"error":null,"detail":"ok","data":$data}"""
 
-    private fun addon(ex: HttpExchange, rest: String, q: Map<String, String>) {
+    private fun addon(ex: Exchange, rest: String, q: Map<String, String>) {
         val token = rest.substringBefore('/')
         val path = rest.substringAfter('/', "")
         if (token != "TOKEN") return reply(ex, 401, """{"error":"bad token"}""")
