@@ -285,8 +285,6 @@ object Taste {
         val lastPlayed = HashMap<String, Long>()
         /** Songs you already know: played, liked or in an imported playlist. */
         val heard = HashMap<String, Int>()
-        /** Artist -> distinct songs of theirs you disliked. */
-        val dislikedSongs = HashMap<String, HashSet<String>>()
         val knownArtists = HashSet<String>()
         /** Key -> the name as last seen, for display and for searching. */
         val artistNames = HashMap<String, String>()
@@ -307,9 +305,6 @@ object Taste {
                 }
                 val artistK = artistKey(e.artist)
                 artistK?.let { knownArtists.add(it); artistNames[it] = e.artist!!.split(',').first().trim() }
-                if (e.kind == Kind.DISLIKE) {
-                    artistK?.let { a -> dislikedSongs.getOrPut(a) { HashSet() }.add(e.key) }
-                }
                 val w = weight(e, now)
                 if (w == 0f) continue
                 ks.forEach { k -> tracks[k] = (tracks[k] ?: 0f) + w }
@@ -317,12 +312,11 @@ object Taste {
                 e.album?.lowercase()?.let { a -> albums[a] = (albums[a] ?: 0f) + w * 0.15f }
             }
         }
-        // An artist is out of the pool after two disliked songs — one is about the song — unless
-        // you otherwise clearly play them.
-        val bannedArtists = dislikedSongs.filter { it.value.size >= 2 }.keys.toHashSet()
-        bannedArtists.removeAll { a -> (artists[a] ?: 0f) > 4f }
+        // No artist is ever banned outright. A disliked song is out for good; its artist only
+        // takes a decaying penalty through the affinity above (-3.6 per dislike, fading over
+        // weeks), which the radio caps, so their other songs can still come up.
         skippedRecently.removeAll(liked)
-        val p = Profile(tracks, artists, albums, liked, disliked, bannedArtists, skippedRecently, lastPlayed, heard, knownArtists, artistNames)
+        val p = Profile(tracks, artists, albums, liked, disliked, skippedRecently, lastPlayed, heard, knownArtists, artistNames)
         cached = p
         cachedVersion = v
         return p
@@ -419,7 +413,6 @@ class Profile(
     private val albums: Map<String, Float>,
     private val liked: Set<String>,
     private val disliked: Set<String>,
-    private val bannedArtists: Set<String>,
     private val skippedRecently: Set<String>,
     private val lastPlayed: Map<String, Long> = emptyMap(),
     private val heard: Map<String, Int> = emptyMap(),
@@ -430,7 +423,8 @@ class Profile(
 
     fun isLiked(t: Track): Boolean = Taste.keys(t).any { it in liked }
 
-    fun isDisliked(t: Track): Boolean = Taste.keys(t).any { it in disliked } || artistKey(t) in bannedArtists
+    /** This song was disliked. Its artist is not: see [Taste.profile]. */
+    fun isDisliked(t: Track): Boolean = Taste.keys(t).any { it in disliked }
 
     fun skippedRecently(t: Track): Boolean = !isLiked(t) && Taste.keys(t).any { it in skippedRecently }
 
@@ -453,7 +447,6 @@ class Profile(
      */
     fun score(t: Track): Float {
         if (Taste.keys(t).any { it in disliked }) return -10f
-        if (artistKey(t) in bannedArtists) return -8f
         // Skipped in the last half hour: don't offer it again in this session.
         if (skippedRecently(t)) return -6f
         var s = trackAffinity(t)
