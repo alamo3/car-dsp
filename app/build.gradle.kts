@@ -113,6 +113,11 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        // android.util.Log and friends return defaults in JVM tests instead of throwing.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 // The app is otherwise framework-only. androidx.media is here for one thing the framework is
@@ -126,4 +131,9 @@ dependencies {
     // Car App Library: the media templates Android Auto/AAOS render for YT Music and Spotify
     // (sections of tiles, tabs). 1.8 adds CATEGORY_MEDIA + MediaPlaybackManager.
     implementation("androidx.car.app:app:1.9.0-alpha03")
+
+    // JVM tests (src/test): the framework's org.json is only a stub off-device, so tests bring
+    // a real one.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

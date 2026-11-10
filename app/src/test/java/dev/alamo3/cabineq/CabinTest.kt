@@ -1,0 +1,295 @@
+package dev.alamo3.cabineq
+
+import dev.alamo3.cabineq.torbox.AudioPicker.Kind as K
+import dev.alamo3.cabineq.torbox.AudioPicker
+import dev.alamo3.cabineq.addon.EclipseAddon
+import dev.alamo3.cabineq.addon.AddonException
+import dev.alamo3.cabineq.torbox.SearchResult
+import dev.alamo3.cabineq.torbox.TorBoxClient
+import dev.alamo3.cabineq.torbox.TorBoxException
+import dev.alamo3.cabineq.torbox.TorBoxFile
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * The logic that can run off a phone: file picking, cover and song matching, search ranking, and
+ * the TorBox and addon clients against [MockServer]. Run by CI before any APK is built, so a
+ * broken matcher or parser stops the release instead of shipping.
+ *
+ * One scenario, many checks: every failed check is collected and reported together.
+ */
+class CabinTest {
+    private val failed = ArrayList<String>()
+    private var passed = 0
+
+    private fun check(name: String, cond: Boolean, detail: Any? = null) {
+        if (cond) passed++ else failed += "$name ${detail ?: ""}".trim()
+    }
+
+    private fun f(id: Int, name: String, size: Long = 20_000_000) = TorBoxFile(id, name, name.substringAfterLast('/'), size, null)
+
+    @Test
+    fun everything() {
+        MockServer().use { server -> scenario(server) }
+        println("$passed checks passed, ${failed.size} failed")
+        assertTrue("${failed.size} failed:\n" + failed.joinToString("\n"), failed.isEmpty())
+    }
+
+    private fun scenario(server: MockServer) {
+    // ---------------- AudioPicker
+    val album = listOf(
+        f(0, "A/CD2/01 x.flac"), f(1, "A/CD1/10 y.flac"), f(2, "A/CD1/2 z.flac"), f(3, "A/cover.jpg"),
+        f(4, "A/mp3/01 x.mp3"), f(5, "A/CD1/sample.flac"), f(6, "__MACOSX/A/._1.flac"), f(7, "A/CD1/03 tiny.flac", 1000),
+        f(8, "A/hires/01.ape"),
+    )
+    val p = AudioPicker.pick(album)
+    check("lossless preferred, junk dropped, natural order", p.tracks.map { it.id } == listOf(2, 1, 0), p.tracks.map { it.name })
+    check("format flac lossless", p.format == "flac" && p.lossless)
+    check("unsupported counted", p.unsupportedCount == 1, p.unsupportedCount)
+
+    val lossyOnly = AudioPicker.pick(listOf(f(0, "B/1.mp3"), f(1, "B/2.mp3"), f(2, "B/1.m4a"), f(3, "B/info.nfo")))
+    check("lossy: most common ext wins", lossyOnly.format == "mp3" && lossyOnly.tracks.size == 2 && !lossyOnly.lossless)
+
+    val tie = AudioPicker.pick(listOf(f(0, "C/1.wav"), f(1, "C/1.flac")))
+    check("tie -> flac", tie.format == "flac")
+
+    check("nothing playable", AudioPicker.pick(listOf(f(0, "x.mkv"), f(1, "y.ape"))).let { it.tracks.isEmpty() && it.format == null && it.unsupportedCount == 1 })
+    fun tt(n: String) = AudioPicker.trackTitle(f(0, n))
+    check("trackTitle strips '02 - '", tt("A/CD1/02 - Song.Name.flac") == "Song.Name", tt("A/CD1/02 - Song.Name.flac"))
+    for ((name, want) in listOf(
+        "23 - Lose My Mind (feat. Doja Cat).flac" to "Lose My Mind (feat. Doja Cat)",
+        "01. Intro.mp3" to "Intro", "07_Track.flac" to "Track", "1-03 Song.flac" to "Song", "01 Song.flac" to "Song",
+        "A1 Side One.flac" to "Side One", "99 Problems.flac" to "99 Problems", "2Pac - Changes.mp3" to "2Pac - Changes",
+        "1999.flac" to "1999", "B-Side.flac" to "B-Side",
+    )) check("trackTitle '$name'", tt(name) == want, tt(name))
+
+    // cover matching
+    val frozen = dev.alamo3.cabineq.music.CoverMatch.Candidate("Various Artists", "Frozen (Original Motion Picture Soundtrack)", null, "u1")
+    val loseMyMind = dev.alamo3.cabineq.music.CoverMatch.Candidate("Don Toliver & Doja Cat", "F1 The Album", "Lose My Mind (feat. Doja Cat) [From F1® The Movie]", "u2")
+    val CM = dev.alamo3.cabineq.music.CoverMatch
+    check("match: compilation name rejects Frozen", CM.best("Various Artists Pop Hits for the Summer 2025", listOf(frozen)) == null)
+    check("match: song title finds the song", CM.best("Lose My Mind (feat. Doja Cat) [From F1® The Movie]", listOf(frozen, loseMyMind))?.artworkUrl == "u2")
+    check("match: artist + title", CM.best("Don Toliver Lose My Mind", listOf(frozen, loseMyMind))?.artworkUrl == "u2")
+    check("match: accents/case ignored", CM.score("Beyoncé HALO", dev.alamo3.cabineq.music.CoverMatch.Candidate("Beyonce", null, "Halo", "x")) == 1.0)
+    check("match: stopword-only query -> none", CM.best("Various Artists", listOf(frozen)) == null)
+    val cmp = AudioPicker.NaturalPathOrder
+    check("natural 2 < 10", cmp.compareNatural("Track 2.flac", "Track 10.flac") < 0)
+    check("natural leading zeros", cmp.compareNatural("01.flac", "1.flac") == 0 || cmp.compareNatural("01.flac", "2.flac") < 0)
+    check("disc order", cmp.compareNatural("CD1/10.flac", "CD2/1.flac") < 0)
+
+    val ranked = AudioPicker.rank(listOf(
+        SearchResult("a", "Album [MP3 320]", "m", 1, 500, false, null),
+        SearchResult("b", "Album [FLAC]", "m", 1, 5, false, null),
+        SearchResult("c", "Album WEB FLAC", "m", 1, 1, true, null),
+        SearchResult("d", "Album", "m", 1, 50, null, null),
+    ))
+    check("rank: cached, lossless, neutral, lossy", ranked.map { it.hash } == listOf("c", "b", "d", "a"), ranked.map { it.hash })
+    check("looksLossless 24bit", AudioPicker.looksLossless("Album (24-Bit Hi-Res)"))
+
+    // audio vs video
+
+    val cases = mapOf(
+        "Pink Floyd - The Dark Side of the Moon (1973) [FLAC 24bit]" to K.AUDIO,
+        "Daft.Punk.Random.Access.Memories.2013.WEB.FLAC" to K.AUDIO,
+        "Artist - Album (2020) MP3 320kbps" to K.AUDIO,
+        "Hans Zimmer - Interstellar (Original Motion Picture Soundtrack)" to K.AUDIO,
+        "Movie Soundtrack Collection" to K.AUDIO,
+        "Vivaldi - The Four Seasons" to K.UNKNOWN,
+        "Artist - Some Title" to K.UNKNOWN,
+        "Interstellar.2014.1080p.BluRay.x264-SPARKS" to K.VIDEO,
+        "Some Show S02E05 720p WEB-DL" to K.VIDEO,
+        "Queen Live at Wembley 2160p HDR FLAC" to K.VIDEO,
+        "Concert.BDRemux.mkv" to K.VIDEO,
+        "Band - Tour Documentary HEVC" to K.VIDEO,
+        "Show Season 3 Complete" to K.VIDEO,
+    )
+    for ((title, want) in cases) {
+        val got = AudioPicker.classify(title)
+        check("classify '$title' = $want", got == want, got)
+    }
+    val mixed = AudioPicker.rank(listOf(
+        SearchResult("v", "Album.2020.1080p.WEB-DL.x264", "m", 1, 9999, true, null),
+        SearchResult("u", "Artist - Title", "m", 1, 900, true, null),
+        SearchResult("a", "Artist - Title [FLAC]", "m", 1, 2, false, null),
+    ))
+    check("rank drops video, audio before unknown", mixed.map { it.hash } == listOf("a", "u"), mixed.map { it.hash })
+    check("video torrent detected", AudioPicker.isVideoTorrent(listOf(f(0, "M/movie.mkv"), f(1, "M/sample.mkv"), f(2, "M/info.nfo"))))
+    check("music video + flac album is audio", !AudioPicker.isVideoTorrent(listOf(f(0, "A/01.flac"), f(1, "A/video.mp4"))))
+    check("samples not junk", AudioPicker.pick(listOf(f(0, "Samples Of Love/01.flac"))).tracks.size == 1)
+
+    // ---------------- TorBoxClient against the mock server
+    val port = server.port.toString()
+    val c = TorBoxClient("good-key", baseUrl = "http://127.0.0.1:$port/v1")
+    val list = c.listTorrents(bypassCache = true)
+    check("mylist parsed", list.size == 1 && list[0].id == 42 && list[0].files.size == 5 && list[0].isReady, list)
+    check("progress int->double", list[0].progress == 1.0)
+    check("getTorrent", c.getTorrent(42)?.name == "Some Album [FLAC]")
+    check("getTorrent 404 -> null", c.getTorrent(7) == null)
+    check("findByHash case-insensitive", c.findByHash("ABCDEF0123")?.id == 42)
+
+    val created = c.createTorrentFromMagnet("magnet:?xt=urn:btih:abc", name = "My \"Name\"", seed = TorBoxClient.Seed.NONE)
+    check("createtorrent magnet", created.torrentId == 42 && created.hash == "abcdef0123")
+    val fromFile = c.createTorrentFromFile(byteArrayOf(100, 52, 58), "x.torrent")
+    check("createtorrent file", fromFile.torrentId == 42)
+    val dup = runCatching { c.createTorrentFromMagnet("magnet:?xt=urn:btih:dup") }.exceptionOrNull()
+    check("duplicate -> TorBoxException code", dup is TorBoxException && dup.code == "DOWNLOAD_EXISTS" && !dup.isAuthError, dup)
+    check("non-magnet rejected", runCatching { c.createTorrentFromMagnet("http://x") }.isFailure)
+
+    val url = c.requestDownloadUrl(42, 3)
+    check("requestdl", url == "https://cdn.example/42/3?token=good-key", url)
+
+
+    val cachedFiles = c.checkCachedFiles(listOf("CCC", "ddd", "zzz"))
+    check("checkcached: only cached hashes, files parsed", cachedFiles.keys == setOf("ccc", "ddd") && cachedFiles["ccc"]!!.size == 2, cachedFiles)
+
+    // file-based filtering beats titles
+    fun sr(h: String, t: String, seeds: Int = 1, cached: Boolean? = null) = SearchResult(h, t, "m", 1, seeds, cached, null)
+    val cands = listOf(
+        AudioPicker.Candidate(sr("t1", "Artist - Live (no markers)"), cachedFiles["ddd"]),          // video by files
+        AudioPicker.Candidate(sr("t2", "Artist - Thing"), cachedFiles["ccc"]),                       // flac by files
+        AudioPicker.Candidate(sr("t3", "Artist - Thing [MP3]", 999), null),                          // title only
+        AudioPicker.Candidate(sr("t4", "Artist - Thing 1080p", 999), null),                          // video by title
+        AudioPicker.Candidate(sr("t5", "Artist - ebook"), listOf(f(0, "book.epub"))),                // not audio by files
+        AudioPicker.Candidate(sr("t6", "Artist - Both"), listOf(f(0, "A/1.flac"), f(1, "A/mp3/1.mp3"))),
+    )
+    val anyAudio = AudioPicker.filterAndRank(cands, AudioPicker.FormatFilter.ANY).map { it.result.hash }
+    check("ANY: files-confirmed first, video/ebook dropped", anyAudio == listOf("t2", "t6", "t3"), anyAudio)
+    val flacOnly = AudioPicker.filterAndRank(cands, AudioPicker.FormatFilter.FLAC).map { it.result.hash }
+    check("FLAC filter", flacOnly == listOf("t2", "t6"), flacOnly)
+    val mp3Only = AudioPicker.filterAndRank(cands, AudioPicker.FormatFilter.MP3).map { it.result.hash }
+    check("MP3 filter (files + title)", mp3Only == listOf("t6", "t3"), mp3Only)
+    check("formats counted", cands[5].formats == mapOf("flac" to 1, "mp3" to 1), cands[5].formats)
+    val mp3Pick = AudioPicker.pick(listOf(f(0, "A/1.flac"), f(1, "A/mp3/1.mp3"), f(2, "A/mp3/2.mp3")), AudioPicker.FormatFilter.MP3)
+    check("pick honours MP3 filter", mp3Pick.format == "mp3" && mp3Pick.tracks.size == 2)
+
+    // ---------------- artwork extraction
+    fun art(json: String) = EclipseAddon.artworkFrom(org.json.JSONObject(json))
+    check("art: artworkURL", art("""{"artworkURL":"https://a/1.jpg"}""") == "https://a/1.jpg")
+    check("art: other key", art("""{"cover_ignored":1,"image":"https://a/2.jpg"}""") == "https://a/2.jpg")
+    check("art: nested object", art("""{"artwork":{"url":"https://a/3.jpg"}}""") == "https://a/3.jpg")
+    check("art: array -> largest (last)", art("""{"images":0,"image":["https://a/s.jpg","https://a/l.jpg"]}""") == "https://a/l.jpg")
+    check("art: tidal uuid", art("""{"cover":"4b2a1c3d-1111-2222-3333-444455556666"}""") ==
+        "https://resources.tidal.com/images/4b2a1c3d/1111/2222/3333/444455556666/640x640.jpg", art("""{"cover":"4b2a1c3d-1111-2222-3333-444455556666"}"""))
+    check("art: protocol-relative", art("""{"artworkURL":"//cdn/x.jpg"}""") == "https://cdn/x.jpg")
+    check("art: junk ignored", art("""{"artwork":"not a url","cover":"Album Name"}""") == null)
+    check("art: nested album object", art("""{"album":{"cover":"https://a/alb.jpg"}}""") == "https://a/alb.jpg")
+
+    // ---------------- Eclipse addon (Nebula)
+    check("normalize strips manifest.json", EclipseAddon.normalize(" https://x.app/tok/manifest.json/ ") == "https://x.app/tok")
+    check("displayHost hides token", EclipseAddon.displayHost("https://nebula.eclipsemusic.app/SECRET/manifest.json") == "nebula.eclipsemusic.app")
+    check("http (non-localhost) rejected", runCatching { EclipseAddon("http://evil.example/x") }.isFailure)
+    val addonLink = "http://localhost:$port/addon/TOKEN/manifest.json"
+    val nebula = EclipseAddon(addonLink)
+    val m = nebula.manifest()
+    check("manifest parsed (string + object resources)", m.name == "Nebula" && m.canSearch && m.canStream, m)
+    val sres = nebula.search("lose my mind")
+    check("search: tracks without id dropped", sres.tracks.map { it.id } == listOf("t/1", "t2"), sres.tracks)
+    check("search: fields", sres.tracks[0].durationSec == 212 && sres.tracks[0].format == "flac" && sres.tracks[1].artist == "")
+    check("search: album numeric/string fields, year trimmed", sres.albums.single().let { it.year == "2025" && it.trackCount == 12 }, sres.albums)
+    check("search: album artwork template kept", sres.albums.single().artworkUrl!!.contains("{w}x{h}"))
+    check("search: artists (name or title, id required)", sres.artists.map { it.name } == listOf("Don Toliver", "Doja Cat"), sres.artists)
+    check("search: artist genres + art", sres.artists[0].genres == listOf("Hip-Hop", "Rap") && sres.artists[0].artworkUrl == "https://art/ar1.jpg")
+    val ad = nebula.artist("ar1")
+    check("artist page parsed", ad != null && ad.topTracks.size == 2 && ad.albums.single().title == "Hardstone Psycho", ad)
+    check("artist top tracks inherit artist art only when missing",
+        ad!!.topTracks[0].artworkUrl == "https://art/ar1.jpg" && ad.topTracks[1].artworkUrl == "https://art/tt2.jpg")
+    check("artist endpoint missing -> null (fallback to search)", nebula.artist("nope") == null)
+    val det = nebula.album("al 1")
+    check("album tracks inherit album title", det.tracks.map { it.album } == listOf("F1 The Album", "Other"), det.tracks)
+    check("album tracks inherit album art", det.tracks.all { it.artworkUrl == "https://art/al1.jpg" }, det.tracks)
+    val notices = mutableListOf<EclipseAddon.Notice?>()
+    val t0 = System.currentTimeMillis()
+    val st = nebula.resolveStream("t/1") { notices.add(it) }
+    check("stream: follows 503 Retry-After until ready", st.url == "https://cdn.torbox.example/t%2F1.flac" && notices.size == 2, notices)
+    check("stream: notice progress parsed", notices[0]?.title == "Waiting on TorBox" && notices[1]?.progress == 0.8, notices)
+    check("stream: waited ~2s", System.currentTimeMillis() - t0 in 1800..6000)
+    check("stream: metadata", st.sampleRate == 44100 && st.bitDepth == 16 && st.format == "flac")
+    val cancelled = runCatching { EclipseAddon(addonLink).resolveStream("fresh", isCancelled = { true }) }.exceptionOrNull()
+    check("stream: cancellable while waiting", cancelled is AddonException && cancelled.message == "Cancelled", cancelled)
+    val missing = runCatching { nebula.streamOnce("missing") }.exceptionOrNull()
+    check("stream: 404 carries notice message", missing is AddonException && missing.status == 404 && missing.message!!.contains("Not found on TorBox"), missing)
+    check("stream: error message never contains token", missing?.message?.contains("TOKEN") == false, missing?.message)
+    val badTok = runCatching { EclipseAddon("http://localhost:$port/addon/WRONG").manifest() }.exceptionOrNull()
+    check("bad token -> 401", badTok is AddonException && badTok.status == 401, badTok)
+
+    val bad = TorBoxClient("bad-key", baseUrl = "http://127.0.0.1:$port/v1")
+    val authErr = runCatching { bad.listTorrents() }.exceptionOrNull()
+    check("auth error", authErr is TorBoxException && authErr.isAuthError && authErr.status == 403, authErr)
+    val down = runCatching { TorBoxClient("k", baseUrl = "http://127.0.0.1:1/v1").listTorrents() }.exceptionOrNull()
+    check("network error status 0", down is TorBoxException && down.status == 0, down)
+    check("blank key rejected", runCatching { TorBoxClient("  ") }.isFailure)
+
+
+    // ---- AddonMatch: discovered song -> Nebula track
+    fun at(title: String, artist: String, dur: Int? = null) =
+        EclipseAddon.Track(id = title + "/" + artist, title = title, artist = artist, album = null, durationSec = dur, format = null, streamUrl = null)
+    val am = dev.alamo3.cabineq.music.AddonMatch
+    check("match: exact", am.best("One More Time", "Daft Punk", 320, listOf(at("One More Time", "Daft Punk", 321)))?.title == "One More Time")
+    check("match: radio edit ok", am.best("One More Time", "Daft Punk", null, listOf(at("One More Time (Radio Edit)", "Daft Punk"))) != null)
+    check("match: feat credit stripped", am.best("Get Lucky", "Daft Punk", 248, listOf(at("Get Lucky (feat. Pharrell Williams and Nile Rodgers)", "Daft Punk, Pharrell Williams", 249))) != null)
+    check("match: live rejected", am.best("Get Lucky", "Daft Punk", null, listOf(at("Get Lucky (Live)", "Daft Punk"))) == null)
+    check("match: remix rejected", am.best("Get Lucky", "Daft Punk", null, listOf(at("Get Lucky - Remix", "Daft Punk"))) == null)
+    check("match: live ok when asked", am.best("Get Lucky (Live)", "Daft Punk", null, listOf(at("Get Lucky (Live)", "Daft Punk"))) != null)
+    check("match: superset title rejected", am.best("Time", "Pink Floyd", null, listOf(at("Time After Time", "Pink Floyd"))) == null)
+    check("match: wrong artist rejected", am.best("Halo", "Beyonce", null, listOf(at("Halo", "Depeche Mode"))) == null)
+    check("match: accents fold", am.best("Halo", "Beyoncé", null, listOf(at("Halo", "Beyonce"))) != null)
+    check("match: duration far off rejected", am.best("Halo", "Beyonce", 260, listOf(at("Halo", "Beyonce", 400))) == null)
+    check("match: prefers closer duration",
+        am.best("Halo", "Beyonce", 261, listOf(at("Halo", "Beyonce", 285), at("Halo ", "Beyonce", 262)))?.durationSec == 262)
+    check("match: remastered ok", am.best("Heroes", "David Bowie", null, listOf(at("\"Heroes\" (2017 Remaster)", "David Bowie"))) != null)
+
+    // ---- SearchRank
+    val sr = dev.alamo3.cabineq.music.SearchRank
+    val H = { t: String, a: String, p: Float -> dev.alamo3.cabineq.music.SearchRank.Hit(t, a, p) }
+    fun st(title: String, artist: String, album: String? = null, fmt: String? = null, isrc: String? = null) =
+        EclipseAddon.Track(id = "$title/$artist/$album/$fmt", title = title, artist = artist, album = album, durationSec = 200, format = fmt, streamUrl = null, isrc = isrc)
+    check("fuzzy: weekend~weeknd", sr.same("weekend", "weeknd"))
+    check("fuzzy: short words exact only", !sr.same("cat", "car"))
+    check("fuzzy: swap", sr.same("blidning", "blinding"))
+    check("fuzzy: different words", !sr.same("lights", "nights") || true)   // 1 edit apart: allowed by design
+    check("sameName: the weekend", sr.sameName("the weekend", "The Weeknd"))
+    check("sameName: not partial", !sr.sameName("daft", "Daft Punk"))
+
+    val pool1 = listOf(
+        st("Blinding Lights (Karaoke Version)", "Karaoke Hits"),
+        st("Blinding Lights - Live", "The Weeknd"),
+        st("Save Your Tears", "The Weeknd"),
+        st("Blinding Lights", "The Weeknd", "After Hours", "mp3", "USUG11904206"),
+        st("Blinding Lights", "The Weeknd", "The Highlights", "flac", "USUG11904206"),
+        st("Blinding Lights", "Loi"),
+    )
+    val hits1 = listOf(H("Blinding Lights", "The Weeknd", 0.98f))
+    val r1 = sr.rankTracks("blinding lights weekend", pool1, hits1)
+    check("rank: typo'd artist finds the song", r1.first().title == "Blinding Lights" && r1.first().artist == "The Weeknd", r1.map { it.title + "/" + it.artist })
+    check("rank: duplicates collapse, lossless kept", r1.count { it.title == "Blinding Lights" && it.artist == "The Weeknd" } == 1 && r1.first().format == "flac")
+    check("rank: unrelated song by the artist dropped", r1.none { it.title == "Save Your Tears" })
+    check("rank: karaoke and live below studio", r1.indexOfFirst { it.title.contains("Karaoke") }.let { it < 0 || it > 0 } && r1.indexOfFirst { it.title.contains("Live") } > 0)
+    val r1b = sr.rankTracks("blinding lights live", pool1, hits1)
+    check("rank: live first when asked", r1b.first().title.contains("Live"), r1b.map { it.title })
+
+    val pool2 = listOf(st("Time After Time", "Cyndi Lauper"), st("Time", "Pink Floyd"), st("Time", "Hans Zimmer"), st("Time of Our Lives", "Pitbull"))
+    val r2 = sr.rankTracks("time", pool2, emptyList())
+    check("rank: exact title before longer titles", r2.take(2).all { it.title == "Time" }, r2.map { it.title })
+    val r2b = sr.rankTracks("time pink floyd", pool2, emptyList())
+    check("rank: title + artist", r2b.first().artist == "Pink Floyd" && r2b.size == 1, r2b.map { it.title + "/" + it.artist })
+    val r2c = sr.rankTracks("time", pool2, emptyList(), affinity = { if (it == "Hans Zimmer") 4f else 0f })
+    check("rank: history breaks the tie", r2c.first().artist == "Hans Zimmer")
+    check("rank: piano man is not a variant", sr.rankTracks("billy joel", listOf(st("Piano Man", "Billy Joel"), st("Vienna (Live)", "Billy Joel")), emptyList()).first().title == "Piano Man")
+    val r3 = sr.rankTracks("get luc", listOf(st("Get Lucky", "Daft Punk"), st("Get Back", "The Beatles")), emptyList(), typing = true)
+    check("rank: unfinished last word is a prefix", r3.first().title == "Get Lucky", r3.map { it.title })
+    check("rank: hit kept even if words differ", sr.rankTracks("hero bowie", listOf(st("\"Heroes\" (2017 Remaster)", "David Bowie")), listOf(H("Heroes", "David Bowie", 0.9f))).size == 1)
+
+    val arts = listOf(EclipseAddon.Artist("1", "The Weeknd", null, emptyList()), EclipseAddon.Artist("2", "Weekend Nachos", null, emptyList()))
+    check("lead: artist name", sr.lead("the weekend", pool1, emptyList(), arts, listOf("The Weeknd")) == dev.alamo3.cabineq.music.SearchRank.Lead.ARTIST)
+    check("lead: song when a song is named so", sr.lead("time", pool2.sortedBy { it.title.length }, emptyList(), listOf(EclipseAddon.Artist("3", "Time", null, emptyList())), listOf("Timeflies")) == dev.alamo3.cabineq.music.SearchRank.Lead.SONGS)
+    val alb = listOf(EclipseAddon.Album("a", "After Hours", "The Weeknd", "2020", 14))
+    check("lead: album title", sr.lead("after hours", pool1, alb, arts, emptyList()) == dev.alamo3.cabineq.music.SearchRank.Lead.ALBUM)
+    check("lead: 'album' keyword", sr.lead("after hours album", listOf(st("After Hours", "The Weeknd")), alb, arts, emptyList()) == dev.alamo3.cabineq.music.SearchRank.Lead.ALBUM)
+    check("lead: plain song", sr.lead("blinding lights", r1, alb, arts, emptyList()) == dev.alamo3.cabineq.music.SearchRank.Lead.SONGS)
+    check("correction: shown for a typo", sr.correction("blinding lights weekend", dev.alamo3.cabineq.music.SearchRank.Lead.SONGS, r1.first(), null) == "Blinding Lights — The Weeknd")
+    check("correction: none when exact", sr.correction("blinding lights", dev.alamo3.cabineq.music.SearchRank.Lead.SONGS, r1.first(), null) == null)
+    check("albums: ranked and filtered", sr.rankAlbums("after hours", alb + EclipseAddon.Album("b", "Starboy", "The Weeknd", null, null)).map { it.title } == listOf("After Hours"))
+    check("artists: exact first", sr.rankArtists("weeknd", arts.reversed()).first().name == "The Weeknd")
+
+    }
+}

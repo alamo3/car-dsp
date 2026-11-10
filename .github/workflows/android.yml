@@ -25,6 +25,10 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # Before any APK exists: a broken matcher, ranker or API client stops the release.
+      - name: Unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
       - name: Decode signing key
         if: env.HAS_SIGNING == 'true'
         env:
