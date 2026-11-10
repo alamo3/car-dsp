@@ -76,6 +76,9 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     private var lastTrack: Track? = null
     private var lastDurationMs = 0L
     private var failures = 0
+    /** Guards against a slow queue build landing after the queue was replaced. */
+    private var startToken = 0
+    private var rebuildRetries = 0
     private var radioAsks = 0
     private var ticking = false
 
@@ -107,16 +110,25 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         keys.addAll(queueKeys)
         tracksByKey.clear()
         deferred.clear()
-        val items = tracks.mapIndexed { i, t -> item(queueKeys[i], t) }
         failures = 0
         radioAsks = 0
         bridge.error(null)
-        p.setMediaItems(items, index.coerceIn(0, items.lastIndex), startAtMs)
-        p.repeatMode = repeatMode(owner.repeat)
-        p.prepare()
-        p.play()
-        Log.i(TAG, "start: ${items.size} songs from $index at ${startAtMs}ms")
-        startTicking()
+        // Building an item asks the disk cache whether the song is already on the phone, which is
+        // file I/O: never on the main thread, and dropped if the queue is replaced meanwhile.
+        val token = ++startToken
+        checkPool.execute {
+            val local = tracks.map { runCatching { MediaCache.fileFor(context, it) }.getOrNull() }
+            main.post {
+                if (token != startToken || player !== p) return@post
+                val items = tracks.mapIndexed { i, t -> item(queueKeys[i], t, local[i]) }
+                p.setMediaItems(items, index.coerceIn(0, items.lastIndex), startAtMs)
+                p.repeatMode = repeatMode(owner.repeat)
+                p.prepare()
+                p.play()
+                Log.i(TAG, "start: ${items.size} songs from $index at ${startAtMs}ms")
+                startTicking()
+            }
+        }
     }
 
     fun pause() = main.post { player?.pause() }
@@ -145,7 +157,9 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         val p = player ?: return@post
         val first = p.mediaItemCount
         keys.addAll(newKeys)
-        p.addMediaItems(tracks.mapIndexed { i, t -> item(newKeys[i], t) })
+        p.addMediaItems(tracks.mapIndexed { i, t ->
+            item(newKeys[i], t, runCatching { MediaCache.fileFor(context, t) }.getOrNull())
+        })
         // The queue had run out and this is what it was waiting for (the radio's next pick).
         if (p.playbackState == Player.STATE_ENDED) {
             Log.i(TAG, "queue grew after it ended: playing \"${tracks.first().title}\"")
@@ -178,12 +192,26 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         main.postDelayed(rebuild, 300)
     }
 
-    private val rebuild = Runnable {
-        val p = player ?: return@Runnable
-        val want = bridge.targetRate(p.audioFormat?.sampleRate ?: return@Runnable)
+    private val rebuild = object : Runnable {
+        override fun run() {
+            val p = player ?: return
+            val sourceRate = p.audioFormat?.sampleRate
+            if (sourceRate == null) {
+                // The route changed before the first format arrived: retry shortly (bounded).
+                if (rebuildRetries++ < REBUILD_RETRIES) main.postDelayed(this, 300)
+                else Log.i(TAG, "route changed, but there is no audio format to rebuild for yet")
+                return
+            }
+            rebuildRetries = 0
+            rebuildFor(p, sourceRate)
+        }
+    }
+
+    private fun rebuildFor(p: ExoPlayer, sourceRate: Int) {
+        val want = bridge.targetRate(sourceRate)
         if (processor.outputRate == null || processor.outputRate == want) {
             processor.refreshRouteDependentParams()
-            return@Runnable
+            return
         }
         // The engine is built for the old rate. Stopping and preparing again keeps the playlist
         // and the position, and makes Media3 configure the audio chain afresh.
@@ -202,6 +230,8 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         main.removeCallbacks(askAgain)
         main.removeCallbacks(rebuild)
         reportLeaving(skipped = true)
+        startToken++
+        rebuildRetries = 0
         player?.release()
         player = null
         keys.clear()
@@ -239,7 +269,11 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                     .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                     .setAllowedCapturePolicy(C.ALLOW_CAPTURE_BY_SYSTEM)
                     .build(),
-                /* handleAudioFocus = */ true,
+                // FilePlayer already requests and abandons focus and reacts to losses (that is
+                // the logic the car's projection host needed). Two focus managers fight: a
+                // transient loss paused us twice, and abandoning on pause left Media3's manager
+                // believing it still owned focus.
+                /* handleAudioFocus = */ false,
             )
             .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
@@ -250,11 +284,10 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         return built
     }
 
-    private fun item(key: String, track: Track): MediaItem {
+    private fun item(key: String, track: Track, local: File?): MediaItem {
         tracksByKey[key] = track
         // Already on the phone (a download, or the other engine's cache): play the file.
-        val local = runCatching { MediaCache.fileFor(context, track) }.getOrNull()
-        val uri = if (local != null) Uri.fromFile(local) else Uri.parse("$SCHEME://t/$key")
+        val uri = if (local != null && local.isFile) Uri.fromFile(local) else Uri.parse("$SCHEME://t/$key")
         return MediaItem.Builder()
             .setMediaId(key)
             .setUri(uri)
@@ -653,6 +686,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         private const val LINK_TTL_MS = 90_000L
         private const val DEFERRED_RECHECK_MS = 20_000L
         private const val DEFERRED_MAX_AGE_MS = 10 * 60_000L
+        private const val REBUILD_RETRIES = 10
 
         @Volatile private var sharedCache: SimpleCache? = null
 

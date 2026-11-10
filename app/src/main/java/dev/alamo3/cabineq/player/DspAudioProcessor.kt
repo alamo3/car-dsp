@@ -38,6 +38,8 @@ internal class DspAudioProcessor(private val bridge: FilePlayer.Bridge) : BaseAu
     private var engineRate = 0
     private var appliedEq = -1
     private var inFloat = FloatArray(0)
+    /** Bytes of an incomplete frame, carried to the next input buffer. */
+    private var carry = ByteArray(0)
     private var outFloat = FloatArray(0)
     private val audioManager = bridge.context.getSystemService(AudioManager::class.java)
 
@@ -64,11 +66,21 @@ internal class DspAudioProcessor(private val bridge: FilePlayer.Bridge) : BaseAu
         synchronized(bridge.dspLock) {
             if (handle == 0L || engineRate != outRate) {
                 if (handle != 0L) NativeDsp.destroy(handle)
-                handle = NativeDsp.create(outRate)
+                handle = runCatching { NativeDsp.create(outRate) }.getOrElse { e ->
+                    // Without an engine the processor can only output silence; say so instead of
+                    // playing a silent song and leaving the listener to guess.
+                    Log.e(TAG, "could not create the DSP engine at $outRate Hz: ${e.message}")
+                    bridge.error("DSP unavailable")
+                    0L
+                }
                 engineRate = outRate
                 appliedEq = -1
                 Log.i(TAG, if (inRate == outRate) "engine at $outRate Hz, no resampling" else "engine at $outRate Hz, resampling from $inRate Hz")
             }
+            if (handle == 0L) return@synchronized
+            // A flush is a seek or a new song: drop the resampler's history, or its first frames
+            // are a blend of the audio from before the jump. 0 disables it, the real rate resets it.
+            NativeDsp.setInputRate(handle, 0)
             NativeDsp.setInputRate(handle, inRate)
             applyEqLocked()
             // Never start mid-waveform at full amplitude: that step is a click.
@@ -80,20 +92,47 @@ internal class DspAudioProcessor(private val bridge: FilePlayer.Bridge) : BaseAu
     override fun queueInput(inputBuffer: ByteBuffer) {
         val format = inputAudioFormat
         val frameBytes = Pcm.bytesPerSample(format.encoding) * format.channelCount
-        val frames = inputBuffer.remaining() / frameBytes
-        if (frames <= 0) return
-        if (inFloat.size < frames * 2) inFloat = FloatArray(frames * 2)
-        Pcm.toStereoFloat(inputBuffer, format.encoding, format.channelCount, frames, inFloat)
-        inputBuffer.position(inputBuffer.position() + frames * frameBytes)
-
-        val produced = synchronized(bridge.dspLock) {
-            if (handle == 0L) 0 else {
-                val cap = NativeDsp.maxFrames(handle, frames)
-                if (outFloat.size < cap * 2) outFloat = FloatArray(cap * 2)
-                NativeDsp.process(handle, inFloat, frames, outFloat, cap)
-            }
+        // Media3 is documented to hand over whole frames, but a stray partial frame at the end of
+        // a buffer used to be dropped silently; keep the bytes and prepend them next time.
+        var source: ByteBuffer = inputBuffer
+        if (carry.isNotEmpty()) {
+            val joined = ByteBuffer.allocate(carry.size + inputBuffer.remaining())
+            joined.put(carry)
+            joined.put(inputBuffer.duplicate())
+            joined.flip()
+            source = joined
         }
-        emit(produced)
+        val frames = source.remaining() / frameBytes
+        val consumed = frames * frameBytes
+        if (frames > 0) {
+            if (inFloat.size < frames * 2) inFloat = FloatArray(frames * 2)
+            Pcm.toStereoFloat(source, format.encoding, format.channelCount, frames, inFloat)
+            var noEngine = false
+            val produced = synchronized(bridge.dspLock) {
+                if (handle == 0L) {
+                    noEngine = true
+                    0
+                } else {
+                    val cap = NativeDsp.maxFrames(handle, frames)
+                    if (outFloat.size < cap * 2) outFloat = FloatArray(cap * 2)
+                    NativeDsp.process(handle, inFloat, frames, outFloat, cap)
+                }
+            }
+            if (noEngine) logSilenceOnce()
+            emit(produced)
+        }
+        source.position(source.position() + consumed)
+        val leftover = source.remaining()
+        carry = if (leftover > 0) ByteArray(leftover).also { source.get(it) } else ByteArray(0)
+        inputBuffer.position(inputBuffer.limit())
+    }
+
+    /** Says it once rather than per buffer: the engine failed, and the output is silence. */
+    private var silenceLogged = false
+    private fun logSilenceOnce() {
+        if (silenceLogged) return
+        silenceLogged = true
+        Log.e(TAG, "no DSP engine: audio is being dropped while this song plays")
     }
 
     /** End of the stream: push the resampler's look-ahead through, or the last few ms are lost. */
@@ -119,6 +158,8 @@ internal class DspAudioProcessor(private val bridge: FilePlayer.Bridge) : BaseAu
     }
 
     override fun onReset() {
+        carry = ByteArray(0)
+        silenceLogged = false
         synchronized(bridge.dspLock) {
             if (handle != 0L) NativeDsp.destroy(handle)
             handle = 0L
@@ -143,14 +184,26 @@ internal class DspAudioProcessor(private val bridge: FilePlayer.Bridge) : BaseAu
     }
 
     /**
-     * Whether the sound is going to Bluetooth. Media3 does not expose the device its AudioTrack
-     * is routed to, so this asks which outputs are connected: a connected A2DP device is where
-     * media goes.
+     * Whether the sound is going to Bluetooth. Media3 does not expose the AudioTrack's routed
+     * device, so this asks the framework where media *would* go (API 33+); before that, all it
+     * can do is look at what is connected — which is wrong when a Bluetooth device is paired but
+     * the audio is going to a USB or AUX unit, and would have low-passed that for nothing.
      */
     private fun bluetoothRoute(): Boolean = runCatching {
-        audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.any {
+        val am = audioManager ?: return@runCatching false
+        val devices = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            val attrs = android.media.AudioAttributes.Builder()
+                .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
+            am.getAudioDevicesForAttributes(attrs)
+        } else {
+            // An array here, a list above: unify, or the result is just `Any`.
+            am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+        }
+        devices.any {
             it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-        } == true
+        }
     }.getOrDefault(false)
 
     private companion object {

@@ -72,6 +72,10 @@ object MediaCache {
         val app = context.applicationContext
         val settings = Settings(app)
         if (!settings.cacheEnabled) return
+        // Media3 has its own disk cache (cacheDir/media3) and evicts by the same setting; filling
+        // this one too would store every prefetched song twice and double the storage the user
+        // asked for. With that engine on, its cache is the only one doing the caching.
+        if (settings.media3Player) return
         if (settings.cacheWifiOnly && !onUnmeteredNetwork(app)) {
             Log.i(TAG, "skip ${track.title}: not on Wi-Fi and Wi-Fi-only is set")
             return

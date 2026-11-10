@@ -10,6 +10,9 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Media3's player takes a wake lock while playing (setWakeMode); without this the
+         first play throws SecurityException. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- MediaCache checks whether the active network is Wi-Fi before prefetching. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
