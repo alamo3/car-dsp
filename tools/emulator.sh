@@ -3,6 +3,7 @@
 # here without a phone: the app's media UI, playback, the DSP and the car's chrome.
 #
 #   tools/emulator.sh            boot (if needed), build, install, launch, screenshot
+#   tools/emulator.sh --window   boot with a visible window and audio (to watch and listen)
 #   tools/emulator.sh --shot     just take a screenshot of the running emulator
 #   tools/emulator.sh --stop     shut it down
 #
@@ -24,15 +25,19 @@ shot() {
   echo "screenshot: $SHOT"
 }
 
+WINDOW_ARGS=(-no-window -no-audio)
 case "${1:-}" in
   --shot) shot; exit 0 ;;
   --stop) adb -s "$SERIAL" emu kill 2>/dev/null; echo "stopped"; exit 0 ;;
+  # The window and the audio stream are QEMU's: the guest's 48 kHz output is resampled by the
+  # host audio backend, so it is good for "can I hear it at all", not for judging the DSP.
+  --window) WINDOW_ARGS=(-audio pulseaudio) ;;
 esac
 
 if ! adb devices | grep -q "^$SERIAL[[:space:]]*device"; then
   echo "== booting $AVD"
-  nohup "$ANDROID_HOME/emulator/emulator" -avd "$AVD" -no-window -no-audio -no-snapshot \
-      -gpu host -memory 2048 -cores 2 -no-boot-anim \
+  nohup env DISPLAY="${DISPLAY:-:0}" "$ANDROID_HOME/emulator/emulator" -avd "$AVD" \
+      "${WINDOW_ARGS[@]}" -no-snapshot -gpu host -memory 2048 -cores 2 -no-boot-anim \
       -dns-server 1.1.1.1,8.8.8.8 > /tmp/aaos-emulator.log 2>&1 &
   for _ in $(seq 1 60); do
     [ "$(adb -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
@@ -73,6 +78,8 @@ if [ -n "${SEED_PREFS:-}" ] && [ -f "$SEED_PREFS" ]; then
   sleep 2
 fi
 
+# Grant notifications up front: the first play otherwise stops behind a system dialog.
+adb -s "$SERIAL" shell pm grant dev.alamo3.cabineq android.permission.POST_NOTIFICATIONS 2>/dev/null
 adb -s "$SERIAL" shell am start -n dev.alamo3.cabineq/.MusicActivity >/dev/null 2>&1
 sleep 3
 shot

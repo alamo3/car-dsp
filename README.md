@@ -316,6 +316,7 @@ libraries (`extras/google/auto/libs`), which it needs to start at all.
 ```
 tools/emulator.sh                        # boot (if needed), build x86_64, install, launch, screenshot
 SEED_PREFS=/tmp/seed.xml tools/emulator.sh   # …and seed prefs first (e.g. the addon link)
+tools/emulator.sh --window               # …with a visible window and audio, to watch and listen
 tools/emulator.sh --shot                 # screenshot the running emulator
 tools/emulator.sh --stop                 # shut it down
 ```
