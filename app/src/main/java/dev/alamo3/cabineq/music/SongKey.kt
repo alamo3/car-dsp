@@ -32,9 +32,16 @@ object SongKey {
     /** Lowercase, accents folded, punctuation gone, single spaces. */
     fun simplify(s: String): String = words(s).joinToString(" ")
 
+    private val STYLISED_S = Regex("""(?<=\p{L})\$|\$(?=\p{L})""")
+    private val STYLISED_I = Regex("""(?<=\p{L})!(?=\p{L})""")
+
     fun words(s: String?): List<String> {
         if (s.isNullOrBlank()) return emptyList()
         return Normalizer.normalize(s, Normalizer.Form.NFD).replace(Regex("\\p{M}+"), "")
-            .lowercase().replace("&", " and ").split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotEmpty() }
+            .lowercase()
+            // Stylised names are one word, not two: Ke$ha is "kesha", P!nk is "pink", A$AP is
+            // "asap". Catalogues disagree on which spelling they list.
+            .replace(STYLISED_S, "s").replace(STYLISED_I, "i")
+            .replace("&", " and ").split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotEmpty() }
     }
 }

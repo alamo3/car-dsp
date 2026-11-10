@@ -368,5 +368,18 @@ class CabinTest {
         val short = dev.alamo3.cabineq.music.Leveler(known = null, albumGainDb = null)
         val s10 = sine(0.5, 10.0); short.process(s10, s10.size / 2, 48000)
         check("level: a skipped song is not remembered", short.measured() == null)
+
+        // ---- Stylised artist names: catalogues disagree on Ke$ha / Kesha
+        val SK = dev.alamo3.cabineq.music.SongKey
+        check("names: Ke\$ha is one word", SK.words("Ke\$ha") == listOf("kesha") && SK.words("P!nk") == listOf("pink") &&
+            SK.words("A\$AP Rocky") == listOf("asap", "rocky") && SK.words("Ty Dolla \$ign") == listOf("ty", "dolla", "sign"), SK.words("Ke\$ha"))
+        check("names: punctuation still splits", SK.words("Help!") == listOf("help") && SK.words("\$100 Bill") == listOf("100", "bill"), SK.words("\$100 Bill"))
+        check("names: same song key either way", SK.of("Die Young", "Ke\$ha") == SK.of("Die Young", "Kesha"))
+        for (listed in listOf("Ke\$ha", "KE\$HA", "Kesha", "Ke\$ha & will.i.am")) {
+            check("match: Die Young by Kesha vs '$listed'", am.best("Die Young", "Kesha", 212, listOf(at("Die Young", listed, 212))) != null)
+        }
+        check("match: other artist's Die Young still rejected", am.best("Die Young", "Kesha", 212, listOf(at("Die Young", "Roddy Ricch", 212))) == null)
+        check("match: AC/DC vs ACDC", am.best("Thunderstruck", "AC/DC", null, listOf(at("Thunderstruck", "ACDC"))) != null)
+        check("match: misspelt artist tolerated", am.best("Halo", "Beyonce", null, listOf(at("Halo", "Beyoncee"))) != null)
     }
 }
