@@ -261,15 +261,45 @@ class EqService : MediaBrowserServiceCompat() {
     }
 
     /** "Play <something>" from the car's assistant. */
+    /**
+     * The assistant's transcript plus what it understood about it: the kind of thing asked for
+     * and, when it could tell, the artist, album and title.
+     */
+    private fun voiceRequest(query: String, extras: Bundle?): dev.alamo3.cabineq.music.VoiceRequest {
+        fun text(key: String) = runCatching { extras?.getString(key) }.getOrNull()?.trim()?.takeIf { it.isNotEmpty() }
+        return dev.alamo3.cabineq.music.VoiceRequest(
+            query = query,
+            focus = dev.alamo3.cabineq.music.VoiceRequest.focusOf(text(android.provider.MediaStore.EXTRA_MEDIA_FOCUS)),
+            artist = text(android.provider.MediaStore.EXTRA_MEDIA_ARTIST),
+            album = text(android.provider.MediaStore.EXTRA_MEDIA_ALBUM),
+            title = text(android.provider.MediaStore.EXTRA_MEDIA_TITLE),
+            playlist = text("android.intent.extra.playlist"),
+            // Not usually sent for media requests, but free to use when it is.
+            alternatives = runCatching { extras?.getStringArrayList(android.speech.RecognizerIntent.EXTRA_RESULTS) }
+                .getOrNull().orEmpty().filter { !it.equals(query, ignoreCase = true) }.take(3),
+        )
+    }
+
     private fun playFromSearchQuery(query: String) {
         if (query.isBlank()) return
+        playFromVoice(dev.alamo3.cabineq.music.VoiceRequest(query))
+    }
+
+    private fun playFromVoice(request: dev.alamo3.cabineq.music.VoiceRequest) {
+        Log.i(TAG, "voice request: focus=${request.focus} fields=" +
+            listOfNotNull("artist".takeIf { request.artist != null }, "album".takeIf { request.album != null },
+                "title".takeIf { request.title != null }, "playlist".takeIf { request.playlist != null }) +
+            " alternatives=${request.alternatives.size}")
         startEngine()
         startForegroundSafely()
         mediaSession?.isActive = true
         Thread({
-            val spec = runCatching { MediaBrowse.searchPlayback(this, query) }.getOrNull()
+            val spec = runCatching { MediaBrowse.voicePlayback(this, request) }.getOrNull()
             if (spec == null) {
-                Log.w(TAG, "No search results for \"$query\"")
+                Log.w(TAG, "Nothing to play for the voice request")
+                // Say so where the car shows it, instead of silently doing nothing.
+                EngineState.playerMessage = if (request.isOpenEnded) "Nothing to play yet — like or play a few songs first."
+                    else "Couldn't find “${dev.alamo3.cabineq.music.VoiceRequest.clean(request.query).take(60)}”."
                 return@Thread
             }
             FilePlayer.get(this).play(spec.tracks, spec.index, spec.title, radio = spec.radio)
@@ -700,7 +730,8 @@ class EqService : MediaBrowserServiceCompat() {
 
             override fun onPlayFromMediaId(mediaId: String, extras: Bundle?) = playFromBrowse(mediaId)
             override fun onPlayFromSearch(query: String?, extras: Bundle?) {
-                query?.let { playFromSearchQuery(it) }
+                // An empty query is "play some music"; the extras say what was asked for.
+                playFromVoice(voiceRequest(query.orEmpty(), extras))
             }
         })
         mediaSession = session

@@ -67,13 +67,18 @@ object SmartSearch {
         val now = SystemClock.elapsedRealtime()
         synchronized(cache) { cache[cacheKey]?.takeIf { now - it.at < CACHE_MS }?.let { return it.result } }
 
+        // A name the listener plays, misheard or misspelt beyond a typo ("beyonsay"): search
+        // for the real one as well.
+        val profile = context?.let { runCatching { Taste.profile(it) }.getOrNull() }
+        val soundsLike = profile?.let { Phonetic.correct(q, it.knownArtists()) }
+
         // 1 + 2a: the index and the raw addon search, together.
         val trackHitsF = pool.submit(Callable { Discover.searchTracks(q, 8) })
         val artistHitsF = pool.submit(Callable { Discover.searchArtists(q, 3) })
         val rawF = pool.submit(Callable { addon.search(q, LIMIT, deep = false) })
 
         val trackHits = await(trackHitsF, INDEX_WAIT_MS).orEmpty()
-        val artistHits = await(artistHitsF, 500).orEmpty()
+        val artistHits = listOfNotNull(soundsLike) + await(artistHitsF, 500).orEmpty()
         val hits = trackHits.map { SearchRank.Hit(it.title, it.artist, SearchRank.popularity(it.rank)) }
 
         // 2b: the readings of the query, as the addon likes them ("title artist", exact).
@@ -102,7 +107,6 @@ object SmartSearch {
         val all = listOf(raw) + more
 
         // 3: one ranking over everything.
-        val profile = context?.let { runCatching { Taste.profile(it) }.getOrNull() }
         val affinity: (String) -> Float = { artist -> profile?.artistScore(artist) ?: 0f }
         // Readings first, so that when the same song came back twice the cleaner copy is seen.
         val mergedTracks = (more.flatMap { it.tracks } + raw.tracks).distinctBy { it.id }

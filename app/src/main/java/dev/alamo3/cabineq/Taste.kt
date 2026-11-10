@@ -519,6 +519,9 @@ class Profile(
         }
     }
 
+    /** Every artist in the listener's history, as written: what a misheard name is checked against. */
+    fun knownArtists(): Collection<String> = artistNames.values
+
     /** Artists ranked by decayed affinity, for the transparency panel. */
     fun topArtists(n: Int = 5): List<Pair<String, Float>> =
         artists.entries.filter { it.value > 0f }

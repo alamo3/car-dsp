@@ -203,32 +203,136 @@ object MediaBrowse {
         }
     }
 
-    /** "play <something>" from the car's assistant: queue all matches, start at the first. */
-    fun searchPlayback(context: Context, query: String): Playback? {
-        val addon = addon(context) ?: return null
-        val found = smartSearch(context, addon, query)
-        val tracks = found.results.tracks.take(MAX_ROWS).map { it.toTrack() }
-        if (tracks.isEmpty()) return null
+    /** "Play <something>" as plain text (the phone's search intent, older callers). */
+    fun searchPlayback(context: Context, query: String): Playback? =
+        voicePlayback(context, dev.alamo3.cabineq.music.VoiceRequest(query))
+
+    /**
+     * "Play …" from the assistant. Tries the assistant's own fields first (artist, title, album),
+     * then the transcript, then what the transcript may have been meant as, and plays the first
+     * reading that finds what it was looking for. Nothing named at all means "play some music".
+     */
+    fun voicePlayback(context: Context, request: dev.alamo3.cabineq.music.VoiceRequest): Playback? {
+        if (request.isOpenEnded) return somethingToPlay(context)
+        // The listener's own things by name: "play my liked songs", "play <my playlist>".
+        ownCollection(context, request)?.let { return it }
+        val addon = addon(context) ?: return somethingToPlay(context)
+        val known = runCatching { Taste.profile(context).knownArtists() }.getOrDefault(emptyList())
+        var fallback: Playback? = null
+        for (attempt in request.attempts(known).take(4)) {
+            val found = runCatching { smartSearch(context, addon, attempt.text) }.getOrNull() ?: continue
+            val play = playbackFor(context, addon, attempt, found) ?: continue
+            if (confident(attempt, found)) {
+                Log.i(TAG, "voice: \"${request.query.take(40)}\" played as \"${attempt.text.take(40)}\" (${attempt.expect})")
+                return play
+            }
+            if (fallback == null) fallback = play
+        }
+        return fallback
+    }
+
+    /** Did this reading find the thing it names, rather than merely something? */
+    private fun confident(
+        attempt: dev.alamo3.cabineq.music.VoiceRequest.Attempt,
+        found: dev.alamo3.cabineq.music.SmartSearch.Result,
+    ): Boolean {
+        val rank = dev.alamo3.cabineq.music.SearchRank
         return when (found.lead) {
-            // "Play Daft Punk": their top songs, in order.
+            dev.alamo3.cabineq.music.SearchRank.Lead.ARTIST, dev.alamo3.cabineq.music.SearchRank.Lead.ALBUM -> true
+            else -> found.results.tracks.firstOrNull()?.let { rank.covers(attempt.text, it) >= 0.75f } == true
+        }
+    }
+
+    private fun playbackFor(
+        context: Context,
+        addon: EclipseAddon,
+        attempt: dev.alamo3.cabineq.music.VoiceRequest.Attempt,
+        found: dev.alamo3.cabineq.music.SmartSearch.Result,
+    ): Playback? {
+        val rank = dev.alamo3.cabineq.music.SearchRank
+        val tracks = found.results.tracks.take(MAX_ROWS).map { it.toTrack() }
+        // The assistant said what it is: believe that over our own guess when the results agree.
+        val artist = found.results.artists.firstOrNull()
+        val album = found.results.albums.firstOrNull()
+        val lead = when {
+            attempt.expect == dev.alamo3.cabineq.music.VoiceRequest.Focus.ARTIST && artist != null && rank.sameName(artist.name, attempt.text) -> dev.alamo3.cabineq.music.SearchRank.Lead.ARTIST
+            attempt.expect == dev.alamo3.cabineq.music.VoiceRequest.Focus.ALBUM && album != null -> dev.alamo3.cabineq.music.SearchRank.Lead.ALBUM
+            attempt.expect == dev.alamo3.cabineq.music.VoiceRequest.Focus.SONG && tracks.isNotEmpty() -> dev.alamo3.cabineq.music.SearchRank.Lead.SONGS
+            else -> found.lead
+        }
+        return when (lead) {
+            // "Play Daft Punk": their top songs, in order, then radio from them.
             dev.alamo3.cabineq.music.SearchRank.Lead.ARTIST -> {
-                val artist = found.results.artists.first().name
-                val theirs = tracks.filter {
-                    dev.alamo3.cabineq.music.SongKey.artist(it.artist) == dev.alamo3.cabineq.music.SongKey.artist(artist)
-                }.ifEmpty { tracks }
-                Playback(artist, theirs, 0)
+                val name = artist?.name ?: return null
+                val key = dev.alamo3.cabineq.music.SongKey.artist(name)
+                val top = runCatching { addon.artist(artist.id)?.topTracks }.getOrNull().orEmpty().map { it.toTrack() }
+                val theirs = (top + tracks.filter { dev.alamo3.cabineq.music.SongKey.artist(it.artist) == key })
+                    .distinctBy { Taste.key(it) }.ifEmpty { tracks }
+                if (theirs.isEmpty()) null else Playback(name, theirs, 0, radio = theirs.last())
             }
             // "Play the album …": the album itself.
             dev.alamo3.cabineq.music.SearchRank.Lead.ALBUM -> {
-                val album = found.results.albums.first()
-                val detail = runCatching { addon.album(album.id) }.getOrNull()
-                val albumTracks = detail?.tracks?.map { it.toTrack() }.orEmpty()
-                if (albumTracks.isNotEmpty()) Playback(album.title, albumTracks, 0)
-                else Playback("Search: $query", listOf(tracks[0]), 0, radio = tracks[0])
+                val al = album ?: return null
+                val albumTracks = runCatching { addon.album(al.id) }.getOrNull()?.tracks?.map { it.toTrack() }.orEmpty()
+                when {
+                    albumTracks.isNotEmpty() -> Playback(al.title, albumTracks, 0)
+                    tracks.isNotEmpty() -> Playback("Search: ${attempt.text}", listOf(tracks[0]), 0, radio = tracks[0])
+                    else -> null
+                }
             }
             // "Play <song>": that song, then radio from it — not twenty lookalikes.
-            else -> Playback("Search: $query", listOf(tracks[0]), 0, radio = tracks[0])
+            else -> tracks.firstOrNull()?.let { Playback("Search: ${attempt.text}", listOf(it), 0, radio = it) }
         }
+    }
+
+    /** "Play my liked songs / my downloads / <playlist name>". */
+    private fun ownCollection(context: Context, request: dev.alamo3.cabineq.music.VoiceRequest): Playback? {
+        val rank = dev.alamo3.cabineq.music.SearchRank
+        val asked = dev.alamo3.cabineq.music.VoiceRequest.clean(request.playlist ?: request.query)
+            .replace(Regex("(?i)^my\\s+"), "").replace(Regex("(?i)\\s+playlist$"), "").trim()
+        if (asked.isBlank()) return null
+        val words = dev.alamo3.cabineq.music.SongKey.simplify(asked)
+        if (words in setOf("liked songs", "likes", "liked", "favorites", "favourites", "liked music", "favorite songs")) {
+            val liked = Library.liked(context)
+            if (liked.isNotEmpty()) return Playback("Liked songs", liked.shuffled(), 0)
+        }
+        if (words in setOf("downloads", "downloaded music", "offline music", "downloaded songs")) {
+            val all = Downloads.collections(context).flatMap { it.tracks }.distinctBy { it.mediaId }
+                .filter { Downloads.fileFor(context, it) != null }
+            if (all.isNotEmpty()) return Playback("Downloads", all.shuffled(), 0)
+        }
+        // A playlist of the listener's own wins over a catalogue search for the same words —
+        // always when the assistant said "playlist", otherwise only on a full name match.
+        val wantsPlaylist = request.focus == dev.alamo3.cabineq.music.VoiceRequest.Focus.PLAYLIST ||
+            Regex("(?i)\\bplaylist\\b").containsMatchIn(request.query)
+        Library.playlists(context).filter { it.tracks.isNotEmpty() }
+            .firstOrNull { rank.sameName(it.name, asked) }
+            ?.let { return Playback(it.name, it.tracks, 0) }
+        if (wantsPlaylist) {
+            Downloads.collections(context).firstOrNull { rank.sameName(it.title, asked) }
+                ?.let { return Playback(it.title, it.tracks, 0) }
+        }
+        return null
+    }
+
+    /**
+     * "Play some music": the listener's own favourites, shuffled, with the radio carrying on
+     * after them. Falls back to what was played recently, then to whatever is downloaded, so it
+     * also works with no signal.
+     */
+    private fun somethingToPlay(context: Context): Playback? {
+        val liked = Library.liked(context)
+        if (liked.size >= 5) {
+            val mix = liked.shuffled().take(30)
+            return Playback("Your mix", mix, 0, radio = mix.last().takeIf { it.sourceId != null })
+        }
+        val recent = recentTracks(context)
+        if (recent.isNotEmpty()) {
+            val mix = (liked + recent).distinctBy { Taste.key(it) }.shuffled().take(30)
+            return Playback("Your mix", mix, 0, radio = mix.last().takeIf { it.sourceId != null })
+        }
+        val offline = Downloads.collections(context).flatMap { it.tracks }.distinctBy { it.mediaId }
+        return if (offline.isEmpty()) null else Playback("Downloads", offline.shuffled(), 0)
     }
 
     // ------------------------------------------------------------------ children

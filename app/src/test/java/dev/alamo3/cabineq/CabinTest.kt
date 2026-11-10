@@ -9,6 +9,7 @@ import dev.alamo3.cabineq.torbox.TorBoxClient
 import dev.alamo3.cabineq.torbox.TorBoxException
 import dev.alamo3.cabineq.torbox.TorBoxFile
 import org.junit.Assert.assertTrue
+import dev.alamo3.cabineq.music.VoiceRequest.Focus
 import org.junit.Test
 
 /**
@@ -291,5 +292,36 @@ class CabinTest {
     check("albums: ranked and filtered", sr.rankAlbums("after hours", alb + EclipseAddon.Album("b", "Starboy", "The Weeknd", null, null)).map { it.title } == listOf("After Hours"))
     check("artists: exact first", sr.rankArtists("weeknd", arts.reversed()).first().name == "The Weeknd")
 
+
+        // ---- Phonetic + voice requests
+        val ph = dev.alamo3.cabineq.music.Phonetic
+        check("sound: beyonsay = beyonce", ph.sameWord("beyonsay", "beyonce"), ph.key("beyonsay") + "/" + ph.key("beyonce"))
+        check("sound: word boundaries ignored", ph.sameName("day ft punk", "Daft Punk"), ph.key("day ft punk"))
+        check("sound: led zeppelin", ph.sameName("lead zeplin", "Led Zeppelin"))
+        check("sound: different names differ", !ph.sameName("daft punk", "pink floyd") && !ph.sameWord("drake", "adele"))
+        check("sound: short words not trusted", !ph.sameWord("bad", "bat"))
+        val knownNames = listOf("Beyoncé", "Daft Punk", "The Weeknd")
+        check("sound: corrects to a known artist", ph.correct("beyonsay", knownNames) == "Beyoncé", ph.correct("beyonsay", knownNames))
+        check("sound: leaves a known artist alone", ph.correct("daft punk", knownNames) == null)
+        check("sound: leaves unknown names alone", ph.correct("radiohead", knownNames) == null)
+        check("search: spoken artist ranks", sr.rankArtists("beyonsay", listOf(EclipseAddon.Artist("9", "Beyoncé", null, emptyList()))).size == 1)
+        check("search: spoken name leads as artist", sr.sameName("day ft punk", "Daft Punk"))
+
+        val VR = dev.alamo3.cabineq.music.VoiceRequest
+        check("voice: command words stripped", VR.clean("Play Get Lucky by Daft Punk on Cabin EQ") == "Get Lucky by Daft Punk", VR.clean("Play Get Lucky by Daft Punk on Cabin EQ"))
+        check("voice: 'the song called'", VR.clean("play the song called Halo") == "Halo")
+        check("voice: empty is open-ended", dev.alamo3.cabineq.music.VoiceRequest("").isOpenEnded && dev.alamo3.cabineq.music.VoiceRequest("play").isOpenEnded.not())
+        check("voice: focus types", VR.focusOf("vnd.android.cursor.item/artist") == Focus.ARTIST && VR.focusOf("vnd.android.cursor.item/audio") == Focus.SONG &&
+            VR.focusOf("vnd.android.cursor.item/*") == Focus.ANY && VR.focusOf(null) == Focus.ANY)
+        val v1 = dev.alamo3.cabineq.music.VoiceRequest("get lucky daft punk", Focus.SONG, artist = "Daft Punk", title = "Get Lucky").attempts()
+        check("voice: title + artist fields first", v1.first().text == "Get Lucky Daft Punk" && v1.first().expect == Focus.SONG && v1.size == 1, v1)
+        val v2 = dev.alamo3.cabineq.music.VoiceRequest("beyonsay", Focus.ARTIST, artist = "beyonsay").attempts(knownNames)
+        check("voice: misheard artist field corrected", v2.first().text == "Beyoncé" && v2.first().expect == Focus.ARTIST, v2)
+        val v3 = dev.alamo3.cabineq.music.VoiceRequest("play halo by beyonsay").attempts(knownNames)
+        check("voice: 'song by misheard artist'", v3.first().text == "halo by beyonsay" && v3.any { it.text == "halo Beyoncé" && it.expect == Focus.SONG }, v3)
+        val v4 = dev.alamo3.cabineq.music.VoiceRequest("day ft punk", alternatives = listOf("daft punk", "day ft punk")).attempts(knownNames)
+        check("voice: whole transcript corrected, alternatives deduped", v4.map { it.text } == listOf("day ft punk", "Daft Punk"), v4)
+        val v5 = dev.alamo3.cabineq.music.VoiceRequest("after hours", Focus.ALBUM, artist = "The Weeknd", album = "After Hours").attempts()
+        check("voice: album focus", v5.first().text == "After Hours The Weeknd" && v5.first().expect == Focus.ALBUM, v5)
     }
 }

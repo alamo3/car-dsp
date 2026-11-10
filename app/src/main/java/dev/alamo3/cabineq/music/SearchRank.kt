@@ -51,8 +51,11 @@ object SearchRank {
             n >= 4 -> 1
             else -> 0
         }
-        if (allowed == 0 || kotlin.math.abs(a.length - b.length) > allowed) return false
-        return editDistance(a, b, allowed) <= allowed
+        if (allowed > 0 && kotlin.math.abs(a.length - b.length) <= allowed &&
+            editDistance(a, b, allowed) <= allowed
+        ) return true
+        // Spoken queries: "beyonsay" is nowhere near "beyonce" in letters, but sounds the same.
+        return Phonetic.sameWord(a, b)
     }
 
     /** Damerau-Levenshtein (adjacent swaps count once: "teh"), cut off above [max]. */
@@ -95,8 +98,12 @@ object SearchRank {
     fun sameName(a: String, b: String): Boolean {
         val x = queryWords(a)
         val y = queryWords(b)
-        if (x.isEmpty() || y.isEmpty()) return false
-        return x.all { w -> y.any { same(w, it) } } && y.all { w -> x.any { same(w, it) } }
+        if (x.isNotEmpty() && y.isNotEmpty() &&
+            x.all { w -> y.any { same(w, it) } } && y.all { w -> x.any { same(w, it) } }
+        ) return true
+        // The recogniser splits words where it likes: "day ft punk" is "Daft Punk". Compared
+        // whole, small words included — they are part of the sound.
+        return Phonetic.sameName(a, b)
     }
 
     // ------------------------------------------------------------------ songs
