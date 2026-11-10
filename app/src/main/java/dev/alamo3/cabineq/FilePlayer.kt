@@ -69,6 +69,9 @@ class FilePlayer private constructor(private val context: Context) {
      */
     @Volatile var durationExact = false
         private set
+    /** Gain loudness matching is applying to this song, in dB; NaN when it is off. */
+    @Volatile var loudnessGainDb = Float.NaN
+        private set
     /** e.g. "FLAC 44.1 kHz / 16-bit · lossless" */
     @Volatile var formatInfo: String? = null
     // Same facts as [formatInfo], kept as numbers for the output-path diagnostics.
@@ -450,6 +453,15 @@ class FilePlayer private constructor(private val context: Context) {
         }
         return keys
     }
+
+    /** Queues [track] right after the one that is playing. */
+    fun playNext(track: Track) {
+        val key = enqueue(listOf(track)).firstOrNull() ?: return
+        moveUpcoming(key, currentIndex + 1)
+    }
+
+    /** True while the radio tops the queue up by itself. */
+    val radioActive: Boolean get() = radioSeed != null
 
     /** Removes an upcoming entry. Refuses to touch the current or already-played entries. */
     fun removeUpcoming(key: String): Boolean {
@@ -833,6 +845,11 @@ class FilePlayer private constructor(private val context: Context) {
         private var builtEpoch = -1
         private var stereo = FloatArray(0)
         private var lastSavedAt = 0L
+        /** Loudness matching for the song being decoded (null when switched off). */
+        private var leveler: dev.alamo3.cabineq.music.Leveler? = null
+        /** The last song's album and gain: consecutive songs of one album share a level. */
+        private var lastAlbum: String? = null
+        private var lastGainDb: Double? = null
 
         private val live: Boolean get() = gen == generation
 
@@ -1002,6 +1019,15 @@ class FilePlayer private constructor(private val context: Context) {
             // embedded in the file itself, which is exact per song even on compilations.
             if (item.artworkUrl == null) readFileInfo(cached?.path ?: url, cached != null, gen, currentIndex)
 
+            leveler = if (!settings.loudnessMatch) null else {
+                val album = item.album?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+                dev.alamo3.cabineq.music.Leveler(
+                    known = runCatching { LoudnessStore.get(context, item) }.getOrNull(),
+                    albumGainDb = lastGainDb.takeIf { album != null && album == lastAlbum },
+                    startGainDb = runCatching { LoudnessStore.typicalGainDb(context) }.getOrNull()
+                        ?: dev.alamo3.cabineq.music.Leveler.DEFAULT_START_DB,
+                )
+            }
             val extractor = MediaExtractor()
             var codec: MediaCodec? = null
             try {
@@ -1143,6 +1169,11 @@ class FilePlayer private constructor(private val context: Context) {
                         toStereoFloat(buf, encoding, channels, frames, stereo)
                         dec.releaseOutputBuffer(outIdx, false)
 
+                        // One gain per song, ahead of the EQ and limiter (see Leveler).
+                        leveler?.let {
+                            it.process(stereo, frames, streamRate)
+                            loudnessGainDb = it.gainDb.toFloat()
+                        }
                         out.process(stereo, frames)
                         if (out.track.playState != AudioTrack.PLAYSTATE_PLAYING) out.track.play()
                         val written = out.track.write(
@@ -1188,6 +1219,15 @@ class FilePlayer private constructor(private val context: Context) {
                     }
                 }
             } finally {
+                // Keep what was learned about this song's level, and pass its gain on in case
+                // the next one is from the same album.
+                leveler?.let { lv ->
+                    lv.measured()?.let { lufs -> runCatching { LoudnessStore.put(context, item, lufs) } }
+                    lastAlbum = item.album?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+                    lastGainDb = lv.gainDb
+                }
+                if (leveler == null) loudnessGainDb = Float.NaN
+                leveler = null
                 runCatching { codec?.stop() }
                 runCatching { codec?.release() }
                 runCatching { extractor.release() }

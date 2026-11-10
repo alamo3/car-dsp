@@ -323,5 +323,50 @@ class CabinTest {
         check("voice: whole transcript corrected, alternatives deduped", v4.map { it.text } == listOf("day ft punk", "Daft Punk"), v4)
         val v5 = dev.alamo3.cabineq.music.VoiceRequest("after hours", Focus.ALBUM, artist = "The Weeknd", album = "After Hours").attempts()
         check("voice: album focus", v5.first().text == "After Hours The Weeknd" && v5.first().expect == Focus.ALBUM, v5)
+
+        // ---- Loudness (BS.1770) and per-song levelling
+        fun sine(amp: Double, seconds: Double, rate: Int = 48000, hz: Double = 997.0): FloatArray {
+            val n = (seconds * rate).toInt()
+            return FloatArray(n * 2) { i -> (amp * kotlin.math.sin(2 * Math.PI * hz * (i / 2) / rate)).toFloat() }
+        }
+        fun lufsOf(buf: FloatArray, rate: Int = 48000): Double? =
+            dev.alamo3.cabineq.music.LoudnessMeter().also { it.add(buf, buf.size / 2, rate) }.integrated()
+        val l20 = lufsOf(sine(0.1, 5.0))
+        check("lufs: -20 dBFS stereo sine reads -20", l20 != null && kotlin.math.abs(l20 + 20.0) < 0.2, l20)
+        val l20at44 = lufsOf(sine(0.1, 5.0, 44100), 44100)
+        check("lufs: same at 44.1 kHz", l20at44 != null && kotlin.math.abs(l20at44 + 20.0) < 0.2, l20at44)
+        val l6 = lufsOf(sine(0.5, 5.0))
+        check("lufs: +14 dB louder reads +14", l6 != null && l20 != null && kotlin.math.abs((l6 - l20) - 13.98) < 0.1, l6)
+        check("lufs: silence has no loudness", lufsOf(FloatArray(48000 * 2)) == null)
+        // Quiet passages are gated out: a loud half and a silent half read as the loud half.
+        val gated = lufsOf(sine(0.1, 5.0) + FloatArray(48000 * 2 * 5))
+        check("lufs: silence is gated out", gated != null && kotlin.math.abs(gated + 20.0) < 0.3, gated)
+
+        fun peak(buf: FloatArray) = buf.maxOf { kotlin.math.abs(it) }
+        val LV = dev.alamo3.cabineq.music.Leveler
+        val knownLoud = dev.alamo3.cabineq.music.Leveler(known = -8.0, albumGainDb = null)
+        val a1 = sine(0.5, 1.0); knownLoud.process(a1, a1.size / 2, 48000)
+        check("level: known song gets its gain at once", kotlin.math.abs(knownLoud.gainDb + 6.0) < 0.01 && kotlin.math.abs(peak(a1) - 0.5 * 0.501) < 0.01, knownLoud.gainDb)
+        val quiet = dev.alamo3.cabineq.music.Leveler(known = -30.0, albumGainDb = null)
+        check("level: boost is capped", quiet.gainDb == LV.MAX_BOOST_DB)
+        val albumTrack = dev.alamo3.cabineq.music.Leveler(known = -8.0, albumGainDb = -2.5)
+        check("level: album track keeps the album's gain", albumTrack.gainDb == -2.5)
+        val fresh = dev.alamo3.cabineq.music.Leveler(known = null, albumGainDb = null, startGainDb = -5.0)
+        val first = sine(0.5, 1.0); fresh.process(first, first.size / 2, 48000)
+        check("level: unknown song starts from the guess", kotlin.math.abs(fresh.gainDb + 5.0) < 0.01, fresh.gainDb)
+        var maxStep = 0.0
+        var prevGain = fresh.gainDb
+        repeat(59) {
+            val b = sine(0.5, 1.0); fresh.process(b, b.size / 2, 48000)
+            maxStep = maxOf(maxStep, kotlin.math.abs(fresh.gainDb - prevGain)); prevGain = fresh.gainDb
+        }
+        // A 0.5-amplitude sine is about -6 LUFS: the song needs -8 dB to sit at -14.
+        check("level: settles on the song's own level", kotlin.math.abs(fresh.gainDb + 8.0) < 0.3, fresh.gainDb)
+        check("level: moves slowly", maxStep <= 0.51, maxStep)
+        val kept = fresh.measured()
+        check("level: measurement kept for next time", kept != null && kotlin.math.abs(kept + 6.0) < 0.3, kept)
+        val short = dev.alamo3.cabineq.music.Leveler(known = null, albumGainDb = null)
+        val s10 = sine(0.5, 10.0); short.process(s10, s10.size / 2, 48000)
+        check("level: a skipped song is not remembered", short.measured() == null)
     }
 }

@@ -161,6 +161,14 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_CACHE_ENABLED, true)
         set(v) = prefs.edit().putBoolean(KEY_CACHE_ENABLED, v).apply()
 
+    /**
+     * Loudness matching: one gain per song so songs play at the same level. On by default —
+     * radio mixes many masters, and the jumps between them are the first thing heard.
+     */
+    var loudnessMatch: Boolean
+        get() = prefs.getBoolean("loudness_match", true)
+        set(v) = prefs.edit().putBoolean("loudness_match", v).apply()
+
     /** Prefetch only on Wi-Fi/Ethernet. Off by default: the user decides. */
     var cacheWifiOnly: Boolean
         get() = prefs.getBoolean(KEY_CACHE_WIFI_ONLY, false)

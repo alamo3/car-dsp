@@ -111,6 +111,7 @@ class MusicActivity : Activity() {
                 shownDownloads = v
                 downloadRefresh?.invoke()
             }
+            queueRefresh?.invoke()
             val lv = Library.version
             if (lv != shownLibrary) {
                 shownLibrary = lv
@@ -133,6 +134,8 @@ class MusicActivity : Activity() {
     private lateinit var fullWhy: TextView
     /** Redraws a library page when the library changes underneath it. */
     private var libraryRefresh: (() -> Unit)? = null
+    /** Redraws the queue page when the queue or the playing song changes. */
+    private var queueRefresh: (() -> Unit)? = null
     private var shownLibrary = -1
 
     /** Redraws the download status on the page being shown, when there is one. */
@@ -214,6 +217,8 @@ class MusicActivity : Activity() {
                 stack.last().invoke()
                 scroll.scrollTo(0, 0)
             }
+            // Back from another tab's first page goes Home before it leaves the app.
+            tab != Tab.HOME -> switchTab(Tab.HOME)
             else -> @Suppress("DEPRECATION") super.onBackPressed()
         }
     }
@@ -290,6 +295,7 @@ class MusicActivity : Activity() {
         column.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         column.addView(buildMini())
+        column.addView(buildTabs())
         root.addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         root.addView(buildFull(), FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         root.padForSystemBars()
@@ -447,6 +453,10 @@ class MusicActivity : Activity() {
             fullRepeat.text = repeatLabel()
         }
         repeatRow.addView(fullRepeat)
+        repeatRow.addView(Ui.pill(this, "Queue", filled = false) {
+            showFull(false)
+            navigate { renderQueue() }
+        }, wrapLp().apply { leftMargin = dp(10) })
         repeatRow.addView(Ui.pill(this, "Lyrics", filled = false) {
             // Lyrics is a page of its own: the full player is an overlay on top of the stack.
             showFull(false)
@@ -490,6 +500,7 @@ class MusicActivity : Activity() {
         handler.removeCallbacks(lyricTicker)
         downloadRefresh = null
         libraryRefresh = null
+        queueRefresh = null
         lyricsBlock = null
         lyricViews = ArrayList()
     }
@@ -508,32 +519,6 @@ class MusicActivity : Activity() {
                 "Paste the Nebula link you installed in Eclipse (Settings → Connections). Search uses Apple Music's catalog; audio streams from your TorBox.",
                 "Connect",
             ) { navigate { renderSettings() } })
-        }
-
-        // The listener's own collection.
-        val likedCount = Library.liked(this).size
-        val playlistCount = Library.playlists(this).size
-        val albumCount = Library.albums(this).size
-        page.addView(sectionTitle("Library"))
-        page.addView(simpleRow("Liked songs", if (likedCount == 0) "Tap ♡ on a song to keep it here" else "$likedCount songs",
-            android.R.drawable.btn_star_big_on) { navigate { renderLiked() } })
-        page.addView(simpleRow("Playlists", if (playlistCount == 0) "Make your own, or import one" else "$playlistCount playlists",
-            android.R.drawable.ic_menu_sort_by_size) { navigate { renderPlaylists() } })
-        if (albumCount > 0) {
-            page.addView(simpleRow("Albums", "$albumCount saved", android.R.drawable.ic_menu_gallery) { navigate { renderSavedAlbums() } })
-        }
-
-        // On the phone already: first, because it is what works with no signal.
-        val downloads = Downloads.collections(this)
-        if (downloads.isNotEmpty()) {
-            page.addView(sectionTitle("Downloads"))
-            for (c in downloads.take(6)) {
-                val st = Downloads.status(this, c)
-                val sub = if (st.complete) "${st.total} songs · on this phone" else "${st.done} of ${st.total} downloaded"
-                page.addView(simpleRow(c.title, sub, android.R.drawable.stat_sys_download_done) {
-                    navigate { renderDownload(c.id) }
-                })
-            }
         }
 
         // Recently played is local, so the page is never blank while the network is thinking.
@@ -573,20 +558,206 @@ class MusicActivity : Activity() {
             }
         }
 
-        val recents = settings.recentSearches
-        if (recents.isNotEmpty()) {
-            page.addView(sectionTitle("Recent searches"))
-            for (q in recents) {
-                page.addView(simpleRow(q, null, android.R.drawable.ic_menu_recent_history) {
-                    searchInput.setText(q)
-                    searchInput.setSelection(q.length)
-                    handler.removeCallbacks(searchRunnable)
-                    runSearch(q, fromTyping = false)
-                })
-            }
-        }
         page.addView(Ui.text(this, "All playback runs through CabinEQ's DSP: your EQ, preamp, limiter and speed compensation.", 12f, Ui.TEXT_2, lines = 3)
             .apply { setPadding(0, dp(24), 0, 0) })
+    }
+
+    /** The Library tab: everything that is the listener's own. */
+    private fun renderLibrary() {
+        clearPage()
+        page.addView(Ui.text(this, "Library", 30f, bold = true).apply { setPadding(0, dp(8), 0, dp(8)) })
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        page.addView(box)
+        val draw = {
+            box.removeAllViews()
+            val likedCount = Library.liked(this).size
+            val playlists = Library.playlists(this)
+            val albumCount = Library.albums(this).size
+            box.addView(simpleRow("Liked songs", if (likedCount == 0) "Tap ♡ on a song to keep it here" else "$likedCount songs",
+                android.R.drawable.btn_star_big_on) { navigate { renderLiked() } })
+            box.addView(simpleRow("Playlists", if (playlists.isEmpty()) "Make your own, or import one" else "${playlists.size} playlists",
+                android.R.drawable.ic_menu_sort_by_size) { navigate { renderPlaylists() } })
+            box.addView(simpleRow("Albums", if (albumCount == 0) "Save an album from its page" else "$albumCount saved",
+                android.R.drawable.ic_menu_gallery) { navigate { renderSavedAlbums() } })
+            // Straight to the most recent playlists, without the extra tap.
+            for (p in playlists.take(4)) {
+                box.addView(simpleRow(p.name, "Playlist · ${p.tracks.size} songs", android.R.drawable.ic_menu_sort_by_size) {
+                    navigate { renderUserPlaylist(p.id) }
+                })
+            }
+            // On the phone: what works with no signal.
+            val downloads = Downloads.collections(this)
+            if (downloads.isNotEmpty()) {
+                box.addView(sectionTitle("Downloads"))
+                for (c in downloads) {
+                    val st = Downloads.status(this, c)
+                    val sub = if (st.complete) "${st.total} songs · on this phone" else "${st.done} of ${st.total} downloaded"
+                    box.addView(simpleRow(c.title, sub, android.R.drawable.stat_sys_download_done) {
+                        navigate { renderDownload(c.id) }
+                    })
+                }
+            }
+        }
+        draw()
+        libraryRefresh = { draw() }
+        downloadRefresh = { draw() }
+    }
+
+    /** The Search tab before anything is typed: what worked before, one tap away. */
+    private fun renderSearchHome() {
+        clearPage()
+        page.addView(Ui.text(this, "Search", 30f, bold = true).apply { setPadding(0, dp(8), 0, dp(8)) })
+        val recents = settings.recentSearches
+        if (recents.isEmpty()) {
+            page.addView(Ui.text(this, "Songs, albums and artists — typos are fine, and a line of the lyrics works too.",
+                14f, Ui.TEXT_2, lines = 3).apply { setPadding(0, dp(8), 0, 0) })
+            return
+        }
+        page.addView(sectionTitle("Recent searches"))
+        for (q in recents) {
+            page.addView(simpleRow(q, null, android.R.drawable.ic_menu_recent_history) {
+                searchInput.setText(q)
+                searchInput.setSelection(q.length)
+                handler.removeCallbacks(searchRunnable)
+                runSearch(q, fromTyping = false)
+            })
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Tabs
+
+    private enum class Tab { HOME, SEARCH, LIBRARY }
+    private var tab = Tab.HOME
+    private val tabViews = HashMap<Tab, TextView>()
+
+    private fun buildTabs(): View {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Ui.SURFACE)
+        }
+        for ((t, label) in listOf(Tab.HOME to "Home", Tab.SEARCH to "Search", Tab.LIBRARY to "Library")) {
+            val v = Ui.text(this, label, 14f, Ui.TEXT_2, bold = true).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, dp(14), 0, dp(14))
+                setOnClickListener { switchTab(t, focusSearch = t == Tab.SEARCH) }
+            }
+            Ui.selectable(v)
+            tabViews[t] = v
+            bar.addView(v, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        markTab()
+        return bar
+    }
+
+    private fun markTab() {
+        for ((t, v) in tabViews) v.setTextColor(if (t == tab) Ui.ACCENT else Ui.TEXT_2)
+    }
+
+    /** Each tab is a fresh stack: tapping a tab always lands on its first page. */
+    private fun switchTab(to: Tab, focusSearch: Boolean = false) {
+        tab = to
+        markTab()
+        stack.clear()
+        searchPageOnTop = false
+        if (to != Tab.SEARCH && searchInput.text.isNotEmpty()) {
+            handler.removeCallbacks(searchRunnable)
+            searchInput.text.clear()
+        }
+        when (to) {
+            Tab.HOME -> navigate { renderHome() }
+            Tab.SEARCH -> navigate { renderSearchHome() }
+            Tab.LIBRARY -> navigate { renderLibrary() }
+        }
+        if (focusSearch) {
+            searchInput.requestFocus()
+            getSystemService(android.view.inputmethod.InputMethodManager::class.java)
+                ?.showSoftInput(searchInput, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        } else hideKeyboard()
+    }
+
+    /** A list of queue entries with the controls a queue needs: jump, move, remove, clear. */
+    private fun renderQueue() {
+        clearPage()
+        page.addView(backRow())
+        page.addView(Ui.text(this, "Queue", 24f, bold = true).apply { setPadding(0, dp(4), 0, dp(8)) })
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        page.addView(box)
+        var drawn = -1
+        val draw = draw@{
+            val p = player
+            if (p.version == drawn) return@draw
+            drawn = p.version
+            box.removeAllViews()
+            val entries = p.queuedTracks()
+            val current = p.currentIndex
+            if (entries.isEmpty()) {
+                box.addView(Ui.text(this, "Nothing queued. Play something, or hold a song and choose “Add to queue”.",
+                    14f, Ui.TEXT_2, lines = 3))
+                return@draw
+            }
+            entries.getOrNull(current)?.let { now ->
+                box.addView(sectionTitle("Now playing"))
+                box.addView(simpleRow(now.track.title, now.track.artist, android.R.drawable.ic_media_play) { showFull(true) })
+            }
+            val upcoming = entries.withIndex().filter { it.index > current }
+            if (upcoming.isNotEmpty()) {
+                box.addView(sectionTitle("Up next", "Clear") {
+                    upcoming.forEach { p.removeUpcoming(it.value.key) }
+                })
+                upcoming.forEachIndexed { n, (index, entry) ->
+                    box.addView(queueRow(entry.track,
+                        onPlay = { transport { p.skipTo(index) } },
+                        onUp = if (n > 0) ({ p.moveUpcoming(entry.key, index - 1) }) else null,
+                        onDown = if (n < upcoming.lastIndex) ({ p.moveUpcoming(entry.key, index + 1) }) else null,
+                        onRemove = { p.removeUpcoming(entry.key) }))
+                }
+            } else if (p.radioActive) {
+                box.addView(Ui.text(this, "Radio is on: the next song is picked when this one is nearly done.",
+                    13f, Ui.TEXT_2, lines = 2).apply { setPadding(0, dp(12), 0, 0) })
+            }
+            val played = entries.take(current.coerceAtLeast(0))
+            if (played.isNotEmpty()) {
+                box.addView(sectionTitle("Played"))
+                played.asReversed().take(30).forEach { entry ->
+                    val index = entries.indexOf(entry)
+                    box.addView(simpleRow(entry.track.title, entry.track.artist, android.R.drawable.ic_menu_recent_history) {
+                        transport { p.skipTo(index) }
+                    })
+                }
+            }
+        }
+        draw()
+        queueRefresh = { draw() }
+    }
+
+    private fun queueRow(t: Track, onPlay: () -> Unit, onUp: (() -> Unit)?, onDown: (() -> Unit)?, onRemove: () -> Unit): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(6), dp(8), dp(6))
+            setOnClickListener { onPlay() }
+        }
+        Ui.selectable(texts)
+        texts.addView(Ui.text(this, t.title, 16f))
+        if (!t.artist.isNullOrBlank()) texts.addView(Ui.text(this, t.artist, 13f, Ui.TEXT_2))
+        row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        // Large, separate targets: moving a song is a tap, not a drag.
+        fun button(label: String, action: (() -> Unit)?) {
+            val b = Ui.text(this, label, 18f, if (action == null) Ui.SURFACE_2 else Ui.TEXT_2, bold = true).apply {
+                gravity = Gravity.CENTER
+                if (action != null) { setOnClickListener { action() }; Ui.selectable(this) }
+            }
+            row.addView(b, LinearLayout.LayoutParams(dp(44), dp(48)))
+        }
+        button("↑", onUp)
+        button("↓", onDown)
+        button("✕", onRemove)
+        return row
     }
 
     /** A shelf of square song tiles, like the car's home screen. */
@@ -932,6 +1103,7 @@ class MusicActivity : Activity() {
         fun item(label: String, action: () -> Unit) { labels += label; actions += action }
         item("Add to playlist…") { choosePlaylist(track) }
         if (!nowPlaying) {
+            item("Play next") { player.playNext(track); toast("Plays next") }
             item("Add to queue") { player.enqueue(listOf(track)); toast("Added to the queue") }
             item(if (liked) "Remove from Liked songs" else "Like") {
                 if (liked) Taste.unlike(this, track) else Taste.like(this, track)
@@ -1270,6 +1442,9 @@ class MusicActivity : Activity() {
             val info = StringBuilder()
             p.formatInfo?.let { info.append(it).append(" → CabinEQ DSP") }
             EngineState.playerRoute?.let { if (p.state == FilePlayer.State.PLAYING) info.append(" → ").append(it) }
+            p.loudnessGainDb.takeIf { !it.isNaN() && p.isActive }?.let {
+                info.append(String.format(Locale.US, "\nLoudness match %+.1f dB", it))
+            }
             if (p.state == FilePlayer.State.PLAYING && EngineState.running) {
                 info.append(String.format(Locale.US, "\nLevel in %.1f → out %.1f dBFS · limiter %.1f dB",
                     EngineState.playerInPeakDb, EngineState.playerOutPeakDb, EngineState.playerLimiterDb))
@@ -1755,6 +1930,7 @@ class MusicActivity : Activity() {
             return
         }
         val a = addon() ?: return
+        if (tab != Tab.SEARCH) { tab = Tab.SEARCH; markTab() }
         if (!fromTyping) settings.addRecentSearch(query)
         // Typing refines the search page in place instead of stacking a page per keystroke.
         if (searchPageOnTop) stack.removeLast()
@@ -2138,6 +2314,17 @@ class MusicActivity : Activity() {
                 renderSettings()
             }, wrapLp(top = 24))
         }
+
+        page.addView(sectionTitle("Playback"))
+        page.addView(Ui.pill(this, "Match loudness between songs: ${if (settings.loudnessMatch) "on" else "off"}", filled = false) {
+            settings.loudnessMatch = !settings.loudnessMatch
+            renderSettings()
+        }, wrapLp(top = 4))
+        page.addView(Ui.text(this,
+            "One volume setting per song, so a quiet track and a loud one play at the same level. " +
+                "It does not compress: the quiet and loud parts inside a song stay as they were made. " +
+                "A song is measured the first time it plays; albums keep their own balance. Applies from the next song.",
+            12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, 0) })
 
         // What the recommender has learned, in plain words, with a way to wipe it.
         page.addView(sectionTitle("Taste"))
