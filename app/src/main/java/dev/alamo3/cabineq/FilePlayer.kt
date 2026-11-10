@@ -1,6 +1,7 @@
 package dev.alamo3.cabineq
 
 import android.content.Context
+import dev.alamo3.cabineq.music.GrowingDownload
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
@@ -1132,13 +1133,20 @@ class FilePlayer private constructor(private val context: Context) {
             // Downloaded or prefetched: play the local file. Checked before resolving, so a
             // song on the phone starts at once and plays with no network at all.
             val cached = MediaCache.fileFor(context, item)
-            val url = if (cached != null) "" else {
+            val cancelled = { !live || jumpTo >= 0 }
+            // Not on the phone yet. One download serves both playing and keeping: the player
+            // reads the file while it arrives. If the next-song download is already under way,
+            // join it where it is instead of starting over on a second connection.
+            var growing: GrowingDownload? = if (cached != null || !settings.progressivePlayback) null else
+                MediaCache.activeFor(item)?.takeIf { it.awaitStart(JOIN_WAIT_MS, cancelled) }
+            var url = ""
+            if (cached == null && growing == null) {
                 val resolved = try {
                     TrackResolver.resolve(
                         context,
                         item,
                         onNote = { setNote(it) },
-                        isCancelled = { !live || jumpTo >= 0 },
+                        isCancelled = cancelled,
                         waitIfPending = !deferIfNotReady,
                     )
                 } catch (e: dev.alamo3.cabineq.addon.AddonNotReady) {
@@ -1146,13 +1154,32 @@ class FilePlayer private constructor(private val context: Context) {
                     return Outcome.NotReady(e.message ?: "still caching")
                 }
                 declaredQuality = resolved.quality
-                resolved.url
+                url = resolved.url
+                if (live && settings.progressivePlayback && (url.startsWith("http://") || url.startsWith("https://"))) {
+                    val opened = runCatching { MediaCache.open(context, item, url) }.getOrNull()
+                    if (opened != null) {
+                        if (opened.awaitStart(START_WAIT_MS, cancelled)) growing = opened
+                        else {
+                            // Could not start (too big for the cache, refused…): stream directly,
+                            // exactly as before.
+                            if (live && jumpTo < 0) Log.i(TAG, "\"${item.title}\": play-while-downloading unavailable (${opened.error ?: opened.state}); streaming directly")
+                            MediaCache.leave(opened)
+                        }
+                    }
+                }
             }
-            if (!live) return Outcome.Cancelled
+            if (!live) {
+                growing?.let { MediaCache.leave(it) }
+                return Outcome.Cancelled
+            }
             note = null
             // Files without source artwork (e.g. TorBox library tracks): read the cover and tags
             // embedded in the file itself, which is exact per song even on compilations.
-            if (item.artworkUrl == null) readFileInfo(cached?.path ?: url, cached != null, gen, currentIndex)
+            if (item.artworkUrl == null) {
+                val g = growing
+                if (g != null) readFileInfo("", false, gen, currentIndex, g)
+                else readFileInfo(cached?.path ?: url, cached != null, gen, currentIndex)
+            }
 
             leveler = if (!settings.loudnessMatch) null else {
                 val album = item.album?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
@@ -1163,12 +1190,28 @@ class FilePlayer private constructor(private val context: Context) {
                         ?: dev.alamo3.cabineq.music.Leveler.DEFAULT_START_DB,
                 )
             }
-            val extractor = MediaExtractor()
+            var extractor = MediaExtractor()
             var codec: MediaCodec? = null
             try {
+                val g = growing
                 if (cached != null) {
                     Log.i(TAG, "playing cached \"${item.title}\" (${cached.length() / 1024} kB)")
                     extractor.setDataSource(cached.path)
+                } else if (g != null) {
+                    Log.i(TAG, "playing \"${item.title}\" while it downloads (${g.written / 1024} of ${g.total / 1024} kB so far)")
+                    try {
+                        extractor.setDataSource(GrowingSource(g, buffering = true))
+                    } catch (e: Exception) {
+                        if (!live || jumpTo >= 0) throw e
+                        // The platform could not read it this way: fall back to the direct stream.
+                        val direct = url.ifBlank { g.currentUrl }
+                        Log.w(TAG, "\"${item.title}\": could not open the growing file (${e.javaClass.simpleName}: ${e.message}); streaming directly")
+                        runCatching { extractor.release() }
+                        MediaCache.leave(g)
+                        growing = null
+                        extractor = MediaExtractor()
+                        extractor.setDataSource(direct, emptyMap<String, String>())
+                    }
                 } else {
                     extractor.setDataSource(url, emptyMap<String, String>())
                 }
@@ -1366,6 +1409,7 @@ class FilePlayer private constructor(private val context: Context) {
                 runCatching { codec?.stop() }
                 runCatching { codec?.release() }
                 runCatching { extractor.release() }
+                growing?.let { MediaCache.leave(it) }
             }
         }
     }
@@ -1385,7 +1429,7 @@ class FilePlayer private constructor(private val context: Context) {
         return codec
     }
 
-    private fun readFileInfo(source: String, isFile: Boolean, gen: Int, index: Int) {
+    private fun readFileInfo(source: String, isFile: Boolean, gen: Int, index: Int, growing: GrowingDownload? = null) {
         val key = "$gen:$index"
         if (infoBusy.size > 32) infoBusy.clear()   // abandoned generations never clean themselves
         if (!infoBusy.add(key)) return
@@ -1396,7 +1440,8 @@ class FilePlayer private constructor(private val context: Context) {
             }
             val r = MediaMetadataRetriever()
             val info = try {
-                if (isFile) r.setDataSource(source) else r.setDataSource(source, HashMap<String, String>())
+                if (growing != null) r.setDataSource(GrowingSource(growing, buffering = false, forGen = gen))
+                else if (isFile) r.setDataSource(source) else r.setDataSource(source, HashMap<String, String>())
                 FileInfo(
                     art = r.embeddedPicture?.let { decodeCover(it, 1000) },
                     title = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)?.trim()?.ifBlank { null },
@@ -1415,6 +1460,44 @@ class FilePlayer private constructor(private val context: Context) {
                 version++
             }
         }
+    }
+
+    /**
+     * Hands a [GrowingDownload] to the platform's extractor. A read that has to wait for bytes
+     * still on their way gives up as soon as the track is skipped or the player retired, which is
+     * what the platform's own network reader could never do.
+     */
+    private inner class GrowingSource(
+        private val download: GrowingDownload,
+        /** True for the audio itself: waiting shows "Buffering…" and holds off the stall watchdog. */
+        private val buffering: Boolean,
+        private val forGen: Int = generation,
+    ) : android.media.MediaDataSource() {
+        override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+            var waitingSince = 0L
+            var noted = false
+            try {
+                return download.readAt(position, buffer, offset, size) {
+                    val now = SystemClock.elapsedRealtime()
+                    if (buffering) {
+                        if (waitingSince == 0L) waitingSince = now
+                        // Waiting on the network is not a dead output: keep the watchdog quiet.
+                        lastProgressAt = now
+                        if (!noted && now - waitingSince > BUFFERING_NOTE_MS && state == State.PLAYING) {
+                            noted = true
+                            setNote("Buffering…")
+                        }
+                    }
+                    forGen != generation || (buffering && jumpTo >= 0)
+                }
+            } finally {
+                if (noted && note == "Buffering…") setNote(null)
+            }
+        }
+
+        override fun getSize(): Long = download.total
+
+        override fun close() = Unit   // the player releases the download itself
     }
 
     private fun decodeCover(bytes: ByteArray, maxPx: Int): Bitmap? {
@@ -1549,6 +1632,11 @@ class FilePlayer private constructor(private val context: Context) {
         private const val STALL_MS = 4_000L
         /** How long a skip may wait for the busy worker before a fresh one takes over. */
         private const val SKIP_PICKUP_MS = 600L
+        /** How long to wait for a new download's first reply before streaming directly instead. */
+        private const val START_WAIT_MS = 20_000L
+        /** How long to wait for an already-running download to show it has started. */
+        private const val JOIN_WAIT_MS = 3_000L
+        private const val BUFFERING_NOTE_MS = 800L
         /** How long to wait for set-aside songs once nothing else is left to play. */
         private const val DEFERRED_WAIT_MS = 5 * 60_000L
         /** A song set aside this long ago is dropped from the list of ones to come back to. */

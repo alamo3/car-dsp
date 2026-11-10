@@ -2330,6 +2330,14 @@ class MusicActivity : Activity() {
         }
 
         page.addView(sectionTitle("Playback"))
+        page.addView(Ui.pill(this, "Play while downloading: ${if (settings.progressivePlayback) "on" else "off"}", filled = false) {
+            settings.progressivePlayback = !settings.progressivePlayback
+            renderSettings()
+        }, wrapLp(top = 4))
+        page.addView(Ui.text(this,
+            "The song plays from its own download as it arrives: it carries on after a signal drop and is kept for next time. " +
+                "Needs the song cache switched on. Turn this off to go back to plain streaming if a song won't start. Applies from the next song.",
+            12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, dp(12)) })
         page.addView(Ui.pill(this, "Match loudness between songs: ${if (settings.loudnessMatch) "on" else "off"}", filled = false) {
             settings.loudnessMatch = !settings.loudnessMatch
             renderSettings()

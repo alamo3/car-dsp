@@ -169,6 +169,15 @@ class Settings(context: Context) {
         get() = prefs.getBoolean("loudness_match", true)
         set(v) = prefs.edit().putBoolean("loudness_match", v).apply()
 
+    /**
+     * Play the current song from its download as it arrives (resumes after signal drops, keeps
+     * the song for next time) instead of the platform's own stream reader. A switch so the old
+     * path is one tap away if a file or a phone misbehaves with it.
+     */
+    var progressivePlayback: Boolean
+        get() = prefs.getBoolean("progressive_playback", true)
+        set(v) = prefs.edit().putBoolean("progressive_playback", v).apply()
+
     /** Prefetch only on Wi-Fi/Ethernet. Off by default: the user decides. */
     var cacheWifiOnly: Boolean
         get() = prefs.getBoolean(KEY_CACHE_WIFI_ONLY, false)

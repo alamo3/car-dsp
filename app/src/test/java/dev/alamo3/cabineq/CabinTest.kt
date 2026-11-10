@@ -384,6 +384,75 @@ class CabinTest {
         check("match: AC/DC vs ACDC", am.best("Thunderstruck", "AC/DC", null, listOf(at("Thunderstruck", "ACDC"))) != null)
         check("match: misspelt artist tolerated", am.best("Halo", "Beyonce", null, listOf(at("Halo", "Beyoncee"))) != null)
 
+        // ---- Play-while-downloading: one download, read while it grows
+        run {
+            val GD = dev.alamo3.cabineq.music.GrowingDownload::class
+            val dir = java.io.File(System.getProperty("java.io.tmpdir"), "cabin-gd-" + System.nanoTime()).apply { mkdirs() }
+            val base = "http://127.0.0.1:${server.port}/file/"
+            val size = MockServer.FILE_SIZE
+            fun start(name: String, max: Long = 10L * 1024 * 1024, refresh: (() -> String?)? = null, stall: Long = 5_000L) =
+                dev.alamo3.cabineq.music.GrowingDownload(
+                    base + name, java.io.File(dir, "$name.part"), java.io.File(dir, "$name.audio"), max, name,
+                    refreshUrl = refresh, maxStallMs = stall, readTimeoutMs = 3_000, farAheadBytes = 64L * 1024,
+                ).also { d -> Thread({ d.run() }, "gd-$name").apply { isDaemon = true }.start() }
+            fun rightBytes(d: dev.alamo3.cabineq.music.GrowingDownload, at: Int, n: Int): Boolean {
+                val buf = ByteArray(n)
+                var got = 0
+                while (got < n) {
+                    val r = d.readAt((at + got).toLong(), buf, got, n - got)
+                    if (r < 0) break
+                    got += r
+                }
+                return got == n && (0 until n).all { buf[it] == MockServer.fileByte(at + it) }
+            }
+            fun waitDone(d: dev.alamo3.cabineq.music.GrowingDownload, ms: Long = 20_000L) {
+                val until = System.currentTimeMillis() + ms
+                while (d.isAlive && System.currentTimeMillis() < until) Thread.sleep(20)
+            }
+
+            val plain = start("plain")
+            check("growing: starts and reports the size", plain.awaitStart(5_000) && plain.total == size.toLong(), "${plain.state} ${plain.total}")
+            check("growing: bytes read while downloading are the file's", rightBytes(plain, 0, 4096) && rightBytes(plain, 150_000, 5000))
+            waitDone(plain)
+            check("growing: completes into the cache file", plain.isFinished && java.io.File(dir, "plain.audio").length() == size.toLong() && !java.io.File(dir, "plain.part").exists(), plain.state)
+            check("growing: readable after completion, with the end reported", rightBytes(plain, size - 100, 100) && plain.readAt(size.toLong(), ByteArray(10), 0, 10) == -1)
+
+            val drop = start("drop")
+            check("growing: a dropped connection resumes where it stopped", rightBytes(drop, 100 * 1024 - 50, 5000))
+            waitDone(drop)
+            check("growing: resumed download is complete and correct", drop.isFinished && drop.written == size.toLong() && rightBytes(drop, size - 4096, 4096) && (server.fileHits["drop"] ?: 0) >= 2, "${drop.state} ${drop.written} hits=${server.fileHits["drop"]}")
+
+            val slow = start("slow")
+            slow.awaitStart(5_000)
+            val t0 = System.currentTimeMillis()
+            val tail = rightBytes(slow, size - 2000, 2000)
+            check("growing: a read near the end is served without waiting for the rest", tail && slow.written < size - 2000 && System.currentTimeMillis() - t0 < 3_000, "written=${slow.written} in ${System.currentTimeMillis() - t0}ms")
+            val blocked = runCatching { slow.readAt(slow.written + 1000, ByteArray(10), 0, 10) { true } }.exceptionOrNull()
+            check("growing: a waiting read can be cancelled", blocked is java.io.IOException, blocked)
+            slow.cancel()
+            check("growing: a cancelled download is not joinable", !slow.isAlive)
+            run { val until = System.currentTimeMillis() + 3_000; while (slow.state != dev.alamo3.cabineq.music.GrowingDownload.State.CANCELLED && System.currentTimeMillis() < until) Thread.sleep(20) }
+            check("growing: cancel stops it and removes the partial file", slow.state == dev.alamo3.cabineq.music.GrowingDownload.State.CANCELLED && !java.io.File(dir, "slow.part").exists(), slow.state)
+
+            val norange = start("norange")
+            waitDone(norange)
+            check("growing: a server without ranges still downloads", norange.isFinished && rightBytes(norange, 200_000, 3000))
+
+            var refreshed = 0
+            val expired = start("expired", refresh = { refreshed++; base + "expired" })
+            waitDone(expired)
+            check("growing: an expired link is replaced with a fresh one", expired.isFinished && refreshed == 1 && rightBytes(expired, 0, 1000), "${expired.state} refreshed=$refreshed")
+
+            val gone = start("gone")
+            check("growing: a refused download reports failure at the start", !gone.awaitStart(5_000) && gone.state == dev.alamo3.cabineq.music.GrowingDownload.State.FAILED, gone.state)
+            check("growing: reading a failed download throws", runCatching { gone.readAt(0, ByteArray(10), 0, 10) }.exceptionOrNull() is java.io.IOException)
+
+            val big = start("plain2", max = 100L * 1024)
+            waitDone(big)
+            check("growing: a file over the cache limit is refused", big.state == dev.alamo3.cabineq.music.GrowingDownload.State.FAILED && !java.io.File(dir, "plain2.audio").exists(), big.state)
+            dir.deleteRecursively()
+        }
+
         // ---- Playlist import: a YouTube library export (channels, liked videos, one real playlist)
         val csv = """Track name,Artist name,Album,Playlist name,Type,ISRC
 "Katy Perry - Roar","","","Liked videos","Favorite",""

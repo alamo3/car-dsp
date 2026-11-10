@@ -91,6 +91,46 @@ class MockServer : AutoCloseable {
         }
     }
 
+    /** How many requests each /file/ name has had (the tests check resumes and side requests). */
+    val fileHits = ConcurrentHashMap<String, Int>()
+
+    /**
+     * A 300 kB "song" whose byte at offset i is (i * 31 + 7) mod 251, so any range can be checked.
+     * The name picks the behaviour: "drop" cuts the first connection short, "norange" ignores
+     * Range, "slow" trickles, "expired" refuses the first request, "gone" refuses them all.
+     */
+    private fun file(ex: Exchange, name: String) {
+        val hit = fileHits.merge(name, 1) { a, b -> a + b } ?: 1
+        if (name == "gone" || (name == "expired" && hit == 1)) return reply(ex, 403, """{"error":"expired"}""")
+        val size = FILE_SIZE
+        val range = ex.headers["range"]?.removePrefix("bytes=")?.substringBefore('-')?.toIntOrNull()
+        val from = if (name == "norange") 0 else (range ?: 0)
+        val partial = range != null && name != "norange"
+        val head = StringBuilder(if (partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
+            .append("Content-Type: audio/flac\r\n")
+            .append("Content-Length: ${size - from}\r\n")
+            .append("Connection: close\r\n")
+        if (name != "norange") head.append("Accept-Ranges: bytes\r\n")
+        if (partial) head.append("Content-Range: bytes $from-${size - 1}/$size\r\n")
+        head.append("\r\n")
+        val out = ex.socket.getOutputStream()
+        out.write(head.toString().toByteArray(Charsets.ISO_8859_1))
+        // "drop": the first connection dies after 100 kB although it promised everything.
+        val until = if (name == "drop" && hit == 1) 100 * 1024 else size
+        var i = from
+        val chunk = ByteArray(8 * 1024)
+        while (i < until) {
+            val n = minOf(chunk.size, until - i)
+            for (k in 0 until n) chunk[k] = fileByte(i + k)
+            out.write(chunk, 0, n)
+            out.flush()
+            i += n
+            // "slow": the main download trickles; ranged side requests are served at full speed.
+            if (name == "slow" && !partial) Thread.sleep(120)
+        }
+        out.flush()
+    }
+
     private fun query(ex: Exchange): Map<String, String> =
         ex.rawQuery.split('&').filter { it.isNotEmpty() }.associate {
             val k = it.substringBefore('=')
@@ -103,6 +143,7 @@ class MockServer : AutoCloseable {
         val q = query(ex)
         val body = ex.body
         if (path.startsWith("/addon/")) return addon(ex, path.removePrefix("/addon/"), q)
+        if (path.startsWith("/file/")) return file(ex, path.removePrefix("/file/"))
         if (ex.headers["authorization"] != "Bearer good-key") {
             return reply(ex, 403, """{"success":false,"error":"BAD_TOKEN","detail":"Invalid token.","data":null}""")
         }
@@ -162,7 +203,10 @@ class MockServer : AutoCloseable {
         }
     }
 
-    private companion object {
+    companion object {
+        const val FILE_SIZE = 300 * 1024
+        fun fileByte(i: Int): Byte = ((i * 31 + 7) % 251).toByte()
+
         const val TORRENT = """{"id":42,"hash":"abcdef0123","name":"Some Album [FLAC]","size":98000000,"download_state":"cached","progress":1,"download_speed":0,"eta":0,"seeds":10,"download_finished":true,"download_present":true,"files":[
 {"id":0,"name":"Album/CD2/01 - Opening.flac","short_name":"01 - Opening.flac","size":30000000,"mimetype":"audio/flac"},
 {"id":1,"name":"Album/CD1/10 - Ten.flac","short_name":"10 - Ten.flac","size":30000000,"mimetype":"audio/flac"},
