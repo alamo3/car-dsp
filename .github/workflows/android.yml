@@ -15,6 +15,7 @@ jobs:
       VERSION_CODE: ${{ github.run_number }}
       VERSION_NAME: 0.1.${{ github.run_number }}
       HAS_SIGNING: ${{ secrets.SIGNING_KEYSTORE_B64 != '' && secrets.SIGNING_PASSWORD != '' }}
+      HAS_PLAY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -91,6 +92,19 @@ jobs:
 
       - name: Lint
         run: ./gradlew --no-daemon lintDebug
+
+      # Pushes to main also go to Google Play's internal testing track, so the phone and the car
+      # get the same build through the store. Needs the PLAY_SERVICE_ACCOUNT_JSON secret; without
+      # it this step is skipped and the GitHub release still works as before.
+      - name: Upload to Google Play (internal testing)
+        if: env.HAS_SIGNING == 'true' && env.HAS_PLAY == 'true' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: dev.alamo3.cabineq
+          releaseFiles: out/cabineq-v${{ env.VERSION_NAME }}.aab
+          track: internal
+          status: completed
 
       - name: Clean up signing key
         if: always()

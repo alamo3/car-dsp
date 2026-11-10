@@ -77,7 +77,7 @@ class MainActivity : Activity() {
         settings = Settings(this)
         setContentView(buildUi())
         handleInstallStatus(intent)
-        checkForUpdate(userInitiated = false)
+        if (!Updater.installedFromPlay(this)) checkForUpdate(userInitiated = false)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -426,7 +426,12 @@ class MainActivity : Activity() {
             text = "Check for updates"
             setOnClickListener { onUpdateButton() }
         }
-        root.addView(updateButton)
+        if (Updater.installedFromPlay(this)) {
+            // Google Play delivers updates for this copy; the GitHub updater stays out of it.
+            updateText.text = "Version ${Updater.installedVersionName(this)} — updates come from Google Play"
+        } else {
+            root.addView(updateButton)
+        }
 
         return ScrollView(this).apply {
             addView(root)
