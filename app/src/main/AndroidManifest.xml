@@ -29,6 +29,7 @@
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:enableOnBackInvokedCallback="false"
         android:theme="@style/Theme.CabinEQ">
 
         <!-- Tells the car (Android Auto / Automotive) that we are a media source. -->

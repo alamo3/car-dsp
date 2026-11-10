@@ -59,7 +59,7 @@ logger.lifecycle(
 
 android {
     namespace = "dev.alamo3.cabineq"
-    compileSdk = 35
+    compileSdk = 36
 
     buildFeatures {
         buildConfig = true   // BuildConfig.APPLICATION_ID: the art provider authority follows it
@@ -68,7 +68,7 @@ android {
     defaultConfig {
         applicationId = "dev.alamo3.cabineq" + cabinAppIdSuffix
         minSdk = 29
-        targetSdk = 35
+        targetSdk = 36
         versionCode = cabinVersionCode
         versionName = cabinVersionName
 
