@@ -109,6 +109,15 @@ class MusicActivity : Activity() {
         }
     }
 
+    /** While the lyrics page is open the highlight is checked 10x a second, not with the 2 Hz UI tick. */
+    private val lyricTicker = object : Runnable {
+        override fun run() {
+            if (!lyricsOpen) return
+            updateLyricsHighlight()
+            handler.postDelayed(this, 100)
+        }
+    }
+
     private val searchRunnable = Runnable { runSearch(searchInput.text.toString().trim(), fromTyping = true) }
 
     // ---------------------------------------------------------------------------------
@@ -447,6 +456,7 @@ class MusicActivity : Activity() {
     private fun clearPage() {
         page.removeAllViews()
         lyricsOpen = false
+        handler.removeCallbacks(lyricTicker)
         lyricsBlock = null
         lyricViews = ArrayList()
     }
@@ -933,6 +943,8 @@ class MusicActivity : Activity() {
     private fun renderLyrics() {
         clearPage()
         lyricsOpen = true
+        handler.removeCallbacks(lyricTicker)
+        handler.post(lyricTicker)
         page.addView(backRow())
         page.addView(Ui.text(this, "Lyrics", 24f, bold = true).apply { setPadding(0, dp(4), 0, dp(4)) })
         val p = player
@@ -997,7 +1009,7 @@ class MusicActivity : Activity() {
     private fun updateLyricsHighlight(force: Boolean = false) {
         val sheet = lyricSheet ?: return
         if (!sheet.synced || lyricViews.isEmpty()) return
-        val idx = sheet.indexAt(player.audiblePositionMs)
+        val idx = sheet.indexAt(player.audiblePositionMs + Lyrics.LEAD_MS)
         if (idx != lyricIndex || force) {
             lyricIndex = idx
             lyricViews.forEachIndexed { i, v ->

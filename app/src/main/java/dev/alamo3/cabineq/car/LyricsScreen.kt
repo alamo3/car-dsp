@@ -40,6 +40,8 @@ class LyricsScreen(carContext: CarContext) : Screen(carContext) {
     private companion object {
         /** Rows per template: enough to read ahead, few enough to fit a compact host. */
         const val WINDOW = 8
+        /** Half the 1 s refresh: see [currentIndex]. */
+        const val CAR_REFRESH_LEAD_MS = 500L
     }
 
     /** Only the top screen should poke the host; a buried one would just be throttled. */
@@ -129,7 +131,9 @@ class LyricsScreen(carContext: CarContext) : Screen(carContext) {
     private fun currentIndex(): Int {
         val s = sheet ?: return -1
         val p = FilePlayer.peek() ?: return -1
-        return s.indexAt(p.audiblePositionMs)
+        // The host redraws about once a second, so a line can show up to a second after its time:
+        // look half of that ahead, so on average it is on time.
+        return s.indexAt(p.audiblePositionMs + Lyrics.LEAD_MS + CAR_REFRESH_LEAD_MS)
     }
 
     /** One lookup per screen; the cache in [Lyrics] makes a repeat open instant. */

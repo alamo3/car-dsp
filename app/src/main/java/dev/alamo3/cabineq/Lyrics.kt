@@ -35,6 +35,12 @@ object Lyrics {
     private const val UA = "CabinEQ/0.1 (personal music player)"
     private const val HIT_TTL_MS = 30L * 24 * 3_600_000
     private const val MISS_TTL_MS = 7L * 24 * 3_600_000
+    /**
+     * A line is highlighted this much before its timestamp. Timestamps mark the start of the
+     * sung line, and by the time a line is read and the eye moves, the singer is already on it:
+     * lyrics that change exactly on time feel late.
+     */
+    const val LEAD_MS = 250L
     private const val EXACT_DURATION_WAIT_MS = 10_000L
     /**
      * Timed lyrics belong to one edit of a song. LRCLIB itself accepts ±2 s; a few more seconds
