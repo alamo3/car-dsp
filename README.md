@@ -337,6 +337,26 @@ Three things had to be discovered to make it work, all recorded in the script:
 Verified in the emulator: install, launch in the car's window, the Nebula addon search returning
 real results with artwork, and screenshots via `screencap`.
 
+### The Media3 engine and the DSP
+
+Media3's `DefaultAudioSink` runs custom audio processors **only on its integer path**:
+
+```java
+if (shouldUseFloatOutput(inputFormat.pcmEncoding)) {
+    pipelineProcessors.add(toFloatPcmAudioProcessor);          // chain skipped entirely
+} else {
+    pipelineProcessors.add(toInt16PcmAudioProcessor);
+    pipelineProcessors.add(audioProcessorChain.getAudioProcessors());   // ours
+}
+```
+
+So `setEnableFloatOutput(true)` silently removes the whole equaliser — audio plays, at the source
+rate, untouched. The engine therefore keeps float output off and hands the DSP's result back as
+16-bit (`DspAudioProcessor.onConfigure` returns `ENCODING_PCM_16BIT` at the device rate). The
+native engine still works in float internally and resamples to the rate the device mixes at, so
+the mixer still has nothing to convert — only the hand-over to Media3 is 16-bit, which is a
+precision trade the Media3 design forces (the built-in engine keeps float end to end).
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are

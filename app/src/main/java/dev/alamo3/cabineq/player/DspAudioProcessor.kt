@@ -44,6 +44,7 @@ internal class DspAudioProcessor(private val bridge: FilePlayer.Bridge) : BaseAu
     private val audioManager = bridge.context.getSystemService(AudioManager::class.java)
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+        Log.i(TAG, "configure: in=$inputAudioFormat")
         val encoding = inputAudioFormat.encoding
         val known = encoding == C.ENCODING_PCM_16BIT || encoding == C.ENCODING_PCM_FLOAT ||
             encoding == C.ENCODING_PCM_24BIT || encoding == C.ENCODING_PCM_32BIT ||
@@ -54,7 +55,10 @@ internal class DspAudioProcessor(private val bridge: FilePlayer.Bridge) : BaseAu
         // Emit at the rate the device mixes at (when that setting is on), as the other player
         // does, so the Android mixer has nothing left to resample.
         val rate = bridge.targetRate(inputAudioFormat.sampleRate)
-        return AudioProcessor.AudioFormat(rate, 2, C.ENCODING_PCM_FLOAT)
+        // 16-bit on purpose: Media3 runs custom processors only on the integer path (with float
+        // output it inserts its own converter and skips the chain). The native engine still works
+        // in float internally; only this hand-over back to Media3 is 16-bit.
+        return AudioProcessor.AudioFormat(rate, 2, C.ENCODING_PCM_16BIT)
     }
 
     /** A new stream, a seek, or a new format: make sure the engine matches, and start from silence. */
@@ -89,7 +93,13 @@ internal class DspAudioProcessor(private val bridge: FilePlayer.Bridge) : BaseAu
         outputRate = outRate
     }
 
+    private var queueLogged = false
+
     override fun queueInput(inputBuffer: ByteBuffer) {
+        if (!queueLogged && inputBuffer.remaining() > 0) {
+            queueLogged = true
+            Log.i(TAG, "first audio: ${inputBuffer.remaining()} bytes, in=$inputAudioFormat out=$outputAudioFormat")
+        }
         val format = inputAudioFormat
         val frameBytes = Pcm.bytesPerSample(format.encoding) * format.channelCount
         // Media3 is documented to hand over whole frames, but a stray partial frame at the end of
@@ -149,11 +159,22 @@ internal class DspAudioProcessor(private val bridge: FilePlayer.Bridge) : BaseAu
         emit(produced)
     }
 
+    private var outShorts = ShortArray(0)
+
     private fun emit(frames: Int) {
         if (frames <= 0) return
-        val bytes = frames * 2 * 4
+        val samples = frames * 2
+        if (outShorts.size < samples) outShorts = ShortArray(samples)
+        for (i in 0 until samples) {
+            // Clamp before scaling: the limiter already bounds the signal, this is the safety net
+            // for rounding at exactly 1.0.
+            val v = outFloat[i]
+            val clamped = if (v > 1f) 1f else if (v < -1f) -1f else v
+            outShorts[i] = (clamped * 32767f).toInt().toShort()
+        }
+        val bytes = samples * 2
         val out = replaceOutputBuffer(bytes)
-        out.asFloatBuffer().put(outFloat, 0, frames * 2)
+        out.asShortBuffer().put(outShorts, 0, samples)
         out.limit(bytes)
     }
 
