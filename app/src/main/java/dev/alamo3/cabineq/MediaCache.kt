@@ -178,8 +178,11 @@ object MediaCache {
     private fun onUnmeteredNetwork(context: Context): Boolean {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return true
         val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
-        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+        // "Wi-Fi only" means "not paying per megabyte": a car hotspot or a phone tethered to
+        // another phone is Wi-Fi but metered, and the system knows which is which.
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) ||
+            (android.os.Build.VERSION.SDK_INT >= 30 &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_TEMPORARILY_NOT_METERED))
     }
 
     private fun sha1(s: String): String =
