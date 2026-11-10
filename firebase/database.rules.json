@@ -2,6 +2,7 @@
   "rules": {
     "jam": {
       "$sid": {
+        ".validate": "$sid.length <= 64",
         "info": {
           ".read": true,
           ".write": "!data.exists() || !newData.exists()",
@@ -10,26 +11,38 @@
         "state": {
           ".read": true,
           ".write": true,
-          ".validate": "newData.hasChildren(['playing', 'updatedAt'])"
+          ".validate": "!newData.exists() || newData.hasChildren(['playing', 'updatedAt'])"
         },
         "ops": {
           ".read": true,
           "$op": {
             ".write": "!data.exists() || !newData.exists()",
-            ".validate": "!newData.exists() || (newData.hasChildren(['op', 'guest', 'at']) && newData.child('op').isString() && newData.child('op').val().matches(/^(add|move|remove|vote|skip|search)$/) && newData.child('guest').isString() && newData.child('guest').val().length <= 64 && newData.child('at').isNumber())"
+            ".validate": "!newData.exists() || (newData.hasChildren(['op', 'guest', 'at']) && newData.child('op').isString() && newData.child('op').val().matches(/^(add|move|remove|vote|skip|search)$/) && newData.child('guest').isString() && newData.child('guest').val().length <= 64 && newData.child('at').isNumber())",
+            "op": { ".validate": true },
+            "guest": { ".validate": true },
+            "at": { ".validate": true },
+            "name": { ".validate": "newData.isString() && newData.val().length <= 40" },
+            "q": { ".validate": "newData.isString() && newData.val().length <= 200" },
+            "reqId": { ".validate": "(newData.isString() && newData.val().length <= 40) || newData.isNumber()" },
+            "key": { ".validate": "newData.isString() && newData.val().length <= 64" },
+            "to": { ".validate": "newData.isNumber()" },
+            "track": {
+              "$f": { ".validate": "$f.length <= 16 && ((newData.isString() && newData.val().length <= 1000) || newData.isNumber() || newData.isBoolean())" }
+            },
+            "$other": { ".validate": false }
           }
         },
         "results": {
           ".read": true,
           "$req": {
-            ".write": true
+            ".write": "!data.exists() || !newData.exists()",
+            ".validate": "!newData.exists() || ($req.length <= 40 && newData.hasChildren(['at', 'items']))"
           }
         },
         "guests": {
           ".read": true,
           "$g": {
-            ".write": true,
-            ".validate": "newData.hasChildren(['at'])"
+            ".write": "!newData.exists()"
           }
         }
       }

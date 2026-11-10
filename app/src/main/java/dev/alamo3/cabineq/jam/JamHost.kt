@@ -35,6 +35,9 @@ object JamHost {
     private const val BASE_DELAY_MS = 700L
     private const val RATE_WINDOW_MS = 10_000L
     private const val RATE_MAX_OPS = 12
+    /** All guests together: the guest id is self-chosen, so a per-guest budget alone is no cap. */
+    private const val RATE_MAX_OPS_TOTAL = 40
+    private const val MAX_FIELD = 300
     private const val DB = "https://cabineq-jam-81cd8-default-rtdb.firebaseio.com"
     const val WEB = "https://cabineq-jam-81cd8.web.app"
 
@@ -49,8 +52,6 @@ object JamHost {
         Thread(r, "CabinEQ-Jam").apply { isDaemon = true }
     }
     private val seen = HashSet<String>()
-    /** Search answers we published this session; deleted when it ends. */
-    private val reqIds = HashSet<String>()
 
     /** Set when an op changed something, so the next loop iteration publishes state at once. */
     @Volatile private var dirty = false
@@ -59,9 +60,18 @@ object JamHost {
     private class Budget(var windowStart: Long, var count: Int)
     private val budgets = HashMap<String, Budget>()
 
+    private val total = Budget(0L, 0)
+
     private fun withinBudget(guest: String): Boolean = synchronized(budgets) {
         val now = SystemClock.elapsedRealtime()
-        val b = budgets.getOrPut(guest.ifBlank { "?" }) { Budget(now, 0) }
+        if (now - total.windowStart > RATE_WINDOW_MS) {
+            total.windowStart = now
+            total.count = 0
+            // Inventing guest ids must not grow this map forever either.
+            budgets.entries.removeAll { now - it.value.windowStart > RATE_WINDOW_MS }
+        }
+        if (++total.count > RATE_MAX_OPS_TOTAL) return@synchronized false
+        val b = budgets.getOrPut(guest.ifBlank { "?" }.take(64)) { Budget(now, 0) }
         if (now - b.windowStart > RATE_WINDOW_MS) {
             b.windowStart = now
             b.count = 0
@@ -79,6 +89,7 @@ object JamHost {
         val sid = randomId()
         sessionId = sid
         seen.clear()
+        synchronized(budgets) { budgets.clear() }
         running = true
         val orphan = settings.lastJamSession?.takeIf { it != sid }
         settings.lastJamSession = sid
@@ -111,6 +122,9 @@ object JamHost {
                 failures = if (ok) 0 else (failures + 1).coerceAtMost(4)
                 Thread.sleep(BASE_DELAY_MS shl failures)
             }
+            // stop() wipes from another thread, but this loop may have been mid-publish and
+            // written the state back afterwards. It is the last writer, so it cleans up last.
+            delete("$sid/state.json")
             Log.i(TAG, "Session $sid stopped")
         }
         Log.i(TAG, "Session $sid started: ${sessionUrl(sid)}")
@@ -140,7 +154,9 @@ object JamHost {
         ops.forEach { delete("$sid/ops/$it.json") }
         val guests = keysOf("$sid/guests.json")
         guests.forEach { delete("$sid/guests/$it.json") }
-        val results = reqIds.toList()
+        // Enumerated like the others (the node is readable), so an orphaned session's search
+        // answers go too, not just the ones this process remembers.
+        val results = keysOf("$sid/results.json")
         results.forEach { delete("$sid/results/$it.json") }
         // DELETE bodies are "null" on success, so ask the HTTP layer for success instead.
         val stateOk = delete("$sid/state.json") != null
@@ -150,7 +166,8 @@ object JamHost {
     }
 
     private fun keysOf(path: String): List<String> {
-        val body = get(path) ?: return emptyList()
+        // shallow=true: keys only, not every entry's body.
+        val body = get("$path?shallow=true") ?: return emptyList()
         val o = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
         return o.keys().asSequence().toList()
     }
@@ -226,9 +243,10 @@ object JamHost {
     private fun answerSearchNow(app: Context, sid: String, op: JSONObject) {
         val link = Settings(app).addonLink
         val reqId = op.optString("reqId")
-        if (link.isBlank() || reqId.isBlank()) return
-        val query = op.optString("q")
-        reqIds.add(reqId)
+        if (link.isBlank() || reqId.isBlank() || reqId.length > 40) return
+        // Becomes part of a database path: only the characters the web client generates.
+        if (!reqId.all { it.isLetterOrDigit() || it == '-' || it == '_' }) return
+        val query = op.optString("q").take(200)
         val tracks = runCatching { EclipseAddon(link).search(query).tracks }
             .getOrDefault(emptyList())
         val items = JSONArray()
@@ -242,9 +260,12 @@ object JamHost {
                     .put("dur", (t.durationSec ?: 0) * 1000L)
                     .put("source", "ADDON")
                     .put("id", t.id)
-                    .put("url", t.streamUrl ?: JSONObject.NULL)
+                // No stream URL: the relay is world-readable, a ticket URL may carry
+                // credentials, and the host only honours ids anyway (see trackFrom).
             )
         }
+        // The session may have ended during the search: don't recreate what stop() wiped.
+        if (sessionId != sid) return
         put(
             "$sid/results/$reqId.json",
             JSONObject().put("at", System.currentTimeMillis()).put("items", items)
@@ -285,16 +306,16 @@ object JamHost {
         .put("isrc", t.isrc ?: JSONObject.NULL)
 
     private fun trackFrom(o: JSONObject): Track = Track(
-        title = o.optString("title"),
-        artist = o.optString("artist").takeIf { it.isNotBlank() },
-        album = o.optString("album").takeIf { it.isNotBlank() },
-        artworkUrl = o.optString("art").takeIf { it.isNotBlank() },
+        title = o.optString("title").take(MAX_FIELD),
+        artist = o.optString("artist").take(MAX_FIELD).takeIf { it.isNotBlank() },
+        album = o.optString("album").take(MAX_FIELD).takeIf { it.isNotBlank() },
+        artworkUrl = o.optString("art").takeIf { it.startsWith("https://") && it.length <= 1000 },
         durationMs = o.optLong("dur"),
         source = if (o.optString("source") == "TORBOX") Track.Source.TORBOX else Track.Source.ADDON,
-        sourceId = o.optString("id").takeIf { it.isNotBlank() },
+        sourceId = o.optString("id").take(MAX_FIELD).takeIf { it.isNotBlank() },
         // Deliberately ignore a guest-supplied "url": only ids are honoured, so the phone never
         // downloads something an arbitrary guest chose.
-        isrc = o.optString("isrc").takeIf { it.isNotBlank() },
+        isrc = o.optString("isrc").take(32).takeIf { it.isNotBlank() },
     )
 
     // ---------------------------------------------------------------- rest

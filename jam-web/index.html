@@ -136,7 +136,12 @@
     connEl.textContent = ok ? "live" : "reconnecting…";
   };
 
-  const esc = (s) => (s == null ? "" : String(s));
+  // Everything shown here comes from the relay, which any guest can write to: escape it.
+  const esc = (s) => (s == null ? "" : String(s)).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  /** Only plain https images; anything else (javascript:, data:, quotes) is dropped. */
+  const safeArt = (u) => (typeof u === "string" && /^https:\/\/[^\s"'<>]+$/.test(u)) ? u : "";
+  const artHtml = (t) => safeArt(t.art) ? `<img class="art" src="${esc(safeArt(t.art))}" alt="">` : `<div class="art"></div>`;
   const meta = (t) => [t.artist, t.album].filter(Boolean).join(" · ");
   /** Same recording = same ISRC, else title+artist: how the host dedupes, so how we match too. */
   const trackKey = (t) => (t && (t.isrc || ((t.title || "") + "|" + (t.artist || "")).toLowerCase())) || "";
@@ -199,10 +204,10 @@
     if (s && (s.nowPlaying || s.playing)) {
       const t = s.nowPlaying || {};
       nowCard.hidden = false;
-      document.getElementById("nowTitle").textContent = esc(t.title) || "—";
+      document.getElementById("nowTitle").textContent = (t.title == null ? "" : String(t.title)) || "—";
       document.getElementById("nowMeta").textContent = meta(t) || (s.playing ? "playing" : "paused");
       const art = document.getElementById("nowArt");
-      if (t.art) { art.src = t.art; art.style.visibility = "visible"; }
+      if (safeArt(t.art)) { art.src = safeArt(t.art); art.style.visibility = "visible"; }
       else { art.removeAttribute("src"); art.style.visibility = "hidden"; }
     } else {
       nowCard.hidden = true;
@@ -227,7 +232,7 @@
       const abs = base + i;   // move/remove address the host's queue, so send absolute indices
       const el = document.createElement("div");
       el.className = "item";
-      const art = t.art ? `<img class="art" src="${t.art}" alt="">` : `<div class="art"></div>`;
+      const art = artHtml(t);
       el.innerHTML = `${art}
         <div class="grow">
           <div class="title">${esc(t.title)}</div>
@@ -242,7 +247,7 @@
       const t = p.track;
       const el = document.createElement("div");
       el.className = "item pending";
-      const art = t.art ? `<img class="art" src="${t.art}" alt="">` : `<div class="art"></div>`;
+      const art = artHtml(t);
       el.innerHTML = `${art}
         <div class="grow">
           <div class="title">${esc(t.title)}</div>
@@ -308,7 +313,7 @@
   async function doSearch(q) {
     const query = q.trim();
     if (query.length < 2) { clearResults(); return; }
-    reqId = Date.now();
+    reqId = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
     const mine = reqId;
     hint("Searching…", 0);
     resultsEl.innerHTML = "";
@@ -342,7 +347,7 @@
     items.slice(0, 20).forEach((t) => {
       const el = document.createElement("div");
       el.className = "item";
-      const art = t.art ? `<img class="art" src="${t.art}" alt="">` : `<div class="art"></div>`;
+      const art = artHtml(t);
       el.innerHTML = `${art}
         <div class="grow">
           <div class="title">${esc(t.title)}</div>
