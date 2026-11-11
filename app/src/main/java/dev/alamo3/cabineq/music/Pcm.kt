@@ -59,30 +59,29 @@ object Pcm {
      */
     class Reading(val encoding: Int, val switched: Boolean, val note: String)
 
-    /** Below this many frames the statistics mean nothing; the next buffer is tried. */
-    const val PROBE_FRAMES = 128
+    /** Frames the running check looks at: enough for garbage to show itself, small enough to run often. */
+    const val CHECK_FRAMES = 512
 
-    fun detect(buf: ByteBuffer, declared: Int, channels: Int): Reading {
-        if (channels <= 0) return Reading(declared, false, "no channel count")
-        val frames = buf.remaining() / (bytesPerSample(declared) * channels)
-        if (frames < PROBE_FRAMES) return Reading(declared, false, "too short to tell")
-        val asDeclared = measure(buf, declared, channels, minOf(frames, 4096))
-        val candidates = interpretations(buf, declared, channels)
-        if (asDeclared.isPlausibleAudio()) {
-            // A wrong word size can still look plausible (float read as 16-bit is bounded and not
-            // denormal). It is only overridden by a reading that is unmistakably audio while the
-            // declared one is not clean.
-            val cleaner = if (asDeclared.roughness > 0.35 && asDeclared.jump > 0.6) {
-                candidates
-                    .filter { it.second.roughness < 0.4 && it.second.roughness < asDeclared.roughness / 2 }
-                    .minByOrNull { it.second.roughness }
-            } else null
-            return cleaner?.let { switched(declared, it) }
-                ?: Reading(declared, false, "as declared (${asDeclared.describe()})")
-        }
-        val pick = candidates.minByOrNull { it.second.roughness }
-            ?: return Reading(declared, false, "as declared; nothing else looked like audio")
-        return switched(declared, pick)
+    /**
+     * True when reading this buffer as float gives samples that cannot be audio. Cheap enough to
+     * run on every buffer, which is what makes it correct: a stream's format is configured once,
+     * and a later song of the same format never reconfigures the sink even if its decoder
+     * produces a different word size.
+     */
+    fun floatIsImpossible(buf: ByteBuffer, channels: Int): Boolean {
+        if (channels <= 0) return false
+        val frames = buf.remaining() / (bytesPerSample(ENCODING_FLOAT) * channels)
+        if (frames < 32) return false
+        val stats = measure(buf, ENCODING_FLOAT, channels, minOf(frames, CHECK_FRAMES))
+        return stats.isImpossibleFloat()
+    }
+
+    /** The word size that reads as audio in this buffer, when float does not. */
+    fun alternativeToFloat(buf: ByteBuffer, channels: Int): Reading {
+        if (channels <= 0) return Reading(ENCODING_FLOAT, false, "no channel count")
+        val pick = interpretations(buf, ENCODING_FLOAT, channels).minByOrNull { it.second.roughness }
+            ?: return Reading(ENCODING_FLOAT, false, "float samples are impossible, but nothing else is audio")
+        return switched(ENCODING_FLOAT, pick)
     }
 
     private fun switched(declared: Int, pick: Pair<Int, Stats>) = Reading(
@@ -97,7 +96,7 @@ object Pcm {
         for (candidate in intArrayOf(ENCODING_16BIT, ENCODING_24BIT_PACKED, ENCODING_FLOAT)) {
             if (candidate == declared) continue
             val n = buf.remaining() / (bytesPerSample(candidate) * channels)
-            if (n < PROBE_FRAMES) continue
+            if (n < 32) continue
             val stats = measure(buf, candidate, channels, minOf(n, 4096))
             if (stats.isAudio()) add(candidate to stats)
         }
@@ -135,6 +134,13 @@ object Pcm {
 
         /** Bit patterns reinterpreted as float land almost entirely in the denormal range. */
         fun isMostlyDenormal(): Boolean = tiny > 0.5
+
+        /**
+         * These samples cannot be decoded audio, whatever they are: a signal six times over full
+         * scale, almost every value in the denormal range (16-bit samples read as float), or not
+         * a number at all.
+         */
+        fun isImpossibleFloat(): Boolean = !peak.isFinite() || peak > 4.0 || (isMostlyDenormal() && peak < 1.0)
     }
 
     private fun measure(buf: ByteBuffer, encoding: Int, channels: Int, frames: Int): Stats {

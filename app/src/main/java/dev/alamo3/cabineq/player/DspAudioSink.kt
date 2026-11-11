@@ -48,9 +48,8 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     private var inRate = 0
     /** What the decoder says its samples are. */
     private var inEncoding = C.ENCODING_PCM_16BIT
-    /** What they actually are: checked against the data once per stream, see [Pcm.detect]. */
+    /** What they actually are: checked against the data, see [Pcm.floatIsImpossible]. */
     private var readEncoding = C.ENCODING_PCM_16BIT
-    private var probed = false
     private var inChannels = 2
 
     // The engine, always at the rate the device mixes at.
@@ -121,7 +120,6 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         inEncoding = format.pcmEncoding
         inChannels = format.channelCount
         readEncoding = inEncoding
-        probed = false
         inputDescription = "${format.sampleMimeType} ${inRate} Hz ${inChannels}ch, " +
             "declared ${Pcm.name(inEncoding)}"
         Log.i(TAG, "in: ${inputDescription}")
@@ -234,18 +232,16 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
             buffer.position(buffer.limit())
             return true
         }
-        // The decoder's word for its own samples is checked once: a device that declares float
-        // while sending 16-bit makes every word garbage, and a limiter turns that into the
-        // "extremely distorted" this engine was reported to play.
-        if (!probed) {
-            val declaredFrames = buffer.remaining() / (Pcm.bytesPerSample(inEncoding) * inChannels)
-            if (declaredFrames >= Pcm.PROBE_FRAMES) {
-                probed = true
-                val reading = Pcm.detect(buffer, inEncoding, inChannels)
+        // The decoder's word for its own samples is checked continuously while we read float. It
+        // has to be: Media3 configures the sink once per format, so a later song that decodes to
+        // a different word size — which is what file-backed songs were doing — never reconfigures
+        // it, and the previous song's interpretation turns the new one into noise.
+        if (readEncoding == Pcm.ENCODING_FLOAT && Pcm.floatIsImpossible(buffer, inChannels)) {
+            val reading = Pcm.alternativeToFloat(buffer, inChannels)
+            if (reading.switched) {
                 readEncoding = reading.encoding
                 inputDescription = "declared ${Pcm.name(inEncoding)}, reads as ${Pcm.name(readEncoding)}"
-                if (reading.switched) Log.w(TAG, "sample format: ${reading.note}")
-                else Log.i(TAG, "sample format: ${reading.note}")
+                Log.w(TAG, "sample format: ${reading.note}")
             }
         }
         val frameBytes = Pcm.bytesPerSample(readEncoding) * inChannels

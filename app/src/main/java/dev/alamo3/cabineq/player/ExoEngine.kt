@@ -496,6 +496,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         tracksByKey[key] = track
         // Already on the phone (a download, or the other engine's cache): play the file.
         val uri = if (local != null && local.isFile) Uri.fromFile(local) else Uri.parse("$SCHEME://t/$key")
+        Log.i(TAG, "source of \"${track.title}\": " + if (local != null && local.isFile) "file (${local.length()} bytes)" else "stream")
         return MediaItem.Builder()
             .setMediaId(key)
             .setUri(uri)
