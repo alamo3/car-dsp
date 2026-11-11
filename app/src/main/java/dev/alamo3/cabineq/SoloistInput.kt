@@ -43,9 +43,12 @@ object SoloistInput {
     private const val CHANNELS = 2
     // The pipe sink writes in chunks of up to the pipe's size (~370 ms at 64 KB), so the cushion
     // sits above that. The cap is where the reader stops reading: the backpressure point.
-    private const val TARGET_MS = 500        // cushion before playback starts
-    private const val RESUME_MS = 300        // cushion before carrying on after a starve
-    private const val CAP_MS = 1000          // buffer full: stop reading until the player drains it
+    // A deeper cushion is free for music (it is only latency) and is what absorbs a hiccup on
+    // this side instead of turning it into a pause upstream: with backpressure, anything that
+    // stops the reader for longer than the cushion stalls Soloist, and Spotify with it.
+    private const val TARGET_MS = 1500       // cushion before playback starts
+    private const val RESUME_MS = 1000       // cushion before carrying on after a starve
+    private const val CAP_MS = 3000          // buffer full: stop reading until the player drains it
     private const val SOCKET_BUFFER = 32 * 1024   // a small socket buffer keeps the delay short
     private const val OUTPUT_BUFFER_MS = 300 // AudioTrack cushion, so a late write is not a gap
     private const val BLOCK_FRAMES = 2048

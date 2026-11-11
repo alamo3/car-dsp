@@ -59,7 +59,7 @@ status() {
   echo "supervisor: $(supervised && echo "running (pid $(cat "$PIDFILE"))" || echo stopped)"
   echo "soloist:    $(pgrep -x soloist >/dev/null && echo running || echo stopped)"
   echo "pulseaudio: $(pgrep -x pulseaudio >/dev/null && echo running || echo stopped)"
-  echo "socat:      $(pgrep -x socat >/dev/null && echo "listening on 127.0.0.1:$PORT" || echo stopped)"
+  echo "pcm server: $(pgrep -f cabineq-pcm-server >/dev/null && echo "serving on 127.0.0.1:$PORT" || echo stopped)"
   echo "key:        $([ -s "$KEYFILE" ] && echo stored || echo missing)"
   echo "log:        $LOG (last lines below)"
   tail -n 8 "$LOG" 2>/dev/null
@@ -104,6 +104,10 @@ fi
 
 # ---- Debian side: written fresh each run ------------------------------------------------------
 
+PCM_SERVER="$(cd "$(dirname "$0")" && pwd)/cabineq-pcm-server.py"
+[ -s "$PCM_SERVER" ] || { say "missing $PCM_SERVER (push it next to this script)"; exit 1; }
+install -m 755 "$PCM_SERVER" "$ROOTFS/root/cabineq-pcm-server.py"
+
 cat > "$ROOTFS/root/cabineq-session.sh" <<'SESSION'
 #!/bin/bash
 # One session: PulseAudio + socat + Soloist, sharing one lifetime.
@@ -120,7 +124,7 @@ say() { echo "$(date '+%H:%M:%S') [debian] $*"; }
 
 install_deps() {
   local need=""
-  for p in curl ca-certificates libatomic1 pulseaudio pulseaudio-utils socat; do
+  for p in curl ca-certificates libatomic1 pulseaudio pulseaudio-utils python3-minimal; do
     dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
   done
   if [ -n "$need" ]; then
@@ -143,7 +147,12 @@ fetch_soloist() {
   say "Soloist $("$BIN" --version 2>&1 | head -1)"
 }
 
-key_args() { [ -s "$BASE/key" ] && printf -- '-k\n%s\n' "$(cat "$BASE/key")"; }
+# Without process substitution: proot has no /dev/fd/63, so `mapfile -t K < <(key_args)` left the
+# array empty and Soloist exited 1 ("api key required").
+key_args() {
+  K=()
+  [ -s "$BASE/key" ] && K=(-k "$(cat "$BASE/key")")
+}
 
 # Soloist leaves its session marker behind when it is killed, and then refuses to start
 # ("another session is running for data directory"): only stale ones get here.
@@ -153,6 +162,7 @@ children=()
 cleanup() {
   for p in "${children[@]}"; do kill "$p" 2>/dev/null; done
   pkill -x socat 2>/dev/null
+  pkill -f cabineq-pcm-server 2>/dev/null
   # A wedged PulseAudio may not act on SIGTERM: give it a second, then force it.
   pkill -x pulseaudio 2>/dev/null; sleep 1; pkill -9 -x pulseaudio 2>/dev/null
 }
@@ -205,7 +215,7 @@ case "$MODE" in
   pair)
     install_deps && fetch_soloist || exit 1
     clear_stale
-    mapfile -t K < <(key_args)
+    key_args
     say "on Wi-Fi: open Spotify, play anything, tap the devices icon and pick '$DEVICE'"
     "$BIN" --pair -n "$DEVICE" "${K[@]}" -D "$DATA" 2>&1 | grep -E 'pairing|error|Error| E ' --line-buffered
     ;;
@@ -214,7 +224,7 @@ case "$MODE" in
     install_deps && fetch_soloist || exit 1
     trap cleanup EXIT
     pkill -x pipewire 2>/dev/null; pkill -x wireplumber 2>/dev/null
-    pkill -x pulseaudio 2>/dev/null; pkill -x socat 2>/dev/null; sleep 1
+    pkill -x pulseaudio 2>/dev/null; pkill -x socat 2>/dev/null; pkill -f cabineq-pcm-server 2>/dev/null; sleep 1
     mkdir -p "$RUN/pulse" && chmod 700 "$RUN"
     rm -rf "$RUN/pulse"/* "$FIFO"
     write_pulse_conf
@@ -232,16 +242,21 @@ case "$MODE" in
     pactl set-sink-volume CabinEQ 100% 2>/dev/null
     say "pipe sink ready ($FIFO)"
 
-    # One listener that never goes away (fork: each client gets its own FIFO reader, so a
-    # reconnecting app is never refused). -U: data flows from the FIFO to the client. A small send
-    # buffer keeps the backlog — and so the delay between a tap in Spotify and the sound — short.
-    socat -U TCP-LISTEN:"$PORT",bind=127.0.0.1,reuseaddr,fork,sndbuf=32768 OPEN:"$FIFO",rdonly 2>/dev/null &
-    socat_pid=$!
-    children+=($socat_pid)
-    say "serving PCM on 127.0.0.1:$PORT"
+    # One process owns the FIFO for the session's life. A reader per client (socat OPEN:FIFO) has
+    # the pipe with no reader the moment the app is not connected — PA blocks, Soloist stalls and
+    # Spotify drops the device (heard as "works until the second song"); with fork, two overlapping
+    # clients split the stream, and each reconnect can start mid-frame (channels swapped). The
+    # server drains at real time when nobody listens, blocks when a client is slow (that is the
+    # pacing), and never reopens the FIFO.
+    python3 /root/cabineq-pcm-server.py "$FIFO" "$PORT" >/tmp/cabineq-pcm.log 2>&1 &
+    pcm_pid=$!
+    children+=($pcm_pid)
+    up=""
+    for _ in $(seq 1 20); do kill -0 "$pcm_pid" 2>/dev/null && { up=1; break; }; sleep 0.3; done
+    [ -n "$up" ] && say "serving PCM on 127.0.0.1:$PORT" || { say "PCM server failed"; tail -5 /tmp/cabineq-pcm.log; exit 1; }
 
     clear_stale
-    mapfile -t K < <(key_args)
+    key_args
     say "starting Soloist as '$DEVICE'"
     "$BIN" -n "$DEVICE" "${K[@]}" -D "$DATA" -i 100 >/tmp/cabineq-soloist.log 2>&1 &
     sp=$!
@@ -259,7 +274,7 @@ case "$MODE" in
           pulse_log_tail; exit 1
         fi
       fi
-      kill -0 "$socat_pid" 2>/dev/null || { say "socat (the PCM server) exited"; exit 1; }
+      kill -0 "$pcm_pid" 2>/dev/null || { say "the PCM server exited"; tail -3 /tmp/cabineq-pcm.log; exit 1; }
       if ! kill -0 "$sp" 2>/dev/null; then
         wait "$sp"; code=$?
         if [ "$code" = 10 ]; then
