@@ -150,9 +150,34 @@
   // confirmed round trip can take two seconds. These make the tap feel instant:
   //   pending  — rows we have asked to add, shown greyed out until the host's state includes them
   //   hidden   — keys we asked to remove, hidden until the state no longer lists them
+  //   moves    — songs we asked to move, shown in their new place until the host's state agrees
   const pending = new Map();
   const hidden = new Map();
+  const moves = new Map();
   let localSeq = 0;
+  /** What the queue list last drew, so a button press addresses what the guest actually saw. */
+  let lastShown = [];
+
+  /** The host's queue with our unconfirmed moves applied. */
+  function applyMoves(all) {
+    if (!moves.size) return all;
+    const out = all.slice();
+    for (const [key, m] of moves) {
+      const i = out.findIndex((t) => t.key === key);
+      // Agreed, gone, or never landed (5 s): back to showing what the host says.
+      if (i < 0 || i === m.to || Date.now() - m.at > 5000) { moves.delete(key); continue; }
+      const [item] = out.splice(i, 1);
+      out.splice(Math.min(m.to, out.length), 0, item);
+    }
+    return out;
+  }
+
+  function move(t, to) {
+    moves.set(t.key, { to, at: Date.now() });
+    render();                                                  // it moves now; the host confirms shortly
+    op({ op: "move", key: t.key, to }).catch(() => moves.delete(t.key));
+    poke();
+  }
 
   function dropConfirmed() {
     if (pending.size) poke();   // stay at ~280 ms until the host confirms
@@ -217,7 +242,8 @@
 
     dropConfirmed();
 
-    const all = (s && Array.isArray(s.queue)) ? s.queue : [];
+    const all = applyMoves((s && Array.isArray(s.queue)) ? s.queue : []);
+    lastShown = all;
     // The host publishes the whole queue; "up next" is only what is still ahead of the play head.
     const base = (s && Number.isInteger(s.currentIndex)) ? s.currentIndex + 1 : 0;
     const queue = all.slice(base).filter((t) => !hidden.has(trackKey(t)));
@@ -237,6 +263,7 @@
         <div class="grow">
           <div class="title">${esc(t.title)}</div>
           <div class="meta">${esc(meta(t))}</div>
+          ${t.waiting === true ? '<div class="meta">⏳ Still being prepared — other songs go first, this one plays when it is ready</div>' : ""}
         </div>
         <button class="ghost" data-act="up" data-i="${abs}" ${i === 0 ? "disabled" : ""}>↑</button>
         <button class="ghost" data-act="down" data-i="${abs}" ${i === queue.length - 1 ? "disabled" : ""}>↓</button>
@@ -261,10 +288,10 @@
     const b = e.target.closest("button[data-act]");
     if (!b) return;
     const i = Number(b.dataset.i);
-    const t = (state && state.queue) ? state.queue[i] : null;
+    const t = lastShown[i] || null;
     if (!t) return;
-    if (b.dataset.act === "up" && i > 0) { op({ op: "move", key: t.key, to: i - 1 }).catch(() => {}); poke(); }
-    if (b.dataset.act === "down") { op({ op: "move", key: t.key, to: i + 1 }).catch(() => {}); poke(); }
+    if (b.dataset.act === "up" && i > 0) move(t, i - 1);
+    if (b.dataset.act === "down") move(t, i + 1);
     if (b.dataset.act === "remove") {
       hidden.set(trackKey(t), Date.now());
       render();                       // the row disappears now; the host confirms shortly
@@ -275,8 +302,9 @@
 
   document.getElementById("skip").addEventListener("click", () => op({ op: "skip" }));
 
+  let pollAgain = false;
   async function pollState() {
-    if (pollBusy) return;
+    if (pollBusy) { pollAgain = true; return; }           // asked while fetching: fetch once more after
     pollBusy = true;
     try {
       state = await api.get("state");
@@ -286,7 +314,30 @@
       setOnline(false);
     } finally {
       pollBusy = false;
+      if (pollAgain) { pollAgain = false; pollState(); }
     }
+  }
+
+  // The relay can push: the host's state arrives the moment it is written, with no polling delay
+  // and no extra round trip. Polling stays as the fallback for when the stream is down.
+  let streamLive = false;
+  function openStream() {
+    if (!window.EventSource) return;
+    let es;
+    try { es = new EventSource(`${base}/state.json`); } catch (_) { return; }
+    es.onopen = () => { streamLive = true; };
+    es.onerror = () => { streamLive = false; };            // it reconnects by itself
+    const onChange = (e) => {
+      streamLive = true;
+      try {
+        const m = JSON.parse(e.data);
+        // The host writes the whole state each time: take it as it comes.
+        if (m && m.path === "/") { state = m.data; setOnline(true); render(); return; }
+      } catch (_) { /* fall through */ }
+      pollState();                                         // a partial change: fetch the whole thing
+    };
+    es.addEventListener("put", onChange);
+    es.addEventListener("patch", onChange);
   }
 
   // ---------------------------------------------------------------- search
@@ -302,12 +353,18 @@
     if (ms !== 0) hint._t = setTimeout(() => { hintEl.hidden = true; }, ms || 2500);
   }
   const resultsEl = document.getElementById("results");
-  let searchTimer = 0, reqId = 0, resultsTimer = 0;
+  let searchTimer = 0, reqId = 0, resultsTimer = 0, resultsStream = null;
+
+  /** Stops waiting for a search answer (the poll and the push stream both). */
+  function stopWaiting() {
+    clearInterval(resultsTimer);
+    if (resultsStream) { resultsStream.close(); resultsStream = null; }
+  }
 
   function clearResults() {
     resultsEl.innerHTML = "";
     hintEl.hidden = true;
-    clearInterval(resultsTimer);
+    stopWaiting();
   }
 
   async function doSearch(q) {
@@ -323,22 +380,39 @@
       hint("Search failed: " + e.message);
       return;
     }
-    clearInterval(resultsTimer);
+    stopWaiting();
     const started = Date.now();
+    const arrived = (items) => {
+      if (mine !== reqId) return;                          // something newer was typed since
+      stopWaiting();
+      clearTimeout(hint._t);
+      hintEl.hidden = true;
+      renderResults(items, query);
+    };
+    // The answer is pushed the moment the host writes it; polling below is the fallback.
+    if (window.EventSource) {
+      try {
+        resultsStream = new EventSource(`${base}/results/${encodeURIComponent(mine)}.json`);
+        resultsStream.addEventListener("put", (e) => {
+          try {
+            const m = JSON.parse(e.data);
+            if (m && m.path === "/" && m.data && Array.isArray(m.data.items)) arrived(m.data.items);
+          } catch (_) { /* the poll will get it */ }
+        });
+      } catch (_) { /* the poll will get it */ }
+    }
     resultsTimer = setInterval(async () => {
+      if (mine !== reqId) { clearInterval(resultsTimer); return; }
       if (Date.now() - started > 15000) {
-        clearInterval(resultsTimer);
+        stopWaiting();
         hint("No answer from the car (is the app open?).", 0);
         return;
       }
       let r = null;
       try { r = await api.get(`results/${mine}`); } catch (_) { return; }
       if (!r || !Array.isArray(r.items)) return;
-      clearInterval(resultsTimer);
-      clearTimeout(hint._t);
-      hintEl.hidden = true;
-      renderResults(r.items, query);
-    }, 600);
+      arrived(r.items);
+    }, 400);
   }
 
   function renderResults(items, query) {
@@ -384,15 +458,17 @@
   qEl.addEventListener("input", () => {
     clearTimeout(searchTimer);
     const q = qEl.value;
-    searchTimer = setTimeout(() => doSearch(q), 400);
+    searchTimer = setTimeout(() => doSearch(q), 250);
   });
 
   // ---------------------------------------------------------------- loop
 
   pollState();
-  setInterval(pollState, 1000);                                  // steady heartbeat
-  setInterval(() => { if (Date.now() < burstUntil) pollState(); }, 280);   // right after a tap
-  setInterval(() => { if (!state) pollState(); }, 3000);
+  openStream();
+  // While the stream is up it does the work; these only matter when it is not.
+  setInterval(() => { if (!streamLive) pollState(); }, 1000);                              // heartbeat
+  setInterval(() => { if (!streamLive && Date.now() < burstUntil) pollState(); }, 280);   // right after a tap
+  setInterval(pollState, 6000);                                                            // safety net either way
 })();
 </script>
 </body>
