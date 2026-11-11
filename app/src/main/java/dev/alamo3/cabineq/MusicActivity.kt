@@ -1410,7 +1410,7 @@ class MusicActivity : Activity() {
             miniTitle.text = title
             miniSub.text = when (p.state) {
                 FilePlayer.State.LOADING -> p.note ?: "Loading…"
-                FilePlayer.State.ERROR -> "Couldn't play"
+                FilePlayer.State.ERROR -> p.lastError?.let { "Couldn't play: $it" } ?: "Couldn't play"
                 else -> artist
             }
             fullTitle.text = title
@@ -1468,7 +1468,7 @@ class MusicActivity : Activity() {
                 fullWhy.visibility = if (why == null) View.GONE else View.VISIBLE
             }
             fullInfo.text = info
-            val note = p.note?.let { "⏳ $it" } ?: (EngineState.playerMessage ?: p.lastError)?.let { "⚠ $it" }
+            val note = p.note?.let { "⏳ $it" } ?: EngineState.playerMessage?.let { "⚠ $it" } ?: p.status
             fullNote.text = note ?: ""
             fullNote.setTextColor(if (p.note != null) Ui.TEXT_2 else Ui.ERROR)
             fullNote.visibility = if (note == null) View.GONE else View.VISIBLE
@@ -2379,7 +2379,7 @@ class MusicActivity : Activity() {
             }, wrapLp(top = 4))
             page.addView(Ui.pill(this, "Delete sent diagnostics", filled = false) {
                 Diag.clear(this)
-                showMessage("Sent diagnostics deleted")
+                showMessage("Sent diagnostics deleted — copy the link again, the old one no longer works")
             }, wrapLp(top = 4))
         }
         page.addView(Ui.text(this,

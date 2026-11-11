@@ -92,6 +92,20 @@ class FilePlayer private constructor(private val context: Context) {
     /** What the source claims about quality ("lossless"), appended to the decoder's line. */
     @Volatile private var declaredQuality: String? = null
     @Volatile var lastError: String? = null
+    @Volatile private var lastErrorAt = 0L
+
+    /**
+     * What to tell the listener about the song right now, or null: what it is waiting for
+     * (TorBox caching, a busy slot, a slow connection), else why the last song was skipped, for a
+     * little while after it happened (a skipped song leaves nothing else on screen to say why).
+     */
+    val status: String?
+        get() {
+            note?.let { return "⏳ $it" }
+            val error = lastError ?: return null
+            val fresh = SystemClock.elapsedRealtime() - lastErrorAt < ERROR_SHOWN_MS
+            return if (state == State.ERROR || fresh) "⚠ $error" else null
+        }
         private set
     /** Tags and cover embedded in the current file (read in the background; null until known). */
     class FileInfo(val art: Bitmap?, val title: String?, val artist: String?, val album: String?)
@@ -370,6 +384,10 @@ class FilePlayer private constructor(private val context: Context) {
         }
         fun error(text: String?) {
             lastError = text
+            lastErrorAt = SystemClock.elapsedRealtime()
+            version++
+            // Once it is no longer shown, observers (the car's title lines) must redraw without it.
+            saveHandler.postDelayed({ version++ }, ERROR_SHOWN_MS + 200)
         }
         fun info(info: FileInfo?) {
             currentInfo = info
@@ -1865,6 +1883,7 @@ class FilePlayer private constructor(private val context: Context) {
     }
 
     companion object {
+        private const val ERROR_SHOWN_MS = 20_000L
         /** Ramp-in length at every (re)start; long enough to hide a step, short enough to forget. */
         private const val FADE_IN_MS = 15
 

@@ -73,7 +73,7 @@
         ".read": true,
         "meta": {
           ".write": true,
-          ".validate": "newData.hasChildren(['version', 'updatedAt'])",
+          ".validate": "!newData.exists() || newData.hasChildren(['version', 'updatedAt'])",
           "$f": {
             ".validate": "$f.length <= 20 && ((newData.isString() && newData.val().length <= 100) || newData.isNumber() || newData.isBoolean())"
           }

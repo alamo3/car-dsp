@@ -93,11 +93,19 @@ object Diag {
     fun link(context: Context): String =
         "$DB/diag/${id(context)}/events.json?orderBy=%22%24key%22&limitToLast=400&print=pretty"
 
-    /** Deletes everything this install has sent. */
+    /**
+     * Deletes everything this install has sent and starts over under a new id, so an old link
+     * (or an id that got out) reads nothing from now on.
+     */
     fun clear(context: Context) {
-        val id = id(context)
+        val old = id(context)
         synchronized(lock) { buffer.clear() }
-        io.execute { http("DELETE", "diag/$id/events.json", null) }
+        Settings(context).diagnosticsId = ""
+        metaSent = false
+        io.execute {
+            http("DELETE", "diag/$old/events.json", null)
+            http("DELETE", "diag/$old/meta.json", null)
+        }
     }
 
     fun record(level: String, tag: String, message: String, tr: Throwable? = null) {

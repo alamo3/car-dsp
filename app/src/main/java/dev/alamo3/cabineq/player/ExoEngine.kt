@@ -140,6 +140,10 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     /** Songs moved aside while TorBox caches them (queue key → when). */
     private val deferred = ConcurrentHashMap<String, Long>()
     private val checking = ConcurrentHashMap.newKeySet<String>()
+    /** TorBox said all its download slots are busy: no look-ahead asks until this time. */
+    @Volatile private var torboxBusyUntil = 0L
+    /** When the playing song started waiting with nothing on screen to say why (0: not waiting). */
+    private var quietWaitSince = 0L
     private val checkPool = Executors.newFixedThreadPool(2) { r ->
         Thread(r, "CabinEQ-Ahead").apply { isDaemon = true }
     }
@@ -230,6 +234,8 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     ) {
         onMain()
         val items = tracks.mapIndexed { i, t -> item(queueKeys[i], t, local[i]) }
+        val onPhone = local.count { it != null && it.isFile }
+        DLog.i(TAG, "queue of ${items.size} songs: $onPhone on the phone, ${items.size - onPhone} streamed")
         // Anything asked for while the queue was being built is folded in here: a skip tapped
         // before there were items starts the queue on that song, a pause keeps it paused.
         val ready = intents.onQueueReady()
@@ -496,7 +502,6 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         tracksByKey[key] = track
         // Already on the phone (a download, or the other engine's cache): play the file.
         val uri = if (local != null && local.isFile) Uri.fromFile(local) else Uri.parse("$SCHEME://t/$key")
-        DLog.i(TAG, "source of \"${track.title}\": " + if (local != null && local.isFile) "file (${local.length()} bytes)" else "stream")
         return MediaItem.Builder()
             .setMediaId(key)
             .setUri(uri)
@@ -563,7 +568,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         override fun onPlayerError(error: PlaybackException) {
             val p = player ?: return
             val title = currentTrack()?.title ?: "song"
-            val why = error.cause?.message ?: error.errorCodeName
+            val why = error.cause?.let { SourceTrouble.of(it).describe(it) } ?: error.errorCodeName
             DLog.w(TAG, "\"$title\" failed: ${error.errorCodeName}: $why")
             // The link it had may be what failed: never reuse it.
             keys.getOrNull(p.currentMediaItemIndex)?.let { key ->
@@ -763,6 +768,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         gaveUp = false
         networkRetries = 0
         linkRetries = 0
+        quietWaitSince = 0L
         owner.setNote(null)
         bridge.clearFormat()
         bridge.info(null)
@@ -894,6 +900,20 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                 bridge.duration(duration, exact = true)
             }
         }
+        // Waiting with nothing on screen to say why (the source answered, the bytes are slow):
+        // after a few seconds, say so, rather than sit on 0:00 in silence.
+        if (p.playbackState == Player.STATE_BUFFERING && p.playWhenReady && owner.note == null) {
+            if (quietWaitSince == 0L) quietWaitSince = tickAt
+            if (tickAt - quietWaitSince > QUIET_WAIT_MS) {
+                owner.setNote(
+                    if (!MediaCache.isOnline(context)) "No connection — waiting for it"
+                    else if (links[currentKey ?: ""] != null) "Downloading from TorBox — slow connection"
+                    else "Waiting on Nebula…"
+                )
+            }
+        } else if (p.playbackState != Player.STATE_BUFFERING) {
+            quietWaitSince = 0L
+        }
         if (deferred.isNotEmpty() && tickAt - lastDeferredCheck > DEFERRED_RECHECK_MS) {
             lastDeferredCheck = tickAt
             recheckDeferred()
@@ -934,15 +954,28 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         val known = links[key]?.takeIf { now - it.at < LINK_TTL_MS }
         val link = known ?: try {
             val asked = SystemClock.elapsedRealtime()
-            val resolved = TrackResolver.resolve(
-                context,
-                track,
-                // The next songs are prepared while this one plays: only the one being played gets
-                // to say "caching…", or the player would announce a song that is not playing.
-                onNote = { if (currentKey == key) owner.setNote(it) },
-                isCancelled = { Thread.currentThread().isInterrupted },
-            )
-            Link(resolved.url, resolved.quality, SystemClock.elapsedRealtime()).also {
+            // The next songs are prepared while this one plays: only the one being played gets
+            // to say what it is waiting for, or the player would announce a song that is not playing.
+            val note: (String?) -> Unit = { if (currentKey == key) owner.setNote(it) }
+            note("Finding a source on Nebula…")
+            var resolved: TrackResolver.Resolved? = null
+            while (resolved == null) {
+                try {
+                    resolved = TrackResolver.resolve(context, track, onNote = note, isCancelled = { Thread.currentThread().isInterrupted })
+                } catch (e: Exception) {
+                    // All TorBox slots busy is temporary: for the song that is wanted now, wait for
+                    // a free slot (saying so) instead of skipping it. A queued one just fails.
+                    val waited = SystemClock.elapsedRealtime() - asked
+                    if (SourceTrouble.of(e) != SourceTrouble.TORBOX_FULL || currentKey != key || waited > TORBOX_FULL_WAIT_MS) throw e
+                    torboxBusyUntil = SystemClock.elapsedRealtime() + TORBOX_BUSY_MS
+                    note("TorBox is at its download limit — waiting for a free slot")
+                    DLog.i(TAG, "\"${track.title}\": TorBox download limit, retrying in ${TORBOX_RETRY_MS / 1000} s")
+                    Thread.sleep(TORBOX_RETRY_MS)
+                }
+            }
+            val got = resolved!!
+            note("Connecting to TorBox…")
+            Link(got.url, got.quality, SystemClock.elapsedRealtime()).also {
                 links[key] = it
                 DLog.i(TAG, "link for \"${track.title}\" in ${it.at - asked} ms")
             }
@@ -950,10 +983,12 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             Thread.currentThread().interrupt()
             throw InterruptedIOException("cancelled")
         } catch (e: IOException) {
-            throw e
+            if (e is InterruptedIOException) throw e
+            // Kept as the cause: the connection checks look through it.
+            throw IOException(SourceTrouble.of(e).describe(e), e)
         } catch (e: Exception) {
-            // e.g. "Couldn't find it on Nebula": a load error, so the player moves on.
-            throw IOException(e.message ?: e.javaClass.simpleName, e)
+            // e.g. "Couldn't find it on Nebula": a load error, so the player moves on, saying why.
+            throw IOException(SourceTrouble.of(e).describe(e), e)
         }
         link.quality?.let { q -> main.post { if (currentTrack() === track) bridge.quality(q) } }
         return spec.withUri(Uri.parse(link.url))
@@ -1103,6 +1138,9 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     private fun probe(key: String, track: Track, bringBack: Boolean) {
         val fresh = links[key]?.let { SystemClock.elapsedRealtime() - it.at < LINK_TTL_MS } == true
         if (fresh && !bringBack) return
+        // Every ask can start a TorBox download: while all its slots are busy, asking again only
+        // keeps them busy. Wait it out (the song that is playing still asks; see resolve).
+        if (SystemClock.elapsedRealtime() < torboxBusyUntil) return
         if (!checking.add(key)) return
         checkPool.execute {
             try {
@@ -1113,7 +1151,18 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                 if (!bringBack) main.post { setAside(key, track) }
             } catch (e: Exception) {
                 // Not found, or the network: left for its turn, where it fails and is skipped.
-                DLog.i(TAG, "look-ahead for \"${track.title}\": ${e.javaClass.simpleName}: ${e.message}")
+                val why = SourceTrouble.of(e)
+                DLog.i(TAG, "look-ahead for \"${track.title}\": ${why.describe()} (${e.javaClass.simpleName}: ${e.message})")
+                when (why) {
+                    SourceTrouble.TORBOX_FULL -> torboxBusyUntil = SystemClock.elapsedRealtime() + TORBOX_BUSY_MS
+                    // Nebula has nothing to play for it: waiting will not change that. Stop
+                    // asking; when its turn comes it is tried once more and skipped with a reason.
+                    SourceTrouble.NO_SOURCE -> if (deferred.remove(key) != null) {
+                        DLog.i(TAG, "\"${track.title}\": no source on Nebula, no longer waiting for it")
+                        main.post { publishWaiting() }
+                    }
+                    else -> Unit
+                }
             } finally {
                 checking.remove(key)
             }
@@ -1178,6 +1227,10 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         /** Responses that mean "this link is no longer good", as opposed to "this song is bad". */
         private val REFUSED_LINK_CODES = setOf(400, 401, 403, 410)
         private const val DEFERRED_RECHECK_MS = 10_000L
+        private const val TORBOX_BUSY_MS = 60_000L
+        private const val TORBOX_RETRY_MS = 10_000L
+        private const val TORBOX_FULL_WAIT_MS = 3 * 60_000L
+        private const val QUIET_WAIT_MS = 4_000L
         /** How many songs ahead get their link looked up (which is what starts TorBox caching them). */
         private const val AHEAD_PROBE = 4
         /** How many songs ahead are downloaded whole, ready before their turn. */
