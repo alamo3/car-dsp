@@ -81,6 +81,18 @@ class PcmFormatTest {
     }
 
     @Test
+    fun aReadingLearnedForOneSongDoesNotStickToAnother() {
+        // 16-bit data: float never reads as audio, so the correction stands for as long as the
+        // data needs it.
+        assertFalse(Pcm.floatReadsAsAudio(int16(), 2))
+        // Genuine float: the declared interpretation is right again, so a correction learned for
+        // the previous song must not survive into this one.
+        assertTrue(Pcm.floatReadsAsAudio(float(), 2))
+        // Silence proves nothing either way.
+        assertFalse(Pcm.floatReadsAsAudio(silence(), 2))
+    }
+
+    @Test
     fun aShortWindowIsEnough() {
         // The check runs on every buffer, not only when the format is configured, so it must work
         // on a few hundred frames.

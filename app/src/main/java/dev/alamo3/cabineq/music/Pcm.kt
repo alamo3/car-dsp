@@ -82,6 +82,19 @@ object Pcm {
         return stats.isImpossibleFloat()
     }
 
+    /**
+     * True when reading this buffer as float gives ordinary audio. Used the other way round: a
+     * reading learned for a previous song must not outlive it, so a buffer that is plainly float
+     * takes the declared interpretation back.
+     */
+    fun floatReadsAsAudio(buf: ByteBuffer, channels: Int): Boolean {
+        if (channels <= 0) return false
+        val frames = buf.remaining() / (bytesPerSample(ENCODING_FLOAT) * channels)
+        if (frames < 32) return false
+        val stats = measure(buf, ENCODING_FLOAT, channels, minOf(frames, CHECK_FRAMES))
+        return !stats.isImpossibleFloat() && stats.isPlausibleAudio()
+    }
+
     /** The word size that reads as audio in this buffer, when float does not. */
     fun alternativeToFloat(buf: ByteBuffer, channels: Int): Reading {
         if (channels <= 0) return Reading(ENCODING_FLOAT, false, "no channel count")

@@ -50,6 +50,9 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     private var inEncoding = C.ENCODING_PCM_16BIT
     /** What they actually are: checked against the data, see [Pcm.floatIsImpossible]. */
     private var readEncoding = C.ENCODING_PCM_16BIT
+
+    /** Set once per stream: the first buffer's decision is worth one line in the log. */
+    private var described = false
     private var inChannels = 2
 
     // The engine, always at the rate the device mixes at.
@@ -120,6 +123,7 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         inEncoding = format.pcmEncoding
         inChannels = format.channelCount
         readEncoding = inEncoding
+        described = false
         inputDescription = "${format.sampleMimeType} ${inRate} Hz ${inChannels}ch, " +
             "declared ${Pcm.name(inEncoding)}"
         Log.i(TAG, "in: ${inputDescription}")
@@ -236,16 +240,27 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         // has to be: Media3 configures the sink once per format, so a later song that decodes to
         // a different word size — which is what file-backed songs were doing — never reconfigures
         // it, and the previous song's interpretation turns the new one into noise.
-        if (readEncoding == Pcm.ENCODING_FLOAT && Pcm.floatIsImpossible(buffer, inChannels)) {
-            val reading = Pcm.alternativeToFloat(buffer, inChannels)
-            if (reading.switched) {
-                readEncoding = reading.encoding
-                inputDescription = "declared ${Pcm.name(inEncoding)}, reads as ${Pcm.name(readEncoding)}"
-                Log.w(TAG, "sample format: ${reading.note}")
+        if (readEncoding == Pcm.ENCODING_FLOAT) {
+            if (Pcm.floatIsImpossible(buffer, inChannels)) {
+                val reading = Pcm.alternativeToFloat(buffer, inChannels)
+                if (reading.switched) {
+                    readEncoding = reading.encoding
+                    inputDescription = "declared ${Pcm.name(inEncoding)}, reads as ${Pcm.name(readEncoding)}"
+                    Log.w(TAG, "sample format: ${reading.note}")
+                }
             }
+        } else if (Pcm.floatReadsAsAudio(buffer, inChannels)) {
+            // The correction was for the song before this one: what arrives now is plainly float.
+            Log.i(TAG, "sample format: back to ${Pcm.name(inEncoding)} — the data is audio as declared")
+            readEncoding = inEncoding
+            inputDescription = "declared ${Pcm.name(inEncoding)}"
         }
         val frameBytes = Pcm.bytesPerSample(readEncoding) * inChannels
         val frames = buffer.remaining() / frameBytes
+        if (!described) {
+            described = true
+            Log.i(TAG, "stream: ${Pcm.name(inEncoding)} declared, ${Pcm.name(readEncoding)} read, ${frames}f first")
+        }
         var out: ByteBuffer? = null
         if (frames > 0) {
             if (inFloat.size < frames * 2) inFloat = FloatArray(frames * 2)
@@ -300,6 +315,9 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         // .onProcessedStreamChange). Tearing the resampler down and fading in here is what made
         // every join duck; a format change arrives through configure(), a seek through flush().
         pending = null
+        // A new song: whatever word size the last one needed says nothing about this one. The
+        // per-buffer check re-learns it on this very buffer, before it is converted.
+        readEncoding = inEncoding
         delegate.handleDiscontinuity()
     }
 
