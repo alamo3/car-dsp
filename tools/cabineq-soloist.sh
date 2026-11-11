@@ -64,21 +64,42 @@ fi
 export PULSE_RUNTIME_PATH="$PREFIX/var/run/pulse"
 mkdir -p "$PULSE_RUNTIME_PATH"
 command -v pulseaudio >/dev/null || yes | pkg install -y pulseaudio >/dev/null 2>&1
+# One chain only: a second PulseAudio cannot have the same socket, and two daemons fighting over
+# it is how "play" ends up blocked forever on --start.
+# Soloist is the Spotify Connect endpoint: a stray copy (it is started detached, so killing the
+# proot session does NOT kill it) keeps advertising the same device, and Spotify then loses it
+# from the speaker list. Kill every piece by name before starting one of each.
+pkill -x soloist 2>/dev/null; pkill -x socat 2>/dev/null; pkill -x parec 2>/dev/null
+pkill -f proot 2>/dev/null; pkill -x pulseaudio 2>/dev/null; sleep 2
 pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1
-sleep 1
+# Wait for the server, and bound every client call from here on: a bare pactl with no server
+# autospawns one and blocks forever — that is how `play` hung with nothing on screen.
+up=""
+for i in $(seq 1 40); do timeout 2 pactl info >/dev/null 2>&1 && { up=1; break; }; sleep 0.5; done
+say "termux pulseaudio: ${up:+up}"; [ -n "$up" ] || say "termux pulseaudio: not up"
 # The sink everything is paced by must be a *device*, not a null sink: a null sink swallows
 # whatever it is given as fast as it arrives, so Soloist runs free and delivers bursts (measured
 # 60x realtime). Android's audio hardware keeps real time, so AAudio is the clock — muted, since
 # the sound comes from CabinEQ, not from Termux.
-pactl list short modules 2>/dev/null | grep -q module-aaudio-sink || pactl load-module module-aaudio-sink >/dev/null 2>&1
-AA=$(pactl list short sinks 2>/dev/null | awk '$2 ~ /AAudio/ {print $2; exit}')
-if [ -n "$AA" ]; then
-  pactl set-default-sink "$AA" >/dev/null 2>&1
-  pactl set-sink-volume "$AA" 0 >/dev/null 2>&1
-  pactl set-sink-mute "$AA" 0 >/dev/null 2>&1
-  say "termux clock sink: $AA (muted; it exists to pace)"
+if [ -n "$up" ]; then
+  timeout 2 pactl list short modules 2>/dev/null | grep -q module-aaudio-sink || timeout 8 pactl load-module module-aaudio-sink >/dev/null 2>&1
+  # A second socket, anonymous, for the proot side: it has its own cookie and no way to read
+  # Termux's. Clients there speak the same protocol, so they talk to the same server.
+  PROOT_SOCK="$PULSE_RUNTIME_PATH/proot"
+  timeout 2 pactl list short modules 2>/dev/null | grep -q "socket=$PROOT_SOCK" || \
+    timeout 8 pactl load-module module-native-protocol-unix socket="$PROOT_SOCK" auth-anonymous=1 >/dev/null 2>&1
+  say "proot socket: $(test -S "$PROOT_SOCK" && echo ready || echo missing)"
+  AA=$(timeout 2 pactl list short sinks 2>/dev/null | awk '$2 ~ /AAudio/ {print $2; exit}')
+  if [ -n "$AA" ]; then
+    timeout 2 pactl set-default-sink "$AA" >/dev/null 2>&1
+    timeout 2 pactl set-sink-volume "$AA" 0 >/dev/null 2>&1
+    timeout 2 pactl set-sink-mute "$AA" 0 >/dev/null 2>&1
+    say "termux clock sink: $AA (muted; it exists to pace)"
+  else
+    say "no AAudio sink: Android audio will not pace playback"
+  fi
 else
-  say "no AAudio sink: Termux audio will not pace playback"
+  say "termux pulseaudio did not start: the source will not work"
 fi
 
 mkdir -p "$ROOTFS/root/.soloist"
@@ -230,8 +251,12 @@ case "$MODE" in
     serve_pcm
     start_soloist || say "Soloist is not up yet: give it a key (bash cabineq-soloist.sh key)"
     say "playing. In Spotify, pick CabinEQ and press play."
-    # Hold the session open: PulseAudio and Soloist are its children.
-    while true; do sleep 3600; done
+    # Hold the session open while its PulseAudio is alive. proot's PulseAudio does die on its
+    # own now and then; when it does, exit so the supervisor below replaces the whole session.
+    while true; do
+      sleep 5
+      timeout 3 pactl info >/dev/null 2>&1 || { say "pulseaudio went away: restarting the session"; exit 1; }
+    done
     ;;
   status)
     say "--- pulse"; pactl info 2>&1 | grep -E "Default Sink|Server String|Server Name"
@@ -262,8 +287,13 @@ status=0
 if [ "$MODE" = play ]; then
   # Detached: the session must outlive this shell, because PulseAudio and Soloist are its
   # children. stop kills the session.
-  setsid nohup proot-distro login debian -- bash /root/cabineq-soloist-inner.sh play "$PORT" \
-    >> /sdcard/Download/soloist-play.log 2>&1 &
+  pkill -f "while true; do proot-distro login" 2>/dev/null
+  PORT_FOR_WATCH="$PORT" LOG_FOR_WATCH=/sdcard/Download/soloist-play.log \
+  setsid nohup bash -c 'while true; do
+      proot-distro login debian -- bash /root/cabineq-soloist-inner.sh play "$PORT_FOR_WATCH" >> "$LOG_FOR_WATCH" 2>&1
+      echo "[cabineq] session ended, restarting in 3 s" >> "$LOG_FOR_WATCH"
+      sleep 3
+    done' >/dev/null 2>&1 &
   sleep 12
   say "started in the background; log: /sdcard/Download/soloist-play.log"
 else

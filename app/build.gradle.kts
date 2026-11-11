@@ -107,6 +107,15 @@ android {
             signingConfigs.findByName("cabineq")?.let { signingConfig = it }
             ndk { abiFilters += debugAbis }
         }
+        // Side-by-side test build: its own package, so it installs next to a Play-signed release
+        // (which a locally built APK can never update over). Not part of a release or CI.
+        create("solotest") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".solotest"
+            versionNameSuffix = "-solotest"
+            signingConfig = signingConfigs.getByName("debug")
+            ndk { abiFilters += listOf("arm64-v8a") }
+        }
     }
 
     compileOptions {
