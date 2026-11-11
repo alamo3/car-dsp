@@ -278,13 +278,16 @@ class FilePlayer private constructor(private val context: Context) {
         runCatching { CarVolume.sync(context) }
     }
     @Volatile private var focusPaused = false
-    /** Artist-radio seed: one more track is queued when this one becomes the last entry. */
     /** Set by the stall watchdog: the worker should recreate its AudioTrack and continue. */
     @Volatile private var rebuildOutput = false
     /** A "next" pressed at the end of the queue: jump to the track the radio is fetching. */
     @Volatile private var followNewTrack = false
     private var lastStallRebuildAt = 0L
 
+    /**
+     * Artist-radio seed. Once the queue is within [RADIO_AHEAD] songs of its end, lookups run one
+     * after another (each queues one song and starts the next) until that many are queued again.
+     */
     @Volatile private var radioSeed: Track? = null
     @Volatile private var radioBusy = false
     private val radioPool = Executors.newSingleThreadExecutor { r ->
@@ -574,6 +577,9 @@ class FilePlayer private constructor(private val context: Context) {
         if (radioSeed != null) {
             followNewTrack = true
             DLog.i(TAG, "next at the end of the queue: asking the radio for one more")
+            // The current song keeps playing while the lookup runs: say why the skip is not
+            // instant, or it looks like the button did nothing.
+            setNote("Radio is finding the next song…")
             extendRadioIfNeeded(force = true)
         } else {
             DLog.i(TAG, "next at the end of the queue: no radio for this queue, pausing")
@@ -740,9 +746,11 @@ class FilePlayer private constructor(private val context: Context) {
             if (force) DLog.i(TAG, "Radio: not asked, repeat is $repeat")
             return
         }
-        // Keep two songs queued ahead, not one: a single slow lookup then no longer decides
-        // whether the music carries on, and the song after next can be fetched early too.
-        if (!force && currentIndex < queue.lastIndex - 1) return
+        // Keep several songs queued ahead, not one or two: a lookup can take half a minute when
+        // the artist's related songs are not cached yet, and skipping through two songs is
+        // faster than that. With a deeper queue a skip lands on a song that is already there,
+        // and TorBox's look-ahead (four songs) always has radio picks to start caching.
+        if (!force && queue.lastIndex - currentIndex >= RADIO_AHEAD) return
         if (!force && state != State.PLAYING && state != State.LOADING) return
         radioBusy = true
         val gen = generation
@@ -765,7 +773,14 @@ class FilePlayer private constructor(private val context: Context) {
                     gen != generation -> "playback restarted meanwhile"
                     else -> "the queue changed meanwhile"
                 } + ")" + if (followNewTrack) ", a skip at the end was waiting on it" else "")
-                followNewTrack = false
+                if (followNewTrack) {
+                    // The skip that was waiting gets an answer instead of silence.
+                    followNewTrack = false
+                    setNote(null)
+                    lastError = "Radio couldn't find another song"
+                    lastErrorAt = SystemClock.elapsedRealtime()   // shown for a while, like a skip reason
+                    version++
+                }
                 return@execute
             }
             DLog.i(TAG, "Radio: ${if (found == null) "library fallback" else "pick"} after ${took}ms")
@@ -780,7 +795,7 @@ class FilePlayer private constructor(private val context: Context) {
                 // Playback ran dry while we were fetching: pick the new track up.
                 skipTo(queue.lastIndex)
             }
-            extendRadioIfNeeded()   // top up to two ahead
+            extendRadioIfNeeded()   // and the next lookup, until RADIO_AHEAD songs are queued
         }
     }
 
@@ -1884,6 +1899,8 @@ class FilePlayer private constructor(private val context: Context) {
     }
 
     companion object {
+        /** Songs the radio keeps queued ahead of the one playing. */
+        private const val RADIO_AHEAD = 5
         private const val ERROR_SHOWN_MS = 20_000L
         /** Ramp-in length at every (re)start; long enough to hide a step, short enough to forget. */
         private const val FADE_IN_MS = 15

@@ -723,7 +723,9 @@ class MusicActivity : Activity() {
                         onRemove = { p.removeUpcoming(entry.key) }))
                 }
             } else if (p.radioActive) {
-                box.addView(Ui.text(this, "Radio is on: the next song is picked when this one is nearly done.",
+                box.addView(Ui.text(this,
+                    if (p.radioLooking) "Radio is finding the next songs…"
+                    else "Radio is on: more songs are added as you listen.",
                     13f, Ui.TEXT_2, lines = 2).apply { setPadding(0, dp(12), 0, 0) })
             }
             val played = entries.take(current.coerceAtLeast(0))
