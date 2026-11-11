@@ -80,15 +80,30 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
 
     private val context: Context = bridge.context
     private val main = Handler(Looper.getMainLooper())
-    val sink = DspAudioSink(bridge)
+    /**
+     * The DSP sink of the player that exists now, if any. One per player, never reused: a sink
+     * holds an AudioTrack and the thread that built it, and handing the previous one to a new
+     * player is what made Media3 report "accessed on multiple threads" after stop and play.
+     */
+    @Volatile private var sinkRef: DspAudioSink? = null
+    val sink: DspAudioSink? get() = sinkRef
 
     /** What the decoder is feeding the DSP, for the status report (null before the first song). */
-    val inputDescription: String? get() = sink.inputDescription
+    val inputDescription: String? get() = sinkRef?.inputDescription
 
     // ---- main-thread state ---------------------------------------------------------------
     private var player: ExoPlayer? = null
-    /** Queue keys in playlist order: the mirror of the player's queue, for index look-ups. */
-    private val keys = ArrayList<String>()
+    /**
+     * Queue keys in playlist order, together with the player's own playlist: both are changed by
+     * the same call (see [QueueMirror]), so they cannot drift apart.
+     */
+    private val queue = QueueMirror<MediaItem>(object : QueueMirror.Playlist<MediaItem> {
+        override val itemCount: Int get() = player?.mediaItemCount ?: 0
+        override fun add(items: List<MediaItem>) { player?.addMediaItems(items) }
+        override fun removeAt(index: Int) { player?.removeMediaItem(index) }
+        override fun move(from: Int, to: Int) { player?.moveMediaItem(from, to) }
+    })
+    private val keys: List<String> get() = queue.keys
     private var lastTrack: Track? = null
     private var lastDurationMs = 0L
     private var failures = 0
@@ -179,8 +194,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         onMain()
         val p = ensurePlayer()
         lastTrack = null          // FilePlayer.play already reported what this replaces
-        keys.clear()
-        keys.addAll(queueKeys)
+        queue.loaded(queueKeys)
         cancelAllPrefetch()
         tracksByKey.clear()
         deferred.clear()
@@ -227,7 +241,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         if (ready?.play == false) p.pause() else p.play()
         Log.i(TAG, "queue: ${items.size} songs, starting at $at from ${position}ms" +
             if (ready?.play == false) ", paused" else "")
-        checkQueue("load")
+        queue.check("load", BuildConfig.DEBUG)
         startTicking()
         applyIntents()           // commands that landed while the items were being built
     }
@@ -298,15 +312,6 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         }
     }
 
-    /**
-     * The player's playlist and [keys] are two copies of one queue. Every change goes through one
-     * of the four functions below, which update both; this catches the day one is changed alone.
-     */
-    private fun checkQueue(where: String) {
-        if (!BuildConfig.DEBUG) return
-        val count = player?.mediaItemCount ?: return
-        check(keys.size == count) { "queue mirror out of step after $where: ${keys.size} keys, $count items" }
-    }
 
     fun repeat(mode: FilePlayer.Repeat) = main.post { player?.repeatMode = repeatMode(mode) }
 
@@ -319,11 +324,10 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             Log.i(TAG, "queue edit before the queue exists: ${tracks.size} songs wait for the next start")
             return@post
         }
-        val first = p.mediaItemCount
-        keys.addAll(newKeys)
-        p.addMediaItems(tracks.mapIndexed { i, t ->
+        val items = tracks.mapIndexed { i, t ->
             item(newKeys[i], t, runCatching { MediaCache.fileFor(context, t) }.getOrNull())
-        })
+        }
+        val first = queue.added(items, newKeys)
         // The queue had run out and this is what it was waiting for (the radio's next pick).
         if (p.playbackState == Player.STATE_ENDED) {
             Log.i(TAG, "queue grew after it ended: playing \"${tracks.first().title}\"")
@@ -332,7 +336,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             p.seekToDefaultPosition(first)
             p.play()
         }
-        checkQueue("added")
+        queue.check("added", BuildConfig.DEBUG)
         checkAhead()
     }
 
@@ -342,12 +346,15 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             Log.i(TAG, "remove of $index ignored: the queue is not in the player")
             return@post
         }
-        val gone = keys.removeAt(index)
+        val gone = queue.removedAt(index)
+        if (gone == null) {
+            Log.i(TAG, "remove of $index ignored: it is not in the queue mirror")
+            return@post
+        }
         tracksByKey.remove(gone)
         if (deferred.remove(gone) != null) publishWaiting()
         cancelPrefetch(gone)
-        p.removeMediaItem(index)
-        checkQueue("removed")
+        queue.check("removed", BuildConfig.DEBUG)
     }
 
     fun moved(from: Int, to: Int) = main.post {
@@ -356,9 +363,11 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             Log.i(TAG, "move $from -> $to ignored: the queue is not in the player")
             return@post
         }
-        keys.add(to, keys.removeAt(from))
-        p.moveMediaItem(from, to)
-        checkQueue("moved")
+        if (!queue.moved(from, to)) {
+            Log.i(TAG, "move $from -> $to ignored: it is not in the queue mirror")
+            return@post
+        }
+        queue.check("moved", BuildConfig.DEBUG)
     }
 
     /** The output rate may have moved (new route, or the setting): let the DSP re-plan. */
@@ -383,6 +392,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     }
 
     private fun rebuildFor(p: ExoPlayer, sourceRate: Int) {
+        val sink = sinkRef ?: return
         val want = bridge.targetRate(sourceRate)
         if (sink.outputRate == null || sink.outputRate == want) {
             sink.refreshRouteDependentParams()
@@ -412,7 +422,8 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         unregisterNetworkCallback()
         player?.release()
         player = null
-        keys.clear()
+        sinkRef = null
+        queue.cleared()
         cancelAllPrefetch()
         tracksByKey.clear()
         deferred.clear()
@@ -431,6 +442,8 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
 
     private fun ensurePlayer(): ExoPlayer {
         player?.let { return it }
+        val freshSink = DspAudioSink(bridge)
+        sinkRef = freshSink
         val renderers = object : DefaultRenderersFactory(context) {
             // The DSP is the sink itself (see DspAudioSink): float in, float out, no processor
             // chain for Media3 to skip.
@@ -438,7 +451,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                 context: Context,
                 enableFloatOutput: Boolean,
                 enableAudioTrackPlaybackParams: Boolean,
-            ): AudioSink = sink
+            ): AudioSink = freshSink
         }
         // Audio is cheap to hold: keep a minute or more buffered, and refill early, so a slow
         // stretch of road is ridden out of the buffer, not heard.
