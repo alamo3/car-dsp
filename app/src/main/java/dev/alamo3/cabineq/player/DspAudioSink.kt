@@ -54,6 +54,14 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     /** The rate the engine is running at (what reaches the AudioTrack); null before configure. */
     @Volatile var outputRate: Int? = null
         private set
+
+    /**
+     * What the decoder hands the engine, as text for the status report: a device whose decoder
+     * advertises an encoding it does not actually produce is invisible in the sound, and visible
+     * here. Null until the first stream.
+     */
+    @Volatile var inputDescription: String? = null
+        private set
     private var handle = 0L
     private var appliedEq = -1
     private var inFloat = FloatArray(0)
@@ -108,7 +116,9 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         inRate = format.sampleRate
         inEncoding = format.pcmEncoding
         inChannels = format.channelCount
-        Log.i(TAG, "in: ${format.sampleMimeType} ${inRate} Hz, ${inChannels}ch, encoding $inEncoding")
+        inputDescription = "${format.sampleMimeType} ${inRate} Hz ${inChannels}ch, " +
+            "pcm ${inEncoding}, ${Pcm.bytesPerSample(inEncoding) * 8}-bit words"
+        Log.i(TAG, "in: ${inputDescription}")
         val target = bridge.targetRate(inRate)
         rate = target
         outputRate = target

@@ -330,6 +330,9 @@ class FilePlayer private constructor(private val context: Context) {
         if (settings.media3Player) exoEngine().warmUp()
     }
 
+    /** What the decoder feeds the Media3 sink, for the status report; null on the built-in engine. */
+    val dspInputDescription: String? get() = exo?.inputDescription
+
     private fun exoEngine(): dev.alamo3.cabineq.player.ExoEngine =
         exo ?: synchronized(this) {
             exo ?: dev.alamo3.cabineq.player.ExoEngine(this, Bridge()).also { exo = it }

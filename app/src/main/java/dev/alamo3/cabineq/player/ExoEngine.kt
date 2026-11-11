@@ -75,6 +75,9 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     private val main = Handler(Looper.getMainLooper())
     val sink = DspAudioSink(bridge)
 
+    /** What the decoder is feeding the DSP, for the status report (null before the first song). */
+    val inputDescription: String? get() = sink.inputDescription
+
     // ---- main-thread state ---------------------------------------------------------------
     private var player: ExoPlayer? = null
     /** Queue keys in playlist order: the mirror of the player's queue, for index look-ups. */
