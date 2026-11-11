@@ -165,8 +165,11 @@ class MusicActivity : Activity() {
         navigate { renderHome() }
         startFromPlayFromSearch(intent)
         handleImportIntent(intent)
+        handleInstallStatus(intent)
         // A download interrupted by the app closing carries on from where it stopped.
         runCatching { Downloads.resume(this) }
+        // Copies installed from Google Play get their updates there; others check GitHub quietly.
+        if (!Updater.installedFromPlay(this)) checkForUpdate(userInitiated = false)
     }
 
     /**
@@ -178,6 +181,7 @@ class MusicActivity : Activity() {
         setIntent(intent)
         startFromPlayFromSearch(intent)
         handleImportIntent(intent)
+        handleInstallStatus(intent)
     }
 
     /** Same handling whether the activity was created by the intent or already running. */
@@ -2483,6 +2487,152 @@ class MusicActivity : Activity() {
                 renderSettings()
             }, wrapLp(top = 8))
         }
+
+        renderDebug()
+        renderAbout()
+    }
+
+    // ---------------------------------------------------------------------------------
+    // About: version and updates (moved here from the Equalizer & DSP screen)
+
+    /** What the About line says after "Version x": an update found, a check failing, progress. */
+    private var updateStatus: String? = null
+    private var pendingRelease: Updater.Release? = null
+    private var updateBusy = false
+    // The views of the Settings page currently shown, if it is; updated in place when a check or
+    // download reports, so the page does not have to be rebuilt mid-scroll.
+    private var updateTextView: TextView? = null
+    private var updatePill: TextView? = null
+
+    private fun versionLine(): String {
+        val v = "Version ${Updater.installedVersionName(this)}"
+        return when {
+            Updater.installedFromPlay(this) -> "$v — updates come from Google Play"
+            updateStatus != null -> "$v — $updateStatus"
+            else -> v
+        }
+    }
+
+    private fun updateLabel(): String = pendingRelease?.let { "Install ${it.tag}" } ?: "Check for updates"
+
+    private fun showUpdateState(status: String?) {
+        updateStatus = status
+        updateTextView?.text = versionLine()
+        updatePill?.text = updateLabel()
+        updatePill?.isEnabled = !updateBusy
+        updatePill?.alpha = if (updateBusy) 0.5f else 1f
+    }
+
+    private fun renderAbout() {
+        page.addView(sectionTitle("About"))
+        val line = Ui.text(this, versionLine(), 13f, Ui.TEXT_2, lines = 3).apply {
+            setPadding(0, 0, 0, dp(4))
+        }
+        page.addView(line)
+        updateTextView = line
+        updatePill = null
+        if (!Updater.installedFromPlay(this)) {
+            val pill = Ui.pill(this, updateLabel(), filled = false) { onUpdateButton() }
+            page.addView(pill, wrapLp(top = 8))
+            updatePill = pill
+            showUpdateState(updateStatus)
+        }
+    }
+
+    private fun onUpdateButton() {
+        if (updateBusy) return
+        val release = pendingRelease
+        if (release == null) checkForUpdate(userInitiated = true) else downloadAndInstall(release)
+    }
+
+    private fun checkForUpdate(userInitiated: Boolean) {
+        updateBusy = true
+        if (userInitiated) showUpdateState("checking for updates…")
+        Thread {
+            val result = runCatching { Updater.fetchLatest() }
+            runOnUiThread {
+                updateBusy = false
+                val installed = Updater.installedVersionCode(this)
+                val release = result.getOrNull()
+                when {
+                    result.isFailure ->
+                        showUpdateState(if (userInitiated) "update check failed: ${result.exceptionOrNull()?.message}" else updateStatus)
+                    release != null && release.versionCode > installed -> {
+                        pendingRelease = release
+                        showUpdateState("update available: ${release.tag}")
+                    }
+                    else -> {
+                        pendingRelease = null
+                        showUpdateState(if (userInitiated) "up to date" else null)
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun downloadAndInstall(release: Updater.Release) {
+        // Android needs a one-time "Install unknown apps" grant for CabinEQ.
+        if (!packageManager.canRequestPackageInstalls()) {
+            android.widget.Toast.makeText(this, "Allow CabinEQ to install apps, then tap Install again", android.widget.Toast.LENGTH_LONG).show()
+            startActivity(
+                Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, android.net.Uri.parse("package:$packageName"))
+            )
+            return
+        }
+        updateBusy = true
+        showUpdateState("downloading ${release.tag}…")
+        Thread {
+            try {
+                val apk = Updater.download(this, release) { pct ->
+                    runOnUiThread { showUpdateState(if (pct >= 0) "downloading ${release.tag}… $pct%" else "downloading ${release.tag}…") }
+                }
+                runOnUiThread { showUpdateState("installing ${release.tag}…") }
+                Updater.install(this, apk)
+            } catch (e: Exception) {
+                runOnUiThread {
+                    updateBusy = false
+                    showUpdateState("update failed: ${e.message}")
+                }
+            }
+        }.start()
+    }
+
+    private fun handleInstallStatus(intent: Intent?) {
+        if (intent?.action != Updater.ACTION_INSTALL_STATUS) return
+        val status = intent.getIntExtra(android.content.pm.PackageInstaller.EXTRA_STATUS, android.content.pm.PackageInstaller.STATUS_FAILURE)
+        when (status) {
+            android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                val confirm: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+                    intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                }
+                confirm?.let { startActivity(it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                return  // the final status arrives in another intent
+            }
+            android.content.pm.PackageInstaller.STATUS_SUCCESS -> {
+                pendingRelease = null
+                updateBusy = false
+                showUpdateState("update installed")
+            }
+            else -> {
+                val msg = intent.getStringExtra(android.content.pm.PackageInstaller.EXTRA_STATUS_MESSAGE) ?: "status $status"
+                updateBusy = false
+                showUpdateState("update failed: $msg")
+            }
+        }
+    }
+
+    private fun renderDebug() {
+        page.addView(sectionTitle("Debug"))
+        page.addView(Ui.pill(this, "Debug options: ${if (settings.debugOptions) "on" else "off"}", filled = false) {
+            settings.debugOptions = !settings.debugOptions
+            renderSettings()
+        }, wrapLp(top = 4))
+        page.addView(Ui.text(this,
+            "Shows experimental features on the Equalizer & DSP screen (Spotify via Soloist in Termux). " +
+                "They are not supported and may not work.",
+            12f, Ui.TEXT_2, lines = 3).apply { setPadding(0, dp(8), 0, dp(12)) })
     }
 
     // ---------------------------------------------------------------------------------

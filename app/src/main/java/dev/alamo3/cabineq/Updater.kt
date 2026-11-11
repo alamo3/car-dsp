@@ -114,7 +114,7 @@ object Updater {
     }
 
     /**
-     * Hands the APK to the system installer. The result comes back to MainActivity as an
+     * Hands the APK to the system installer. The result comes back to MusicActivity as an
      * intent with [ACTION_INSTALL_STATUS]; if the user has to confirm, that intent carries
      * the confirmation screen to launch.
      */
@@ -133,7 +133,7 @@ object Updater {
                 apk.inputStream().use { it.copyTo(out) }
                 session.fsync(out)
             }
-            val statusIntent = Intent(context, MainActivity::class.java)
+            val statusIntent = Intent(context, MusicActivity::class.java)
                 .setAction(ACTION_INSTALL_STATUS)
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
             // Must be mutable: the installer fills in the status extras.

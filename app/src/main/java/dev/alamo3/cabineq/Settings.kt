@@ -89,6 +89,14 @@ class Settings(context: Context) {
         get() = prefs.getFloat(KEY_SPEED_FULL, 110f)
         set(v) = prefs.edit().putFloat(KEY_SPEED_FULL, v).apply()
 
+    /**
+     * Debug options: shows experimental features on the Equalizer & DSP screen (Spotify via
+     * Soloist). Off by default; switched in Settings → Debug.
+     */
+    var debugOptions: Boolean
+        get() = prefs.getBoolean("debug_options", false)
+        set(v) = prefs.edit().putBoolean("debug_options", v).apply()
+
     /** Debug: use a slider value instead of GPS so the curve can be tested parked. */
     var simulateSpeed: Boolean
         get() = prefs.getBoolean(KEY_SIM_ON, false)
