@@ -59,6 +59,18 @@ if [ "$MODE" = key ] || { [ "$MODE" != stop ] && [ ! -s "$KEYFILE" ]; }; then
   [ "$MODE" = key ] && exit 0
 fi
 
+# Termux's own PulseAudio is the clock: it runs natively, outside proot, so its null sink
+# keeps real time. The Debian sink is slaved to it with a tunnel sink (see the inner script).
+export PULSE_RUNTIME_PATH="$PREFIX/var/run/pulse"
+mkdir -p "$PULSE_RUNTIME_PATH"
+command -v pulseaudio >/dev/null || yes | pkg install -y pulseaudio >/dev/null 2>&1
+pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1
+sleep 1
+pactl list short sinks 2>/dev/null | grep -q "\bClock\b" || pactl load-module module-null-sink sink_name=Clock >/dev/null 2>&1
+pactl set-default-sink Clock >/dev/null 2>&1
+pactl set-sink-volume Clock 100% >/dev/null 2>&1
+say "termux clock sink: $(pactl list short sinks 2>/dev/null | awk '$2=="Clock"{print $2" "$5}')"
+
 mkdir -p "$ROOTFS/root/.soloist"
 [ -s "$KEYFILE" ] && install -m 600 "$KEYFILE" "$ROOTFS/root/.soloist/key"
 
@@ -96,7 +108,7 @@ export PULSE_SERVER="unix:$XDG_RUNTIME_DIR/pulse/native"
 
 install_deps() {
   local need=""
-  for p in curl ca-certificates libatomic1 pulseaudio pulseaudio-utils dbus sox; do
+  for p in curl ca-certificates libatomic1 pulseaudio pulseaudio-utils dbus sox netcat-openbsd; do
     dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
   done
   if [ -n "$need" ]; then
@@ -122,7 +134,7 @@ write_pulse_conf() {
   cat > /root/.config/pulse/default.pa <<'EOF'
 .fail
 load-module module-native-protocol-unix socket=/tmp/cabineq-runtime/pulse/native auth-anonymous=1
-load-module module-null-sink sink_name=CabinEQ sink_properties=device.description=CabinEQ
+load-module module-tunnel-sink server=unix:/data/data/com.termux/files/usr/var/run/pulse/native sink_name=CabinEQ
 set-default-sink CabinEQ
 EOF
   # A tunnel to Termux's own PulseAudio, for testing on the phone speaker:
@@ -146,12 +158,17 @@ start_audio() {
 }
 
 serve_pcm() {
-  pactl unload-module module-simple-protocol-tcp 2>/dev/null
-  local id
-  id=$(pactl load-module module-simple-protocol-tcp \
-        source=CabinEQ.monitor rate=44100 format=s16le channels=2 \
-        port=$PORT record=true 2>&1)
-  say "serving PCM on 127.0.0.1:$PORT (module $id)"
+  # parec piped into netcat, not module-simple-protocol-tcp: that module delivered ~96% of
+  # realtime here (measured), which drains any buffer and is heard as a pause every so often.
+  # A real reader keeps up; the loop restarts it when the app reconnects.
+  pkill -f "nc -l -p $PORT" 2>/dev/null
+  pkill -x parec 2>/dev/null
+  ( while true; do
+      parec -d CabinEQ.monitor --format=s16le --rate=44100 --channels=2 --raw 2>/dev/null \
+        | nc -l -p "$PORT"
+    done ) >/dev/null 2>&1 &
+  sleep 1
+  say "serving PCM on 127.0.0.1:$PORT (parec | nc)"
 }
 
 start_soloist() {
@@ -165,6 +182,7 @@ start_soloist() {
   if pgrep -x soloist >/dev/null; then
     say "Soloist running (pid $(pgrep -x soloist | head -1))"
     grep -E "AudioDriver|PipeWire|Pulse|error|Error| E " /tmp/cabineq-soloist.log | tail -5
+    return 0
   else
     say "Soloist exited:"
     tail -20 /tmp/cabineq-soloist.log
@@ -197,12 +215,14 @@ case "$MODE" in
     say "--- pulse"; pactl info 2>&1 | grep -E "Default Sink|Server String|Server Name"
     say "--- sinks"; pactl list short sinks
     say "--- playback streams"; pactl list short sink-inputs
-    say "--- module"; pactl list short modules | grep simple-protocol || say "no PCM server loaded"
+    say "--- pcm server"; pgrep -af "nc -l -p $PORT" | head -2 || say "no PCM server running"
     say "--- soloist"; pgrep -x soloist >/dev/null && echo "running" || echo "not running"
     say "--- volume"; pactl get-sink-volume CabinEQ 2>&1 | head -1
     ;;
   stop)
     pkill -x soloist 2>/dev/null
+    pkill -f "nc -l -p $PORT" 2>/dev/null
+    pkill -x parec 2>/dev/null
     pactl unload-module module-simple-protocol-tcp 2>/dev/null
     pulseaudio --kill 2>/dev/null
     say "stopped"

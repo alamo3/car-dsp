@@ -39,9 +39,14 @@ object SoloistInput {
 
     private const val RATE = 44100          // what the PCM server sends
     private const val CHANNELS = 2
-    private const val TARGET_MS = 250        // buffer before playback starts
-    private const val MAX_MS = 800           // beyond this, the oldest audio is dropped
-    private const val BLOCK_FRAMES = 1024
+    // PulseAudio's monitor delivers in bursts: measured up to ~300 ms between arrivals, so the
+    // cushion has to sit above that or playback stutters on a clock that is fine.
+    private const val TARGET_MS = 800        // cushion before playback starts
+    private const val RESUME_MS = 500        // cushion before carrying on after a starve
+    private const val MAX_MS = 2000          // beyond this, the oldest audio is dropped
+    private const val ADAPT_MS = 20_000L     // how often the producer's average rate is measured
+    private const val OUTPUT_BUFFER_MS = 300 // AudioTrack cushion, so a late write is not a gap
+    private const val BLOCK_FRAMES = 2048
     private const val SILENCE_PAUSE_MS = 2000
     private const val LIMITER_THRESHOLD_LIN = 0.7943f   // -2 dBFS, as EqService uses
 
@@ -53,6 +58,20 @@ object SoloistInput {
 
     /** One line for the status screen: what it is doing, and at what level. */
     @Volatile private var lastPeak = 0f
+    /** Times the socket had nothing to give while playing: the cause of a pause. */
+    @Volatile private var underruns = 0
+    /** Times the AudioTrack itself ran dry — a late write, not a short supply. */
+    @Volatile private var trackUnderruns = 0
+    /** Times playback was paused because the source went silent. */
+    @Volatile private var silentPauses = 0
+    /** Times surplus audio was dropped, and how much: each drop is a jump in the music. */
+    @Volatile private var trims = 0
+    @Volatile private var trimmedMs = 0
+    /** Current rate trim, as a multiplier of [RATE]: < 1 plays slower to let the buffer fill. */
+    @Volatile private var rateTrim = 1.0
+    /** Bytes received since the last rate measurement, and when that was. */
+    private var receivedBytes = 0L
+    private var adaptAt = 0L
 
     private var reader: Thread? = null
     private var player: Thread? = null
@@ -77,8 +96,12 @@ object SoloistInput {
 
     fun describe(): String = when {
         running -> String.format(
-            java.util.Locale.US, "%s — peak %.0f dBFS", status,
+            java.util.Locale.US,
+            "%s — peak %.0f dBFS, %d ms buffered, %d underruns, %d track, %d trims, trim %.2f%%",
+            status,
             if (lastPeak > 0f) 20 * Math.log10(lastPeak.toDouble()) else -120.0,
+            bufferedBytes() * 1000 / (RATE * CHANNELS * 2),
+            underruns, trackUnderruns, trims, (rateTrim - 1.0) * 100,
         )
         else -> status
     }
@@ -97,6 +120,10 @@ object SoloistInput {
                 ?.toIntOrNull()?.takeIf { it in 44100..48000 } ?: 48000
 
             handle = NativeDsp.create(sampleRate)
+            rateTrim = 1.0
+            rateTrim = 1.0
+            receivedBytes = 0
+            adaptAt = 0L
             NativeDsp.setInputRate(handle, RATE)
             pushedBands = FloatArray(0)
             pushedPreamp = Float.NaN
@@ -121,16 +148,17 @@ object SoloistInput {
                         .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                         .build()
                 )
-                .setBufferSizeInBytes(max(trackMin, BLOCK_FRAMES * 8) * 2)
+                // 200 ms of headroom: the writes come from another thread, and a late one must
+                // not leave the AudioTrack empty (which is heard as a gap).
+                .setBufferSizeInBytes(max(trackMin, sampleRate * 8 * OUTPUT_BUFFER_MS / 1000))
                 .setTransferMode(AudioTrack.MODE_STREAM)
-                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                // Deliberately not PERFORMANCE_MODE_LOW_LATENCY: that asks for a small, fast
+                // track whose buffer is not the one requested here, and a late write then runs
+                // dry — heard as a gap. Music wants a deep buffer, not a short one.
+                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_NONE)
                 .build()
             if (track?.state != AudioTrack.STATE_INITIALIZED) throw IllegalStateException("AudioTrack not initialised")
 
-            val sock = Socket()
-            sock.connect(InetSocketAddress("127.0.0.1", port), 3000)
-            sock.tcpNoDelay = true
-            socket = sock
         } catch (e: Exception) {
             lastError = e.message ?: e.javaClass.simpleName
             status = "cannot start: $lastError"
@@ -141,10 +169,10 @@ object SoloistInput {
 
         synchronized(lock) { head = 0; count = 0 }
         running = true
-        reader = Thread({ readLoop() }, "CabinEQ-SoloistIn").apply { start() }
+        // The socket is connected on the reader thread: a socket open on the main thread throws
+        // NetworkOnMainThreadException, and a slow connect must not freeze the screen either.
+        reader = Thread({ connectAndRead(port) }, "CabinEQ-SoloistIn").apply { start() }
         player = Thread({ playLoop() }, "CabinEQ-SoloistOut").apply { start() }
-        status = "connected, waiting for audio"
-        DLog.i(TAG, "connected to 127.0.0.1:$port, engine at $sampleRate Hz from ${RATE} Hz")
         return true
     }
 
@@ -183,10 +211,20 @@ object SoloistInput {
 
     // ---------------------------------------------------------------- the socket reader
 
-    private fun readLoop() {
-        val sock = socket ?: return
+    private fun connectAndRead(port: Int) {
+        val sock = Socket()
+        // Published before connecting, so stop() can close it and abort a connect that hangs.
+        socket = sock
         val buf = ByteArray(16 * 1024)
         try {
+            sock.connect(InetSocketAddress("127.0.0.1", port), 3000)
+            sock.tcpNoDelay = true
+            status = "connected, waiting for audio"
+            DLog.i(
+                TAG,
+                "connected to 127.0.0.1:$port, engine at $sampleRate Hz from ${RATE} Hz, " +
+                    "track buffer ${track?.bufferSizeInFrames ?: 0} frames",
+            )
             val input = sock.getInputStream()
             while (running) {
                 val n = input.read(buf)
@@ -200,14 +238,17 @@ object SoloistInput {
         } catch (e: Exception) {
             if (running) {
                 lastError = e.message ?: e.javaClass.simpleName
-                status = "read failed: $lastError"
-                DLog.w(TAG, "read failed: $lastError")
+                status = "cannot connect: $lastError"
+                DLog.w(TAG, "cannot connect: $lastError")
             }
+        } finally {
+            runCatching { sock.close() }
         }
     }
 
     private fun put(src: ByteArray, len: Int) {
         if (len <= 0) return
+        receivedBytes += len
         synchronized(lock) {
             val maxBytes = RATE * CHANNELS * 2 * MAX_MS / 1000
             if (count + len > maxBytes) {
@@ -237,10 +278,16 @@ object SoloistInput {
         }
     }
 
-    private fun take(dst: ByteArray, len: Int): Int {
+    /**
+     * Up to [dst].size bytes of whole frames — not exactly that many. Demanding a full block
+     * turned every partial arrival into a "starved" buffer and a stall.
+     */
+    private fun takeUpTo(dst: ByteArray, len: Int): Int {
         synchronized(lock) {
-            if (count < len) return 0
-            var left = len
+            val frame = CHANNELS * 2
+            val want = min(len, count / frame * frame)
+            if (want <= 0) return 0
+            var left = want
             var off = 0
             while (left > 0) {
                 val n = min(left, ring.size - head)
@@ -249,8 +296,8 @@ object SoloistInput {
                 off += n
                 left -= n
             }
-            count -= len
-            return len
+            count -= want
+            return want
         }
     }
 
@@ -268,17 +315,38 @@ object SoloistInput {
         var played = false
         var silentMs = 0
         var sinceParams = 0L
+        // True while the jitter buffer has the cushion it needs. Waiting for it on *every*
+        // block (as this did) turns any dip in the socket stream into a stall until the buffer
+        // is full again — heard as a pause every so often.
+        var primed = false
+        var everPlayed = false
+        // After a starve, resume as soon as there is a little audio: a full cushion here is a
+        // second, deliberate pause.
+        val resumeBytes = RATE * CHANNELS * 2 * RESUME_MS / 1000
 
         try {
             while (running) {
-                // Wait for the jitter buffer to fill, without blocking a stop.
-                synchronized(lock) {
-                    while (running && count < targetBytes) lock.wait(50)
+                if (!primed) {
+                    val need = if (everPlayed) resumeBytes else targetBytes
+                    synchronized(lock) {
+                        val until = SystemClock.elapsedRealtime() + 600
+                        while (running && count < need && SystemClock.elapsedRealtime() < until) lock.wait(50)
+                        primed = count > 0
+                    }
                     if (!running) break
+                    if (!primed) continue
                 }
 
-                val got = take(pcm, pcm.size)
-                if (got == 0) continue
+                val got = takeUpTo(pcm, pcm.size)
+                if (got == 0) {
+                    // Starved: fill the cushion again before carrying on, and say so.
+                    primed = false
+                    if (everPlayed) {
+                        underruns++
+                        if (underruns <= 5) DLog.w(TAG, "buffer underrun #$underruns")
+                    }
+                    continue
+                }
                 val frames = got / (CHANNELS * 2)
                 if (frames == 0) continue
 
@@ -286,6 +354,38 @@ object SoloistInput {
                 if (now - sinceParams > 500) {
                     sinceParams = now
                     pushParams(force = false)
+                }
+                // The producer is not exactly realtime: measured 96-99% depending on where the
+                // sink's clock lives. Rather than let any mismatch drain the buffer (heard as a
+                // pause), steer the engine's input rate so the level sits at the target. A
+                // percent of pitch is inaudible; a pause is not. The resampler restarts on each
+                // change, so a short fade hides the step.
+                // Steer by the producer's *average* rate, not by the buffer level: the buffer
+                // swings by up to 300 ms as PulseAudio delivers in bursts, and chasing that made
+                // a feedback loop that hunted (53 ms to 735 ms) instead of settling.
+                if (played && now - adaptAt > ADAPT_MS) {
+                    val elapsed = now - adaptAt
+                    val bytes = receivedBytes
+                    receivedBytes = 0
+                    adaptAt = now
+                    val measured = bytes * 1000.0 / elapsed / (CHANNELS * 2)   // frames per second
+                    // A window that saw a startup burst (the socket hands over a backlog at
+                    // once) averages absurdly high; acting on that sped playback up 2% and
+                    // caused the very underruns this is meant to prevent. Implausible windows
+                    // are discarded.
+                    if (measured in RATE * 0.90..RATE * 1.10) {
+                        val wanted = measured / RATE
+                        if (kotlin.math.abs(wanted - rateTrim) > 0.005) {
+                            rateTrim = wanted
+                            NativeDsp.setInputRate(handle, (RATE * rateTrim).toInt())
+                            NativeDsp.fadeIn(handle, sampleRate * 5 / 1000)
+                            DLog.i(
+                                TAG,
+                                "producer averaged ${measured.toInt()} Hz: engine input " +
+                                    "${(RATE * rateTrim).toInt()} Hz, ${bufferedBytes() * 1000 / (RATE * CHANNELS * 2)} ms buffered",
+                            )
+                        }
+                    }
                 }
 
                 val bb = ByteBuffer.wrap(pcm, 0, got).order(ByteOrder.LITTLE_ENDIAN)
@@ -299,6 +399,13 @@ object SoloistInput {
                 lastPeak = peak
                 if (peak > 0f) {
                     silentMs = 0
+                    everPlayed = true
+                    if (adaptAt == 0L) {
+                        // Start measuring only once audio is flowing: the connection's first
+                        // seconds are a burst, not a rate.
+                        adaptAt = SystemClock.elapsedRealtime()
+                        receivedBytes = 0
+                    }
                     if (!played) {
                         out.play()
                         played = true
@@ -310,6 +417,7 @@ object SoloistInput {
                         out.pause()
                         out.flush()
                         played = false
+                        silentPauses++
                         status = "silent (Spotify not playing?)"
                     }
                 }
@@ -321,6 +429,11 @@ object SoloistInput {
                 if (processed.size < cap * 2) continue
                 val n = NativeDsp.process(h, floats, frames, processed, cap)
                 if (n > 0) out.write(processed, 0, n * 2, AudioTrack.WRITE_BLOCKING)
+                val trackUnder = out.underrunCount
+                if (trackUnder > trackUnderruns) {
+                    if (trackUnderruns == 0) DLog.w(TAG, "AudioTrack underrun (track $trackUnder)")
+                    trackUnderruns = trackUnder
+                }
                 trimIfBehind(targetBytes)
             }
         } catch (e: Exception) {
@@ -338,12 +451,16 @@ object SoloistInput {
     /** If the phone's clock fell behind, throw away the surplus instead of letting it grow. */
     private fun trimIfBehind(targetBytes: Int) {
         val maxBytes = RATE * CHANNELS * 2 * MAX_MS / 1000
+        val drop: Int
         synchronized(lock) {
             if (count <= maxBytes) return
-            val drop = count - targetBytes
+            drop = count - targetBytes
             head = (head + drop) % ring.size
             count -= drop
         }
+        trims++
+        trimmedMs += drop * 1000 / (RATE * CHANNELS * 2)
+        if (trims <= 5) DLog.w(TAG, "dropped ${drop * 1000 / (RATE * CHANNELS * 2)} ms of surplus audio")
     }
 
     private fun pushParams(force: Boolean) {
