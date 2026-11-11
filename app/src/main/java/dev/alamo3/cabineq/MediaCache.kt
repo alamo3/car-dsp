@@ -3,7 +3,6 @@ package dev.alamo3.cabineq
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import android.util.Log
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -77,12 +76,12 @@ object MediaCache {
         // asked for. With that engine on, its cache is the only one doing the caching.
         if (settings.media3Player) return
         if (settings.cacheWifiOnly && !onUnmeteredNetwork(app)) {
-            Log.i(TAG, "skip ${track.title}: not on Wi-Fi and Wi-Fi-only is set")
+            DLog.i(TAG, "skip ${track.title}: not on Wi-Fi and Wi-Fi-only is set")
             return
         }
         if (fileFor(app, track) != null) return
         if (app.cacheDir.usableSpace < MIN_FREE_BYTES) {
-            Log.i(TAG, "skip ${track.title}: only ${app.cacheDir.usableSpace / 1024 / 1024} MB free")
+            DLog.i(TAG, "skip ${track.title}: only ${app.cacheDir.usableSpace / 1024 / 1024} MB free")
             return
         }
         val key = track.mediaId
@@ -94,14 +93,14 @@ object MediaCache {
                     TrackResolver.resolve(app, track, { }, { false }, waitMs).url
                 }.getOrNull()
                 if (resolvedUrl == null) {
-                    Log.i(TAG, "skip ${track.title}: no stream URL")
+                    DLog.i(TAG, "skip ${track.title}: no stream URL")
                     return@execute
                 }
                 // Someone (the player) may have started this song while the link was resolving.
                 val mine = register(app, track, resolvedUrl) ?: return@execute
                 runDownload(app, track, mine)
             } catch (e: Exception) {
-                Log.w(TAG, "prefetch ${track.title} failed: ${e.javaClass.simpleName}: ${e.message}")
+                DLog.w(TAG, "prefetch ${track.title} failed: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 synchronized(inFlight) { inFlight.remove(key) }
             }
@@ -148,7 +147,7 @@ object MediaCache {
                 refreshUrl = {
                     runCatching { TrackResolver.resolve(app, track, { }, { false }, 20_000L).url }.getOrNull()
                 },
-                log = { Log.i(TAG, it) },
+                log = { DLog.i(TAG, it) },
             )
             active[track.mediaId] = download
             return download
@@ -159,7 +158,7 @@ object MediaCache {
         try {
             download.run()
             if (download.isFinished) {
-                Log.i(TAG, "cached \"${track.title}\" (${download.written / 1024} kB)")
+                DLog.i(TAG, "cached \"${track.title}\" (${download.written / 1024} kB)")
                 trim(app, Settings(app).cacheMaxMb.toLong() * 1024 * 1024)
             }
         } finally {
@@ -204,12 +203,12 @@ object MediaCache {
             }
             val code = conn.responseCode
             if (code !in 200..299) {
-                Log.i(TAG, "prefetch $label: HTTP $code")
+                DLog.i(TAG, "prefetch $label: HTTP $code")
                 return 0L
             }
             val expected = conn.contentLengthLong
             if (expected > 0 && expected > max) {
-                Log.i(TAG, "skip $label: ${expected / 1024 / 1024} MB exceeds the ${max / 1024 / 1024} MB cap")
+                DLog.i(TAG, "skip $label: ${expected / 1024 / 1024} MB exceeds the ${max / 1024 / 1024} MB cap")
                 return 0L
             }
             var written = 0L
@@ -260,7 +259,7 @@ object MediaCache {
             total -= f.length()
             f.delete()
         }
-        Log.i(TAG, "trimmed cache to ${total / 1024 / 1024} MB (cap ${max / 1024 / 1024} MB)")
+        DLog.i(TAG, "trimmed cache to ${total / 1024 / 1024} MB (cap ${max / 1024 / 1024} MB)")
     }
 
     /** True when the active network can actually reach the internet (not just connected to a router). */

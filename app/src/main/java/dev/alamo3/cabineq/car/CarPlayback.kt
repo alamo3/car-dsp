@@ -1,8 +1,8 @@
 package dev.alamo3.cabineq.car
 
+import dev.alamo3.cabineq.DLog
 import android.content.Context
 import android.content.Intent
-import android.util.Log
 import dev.alamo3.cabineq.EqService
 import dev.alamo3.cabineq.FilePlayer
 import dev.alamo3.cabineq.MediaBrowse
@@ -44,7 +44,7 @@ object CarPlayback {
         if (tracks.isEmpty()) return
         val app = context.applicationContext
         val start = index.coerceIn(0, tracks.lastIndex)
-        Log.i(
+        DLog.i(
             TAG,
             "playTracks: ${tracks.size} tracks, index=$start, title=$title, first=${tracks[start].title}" +
                 " (source=${tracks[start].source} id=${tracks[start].sourceId}" +
@@ -60,7 +60,7 @@ object CarPlayback {
                     Intent(app, EqService::class.java).setAction(EqService.ACTION_PLAYER_ATTACH)
                 )
             }.onFailure {
-                Log.w(TAG, "Couldn't attach the EQ service: ${it.javaClass.simpleName}: ${it.message}")
+                DLog.w(TAG, "Couldn't attach the EQ service: ${it.javaClass.simpleName}: ${it.message}")
             }
             onStarted?.let { started -> main.post { runCatching(started) } }
         }
@@ -83,7 +83,7 @@ object CarPlayback {
         val app = context.applicationContext
         executor.execute {
             val spec = runCatching { MediaBrowse.playback(app, mediaId) }.getOrElse {
-                Log.w(TAG, "Can't resolve $mediaId: ${it.message}")
+                DLog.w(TAG, "Can't resolve $mediaId: ${it.message}")
                 null
             } ?: return@execute
             FilePlayer.get(app).play(spec.tracks, spec.index, spec.title)
@@ -92,7 +92,7 @@ object CarPlayback {
                     Intent(app, EqService::class.java).setAction(EqService.ACTION_PLAYER_ATTACH)
                 )
             }.onFailure {
-                Log.w(TAG, "Couldn't attach the EQ service: ${it.javaClass.simpleName}: ${it.message}")
+                DLog.w(TAG, "Couldn't attach the EQ service: ${it.javaClass.simpleName}: ${it.message}")
             }
             // Navigate on the main thread: callers use this to open the playback screen.
             onStarted?.let { started -> main.post { runCatching(started) } }
@@ -112,13 +112,13 @@ object CarPlayback {
         executor.execute {
             val player = FilePlayer.get(app)
             if (player.userPaused) {
-                Log.i("CabinEQ/CarPlay", "Not resuming: playback was paused by the user")
+                DLog.i("CabinEQ/CarPlay", "Not resuming: playback was paused by the user")
                 return@execute
             }
             val resumable = player.state == FilePlayer.State.PAUSED ||
                 (player.state == FilePlayer.State.IDLE && player.queue.isNotEmpty() && player.positionMs > 0)
             if (!resumable) return@execute
-            Log.i("CabinEQ/CarPlay", "Resuming on connect at ${player.positionMs} ms")
+            DLog.i("CabinEQ/CarPlay", "Resuming on connect at ${player.positionMs} ms")
             player.resume()
         }
     }
@@ -131,7 +131,7 @@ object CarPlayback {
                 Intent(app, EqService::class.java).setAction(EqService.ACTION_PLAYER_ATTACH)
             )
         }.onFailure {
-            Log.w(TAG, "ensureService failed: ${it.javaClass.simpleName}: ${it.message}")
+            DLog.w(TAG, "ensureService failed: ${it.javaClass.simpleName}: ${it.message}")
         }
     }
 }

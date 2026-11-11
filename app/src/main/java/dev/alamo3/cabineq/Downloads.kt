@@ -3,7 +3,6 @@ package dev.alamo3.cabineq
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -162,15 +161,15 @@ object Downloads {
             // Already prefetched for playback: keep that copy instead of downloading it again.
             val cached = MediaCache.cacheFileFor(app, track)
             if (cached != null && runCatching { cached.copyTo(target, overwrite = true) }.isSuccess) {
-                Log.i(TAG, "kept cached \"${track.title}\"")
+                DLog.i(TAG, "kept cached \"${track.title}\"")
                 return
             }
             val url = TrackResolver.resolve(app, track, { }, { false }, RESOLVE_WAIT_MS).url
             val size = MediaCache.downloadTo(target, url, MAX_FILE_BYTES, track.title)
-            if (size > 0) Log.i(TAG, "downloaded \"${track.title}\" (${size / 1024} kB)")
+            if (size > 0) DLog.i(TAG, "downloaded \"${track.title}\" (${size / 1024} kB)")
             else synchronized(lock) { failed[track.mediaId] = "Couldn't download “${track.title}”" }
         } catch (e: Exception) {
-            Log.w(TAG, "download ${track.title} failed: ${e.javaClass.simpleName}: ${e.message}")
+            DLog.w(TAG, "download ${track.title} failed: ${e.javaClass.simpleName}: ${e.message}")
             synchronized(lock) { failed[track.mediaId] = e.message?.takeIf { it.length < 120 } ?: "Couldn't download “${track.title}”" }
         } finally {
             synchronized(lock) { queued.remove(track.mediaId) }
@@ -211,7 +210,7 @@ object Downloads {
                     tracks = list,
                 )
             }
-        }.onFailure { Log.w(TAG, "Couldn't read the downloads index: ${it.message}") }
+        }.onFailure { DLog.w(TAG, "Couldn't read the downloads index: ${it.message}") }
         loaded = out
         return out
     }
@@ -229,6 +228,6 @@ object Downloads {
         runCatching {
             tmp.writeText(JSONObject().put("collections", arr).toString())
             if (!tmp.renameTo(f)) { f.writeText(tmp.readText()); tmp.delete() }
-        }.onFailure { Log.w(TAG, "Couldn't save the downloads index: ${it.message}") }
+        }.onFailure { DLog.w(TAG, "Couldn't save the downloads index: ${it.message}") }
     }
 }

@@ -2,9 +2,9 @@
 
 package dev.alamo3.cabineq.player
 
+import dev.alamo3.cabineq.DLog
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
-import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -130,7 +130,7 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     override fun configure(format: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
         if (format.sampleMimeType != MimeTypes.AUDIO_RAW) {
             // Should be unreachable (supportsFormat refuses these): say so rather than play noise.
-            Log.e(TAG, "compressed format reached the sink: ${format.sampleMimeType}; it cannot be processed")
+            DLog.e(TAG, "compressed format reached the sink: ${format.sampleMimeType}; it cannot be processed")
         }
         inRate = format.sampleRate
         inEncoding = format.pcmEncoding
@@ -139,7 +139,7 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         described = false
         inputDescription = "${format.sampleMimeType} ${inRate} Hz ${inChannels}ch, " +
             "declared ${Pcm.name(inEncoding)}"
-        Log.i(TAG, "in: ${inputDescription}")
+        DLog.i(TAG, "in: ${inputDescription}")
         val target = bridge.targetRate(inRate)
         rate = target
         outputRate = target
@@ -170,13 +170,13 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         if (handle == 0L || engineRate != rate) {
             if (handle != 0L) NativeDsp.destroy(handle)
             handle = runCatching { NativeDsp.create(rate) }.getOrElse { e ->
-                Log.e(TAG, "could not create the DSP engine at $rate Hz: ${e.message}")
+                DLog.e(TAG, "could not create the DSP engine at $rate Hz: ${e.message}")
                 bridge.error("DSP unavailable")
                 0L
             }
             engineRate = rate
             appliedEq = -1
-            Log.i(TAG, if (inRate == rate) "engine at $rate Hz" else "engine at $rate Hz, resampling from $inRate Hz")
+            DLog.i(TAG, if (inRate == rate) "engine at $rate Hz" else "engine at $rate Hz, resampling from $inRate Hz")
         }
         if (handle == 0L) return
         if (reset) {
@@ -247,7 +247,7 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         // was refused — and goes through the engine as usual.
         if (!buffer.hasRemaining()) return true
         if (inChannels <= 0) {
-            Log.e(TAG, "buffer with $inChannels channels: dropped")
+            DLog.e(TAG, "buffer with $inChannels channels: dropped")
             buffer.position(buffer.limit())
             return true
         }
@@ -259,7 +259,7 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         val frames = buffer.remaining() / frameBytes
         if (!described) {
             described = true
-            Log.i(TAG, "stream: ${Pcm.name(inEncoding)} declared, ${Pcm.name(readEncoding)} read, ${frames}f first")
+            DLog.i(TAG, "stream: ${Pcm.name(inEncoding)} declared, ${Pcm.name(readEncoding)} read, ${frames}f first")
         }
         var out: ByteBuffer? = null
         if (frames > 0) {

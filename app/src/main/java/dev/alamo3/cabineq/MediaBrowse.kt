@@ -7,7 +7,6 @@ import android.media.browse.MediaBrowser
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
-import android.util.Log
 import androidx.media.utils.MediaConstants
 import dev.alamo3.cabineq.addon.EclipseAddon
 import dev.alamo3.cabineq.torbox.AudioPicker
@@ -113,7 +112,7 @@ object MediaBrowse {
         if (query.isBlank()) return emptyList()
         val addon = addon(context) ?: return emptyList()
         val results = runCatching { smartSearch(context, addon, query).results }.getOrElse {
-            Log.w(TAG, "Search \"$query\" failed: ${it.message}")
+            DLog.w(TAG, "Search \"$query\" failed: ${it.message}")
             return emptyList()
         }
         val parentId = SEARCH + Uri.encode(query)
@@ -223,7 +222,7 @@ object MediaBrowse {
             val found = runCatching { smartSearch(context, addon, attempt.text) }.getOrNull() ?: continue
             val play = playbackFor(context, addon, attempt, found) ?: continue
             if (confident(attempt, found)) {
-                Log.i(TAG, "voice: \"${request.query.take(40)}\" played as \"${attempt.text.take(40)}\" (${attempt.expect})")
+                DLog.i(TAG, "voice: \"${request.query.take(40)}\" played as \"${attempt.text.take(40)}\" (${attempt.expect})")
                 return play
             }
             if (fallback == null) fallback = play

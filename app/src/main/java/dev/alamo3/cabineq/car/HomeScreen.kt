@@ -1,5 +1,6 @@
 package dev.alamo3.cabineq.car
 
+import dev.alamo3.cabineq.DLog
 import android.content.Context
 import android.net.Uri
 import android.os.Handler
@@ -173,7 +174,7 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         // template, the log says whether we were asked at all.
         if (System.currentTimeMillis() - lastLoggedAt > 2000) {
             lastLoggedAt = System.currentTimeMillis()
-            android.util.Log.i("CabinEQ/CarApp", "HomeScreen.onGetTemplate")
+            DLog.i("CabinEQ/CarApp", "HomeScreen.onGetTemplate")
         }
         CarMediaBridge.register(carContext)
         // The session is created asynchronously by EqService; retry a few times, then stop.

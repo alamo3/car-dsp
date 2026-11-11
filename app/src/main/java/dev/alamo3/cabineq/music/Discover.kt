@@ -1,6 +1,6 @@
 package dev.alamo3.cabineq.music
 
-import android.util.Log
+import dev.alamo3.cabineq.DLog
 import dev.alamo3.cabineq.Track
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -146,18 +146,18 @@ object Discover {
                 setRequestProperty("Accept", "application/json")
             }
             if (conn.responseCode !in 200..299) {
-                Log.w(TAG, "GET $path -> HTTP ${conn.responseCode}")
+                DLog.w(TAG, "GET $path -> HTTP ${conn.responseCode}")
                 return null
             }
             val o = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
             // Deezer reports errors (quota, bad id) as 200 with an "error" object.
             o.optJSONObject("error")?.let {
-                Log.w(TAG, "GET $path -> ${it.optString("type")}: ${it.optString("message")}")
+                DLog.w(TAG, "GET $path -> ${it.optString("type")}: ${it.optString("message")}")
                 return null
             }
             o
         } catch (e: Exception) {
-            Log.w(TAG, "GET $path failed: ${e.javaClass.simpleName}: ${e.message}")
+            DLog.w(TAG, "GET $path failed: ${e.javaClass.simpleName}: ${e.message}")
             null
         } finally {
             conn?.disconnect()

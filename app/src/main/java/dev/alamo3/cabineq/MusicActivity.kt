@@ -151,6 +151,7 @@ class MusicActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Diag.init(this)
         settings = Settings(this)
         window.decorView.setBackgroundColor(Ui.BG)
         if (Build.VERSION.SDK_INT >= 30) {
@@ -2365,6 +2366,25 @@ class MusicActivity : Activity() {
         page.addView(Ui.text(this,
             "When the queue runs out, keep going with radio picks based on its last song, whether it was a playlist, an album or a shelf. " +
                 "Off: the music stops at the end of the queue (a radio you start from a song still keeps going). Applies from the next thing you play.",
+            12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, dp(12)) })
+        page.addView(Ui.pill(this, "Send playback diagnostics: ${if (settings.diagnosticsEnabled) "on" else "off"}", filled = false) {
+            Diag.setEnabled(this, !settings.diagnosticsEnabled)
+            renderSettings()
+        }, wrapLp(top = 4))
+        if (settings.diagnosticsEnabled) {
+            page.addView(Ui.pill(this, "Copy diagnostics link", filled = false) {
+                val cm = getSystemService(android.content.ClipboardManager::class.java)
+                cm?.setPrimaryClip(android.content.ClipData.newPlainText("CabinEQ diagnostics", Diag.link(this)))
+                showMessage("Diagnostics link copied")
+            }, wrapLp(top = 4))
+            page.addView(Ui.pill(this, "Delete sent diagnostics", filled = false) {
+                Diag.clear(this)
+                showMessage("Sent diagnostics deleted")
+            }, wrapLp(top = 4))
+        }
+        page.addView(Ui.text(this,
+            "Playback events (songs started, skips, radio lookups, errors) go to the app's own database so problems in the car can be looked at later. " +
+                "Song titles and artists are included; links and your TorBox key never are. Only someone with your link can read them.",
             12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, dp(12)) })
         page.addView(Ui.pill(this, "Play while downloading: ${if (settings.progressivePlayback) "on" else "off"}", filled = false) {
             settings.progressivePlayback = !settings.progressivePlayback

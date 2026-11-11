@@ -19,7 +19,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Process
 import android.os.SystemClock
-import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
@@ -141,7 +140,7 @@ class FilePlayer private constructor(private val context: Context) {
         positionMs = snap.positionMs
         durationMs = snap.tracks.getOrNull(snap.index)?.durationMs ?: 0
         version++
-        Log.i(TAG, "Restored ${snap.tracks.size} tracks at ${snap.index}, ${snap.positionMs} ms")
+        DLog.i(TAG, "Restored ${snap.tracks.size} tracks at ${snap.index}, ${snap.positionMs} ms")
     }
 
     /** Advances OFF -> ALL -> ONE -> OFF (the phone's repeat button). */
@@ -194,7 +193,7 @@ class FilePlayer private constructor(private val context: Context) {
             routeEpoch++
             if (exoActive) exo?.routeChanged()
             runCatching { refreshRouteDependentParams() }
-            Log.i(TAG, "device mixes at $r Hz")
+            DLog.i(TAG, "device mixes at $r Hz")
             runCatching { CarVolume.sync(context) }
         }
     }
@@ -212,7 +211,7 @@ class FilePlayer private constructor(private val context: Context) {
             }
             val receiver = object : android.content.BroadcastReceiver() {
                 override fun onReceive(c: Context, intent: android.content.Intent) {
-                    Log.i(TAG, "car mode: ${intent.action}")
+                    DLog.i(TAG, "car mode: ${intent.action}")
                     runCatching { CarVolume.sync(c) }
                 }
             }
@@ -250,6 +249,7 @@ class FilePlayer private constructor(private val context: Context) {
         private set
 
     init {
+        Diag.init(context)
         repeat = runCatching { Repeat.valueOf(settings.repeatMode) }.getOrDefault(Repeat.OFF)
         restoreQueue()
         // The mix rate follows the route (speaker 48k, a USB DAC maybe 96k, BT often 44.1),
@@ -418,7 +418,7 @@ class FilePlayer private constructor(private val context: Context) {
         if (wasPlaying != null && !restarting &&
             (state == State.PLAYING || state == State.PAUSED || state == State.LOADING)
         ) {
-            Log.i(TAG, "play() replaces ${wasPlaying.title} at ${positionMs}ms (state=$state) — counted as a skip")
+            DLog.i(TAG, "play() replaces ${wasPlaying.title} at ${positionMs}ms (state=$state) — counted as a skip")
             Taste.onSkip(context, wasPlaying, positionMs, durationMs)
         }
         stopWorker()
@@ -442,6 +442,13 @@ class FilePlayer private constructor(private val context: Context) {
         } else null
         radioSeed = seed
         persistPool.execute { runCatching { settings.radioSeed = seed } }
+        DLog.i(TAG, "play \"${title ?: ""}\": ${tracks.size} songs from #$startIndex, radio ${
+            when {
+                radio != null -> "started from \"${radio.title}\" (${radio.artist})"
+                seed != null -> "at the end from \"${seed.title}\" (${seed.artist})"
+                else -> "off (endless playback ${if (settings.endlessPlayback) "on" else "off"})"
+            }
+        }")
         lastError = null
         userPaused = false
         focusPaused = false
@@ -479,7 +486,7 @@ class FilePlayer private constructor(private val context: Context) {
         val begin = {
             if (gen != generation) Unit
             else {
-                Log.i(TAG, "play: ${tracks.size} tracks from $startIndex at ${startAtMs}ms, title=$title")
+                DLog.i(TAG, "play: ${tracks.size} tracks from $startIndex at ${startAtMs}ms, title=$title")
                 thread = Thread(worker, "CabinEQ-Player").apply { start() }
             }
         }
@@ -488,7 +495,7 @@ class FilePlayer private constructor(private val context: Context) {
         } else {
             // A momentary refusal (the car host or a nav prompt shuffling focus) must not turn a
             // tap into "nothing happens": retry briefly, then start when focus is granted.
-            Log.w(TAG, "play: focus refused, retrying (${tracks.size} tracks, index=$startIndex)")
+            DLog.w(TAG, "play: focus refused, retrying (${tracks.size} tracks, index=$startIndex)")
             requestFocusForUser { begin() }
         }
     }
@@ -527,7 +534,7 @@ class FilePlayer private constructor(private val context: Context) {
         userPaused = false
         focusPaused = false
         requestFocusForUser {
-            Log.i(TAG, "resume: focus granted")
+            DLog.i(TAG, "resume: focus granted")
             if (state == State.PAUSED) setState(State.PLAYING, "resume")
         }
     }
@@ -547,9 +554,10 @@ class FilePlayer private constructor(private val context: Context) {
         // follow it when it lands; without a seed just pause, keeping the queue and the session.
         if (radioSeed != null) {
             followNewTrack = true
-            Log.i(TAG, "next at the end of the queue: asking the radio for one more")
+            DLog.i(TAG, "next at the end of the queue: asking the radio for one more")
             extendRadioIfNeeded(force = true)
         } else {
+            DLog.i(TAG, "next at the end of the queue: no radio for this queue, pausing")
             pause()
         }
     }
@@ -585,7 +593,7 @@ class FilePlayer private constructor(private val context: Context) {
                     if (genAtTap == generation && jumpTo == index && state == State.LOADING &&
                         index in queue.indices
                     ) {
-                        Log.w(TAG, "skip to $index not picked up in ${SKIP_PICKUP_MS}ms (worker busy opening a stream): starting a fresh worker")
+                        DLog.w(TAG, "skip to $index not picked up in ${SKIP_PICKUP_MS}ms (worker busy opening a stream): starting a fresh worker")
                         play(queue, index, queueTitle, radio = radioSeed)
                     }
                 }, SKIP_PICKUP_MS)
@@ -705,27 +713,44 @@ class FilePlayer private constructor(private val context: Context) {
      */
     private fun extendRadioIfNeeded(force: Boolean = false) {
         val seed = radioSeed ?: return
-        if (radioBusy) return
-        if (repeat != Repeat.OFF) return                   // looping is the user's chosen queue
+        if (radioBusy) {
+            if (force) DLog.i(TAG, "Radio: asked again while a lookup is still running")
+            return
+        }
+        if (repeat != Repeat.OFF) {                        // looping is the user's chosen queue
+            if (force) DLog.i(TAG, "Radio: not asked, repeat is $repeat")
+            return
+        }
         // Keep two songs queued ahead, not one: a single slow lookup then no longer decides
         // whether the music carries on, and the song after next can be fetched early too.
         if (!force && currentIndex < queue.lastIndex - 1) return
         if (!force && state != State.PLAYING && state != State.LOADING) return
         radioBusy = true
         val gen = generation
+        val askedAt = SystemClock.elapsedRealtime()
+        DLog.i(TAG, "Radio: looking${if (force) " (asked)" else ""} from \"${seed.title}\" (${seed.artist}), at ${currentIndex + 1} of ${queue.size}")
         radioPool.execute {
             val queued = runCatching { queuedTracks() }.getOrDefault(emptyList())
             val exclude = queued.flatMap { Radio.identity(it.track) }.toHashSet()
             val session = queued.takeLast(5).mapNotNull { it.track.artist?.trim()?.lowercase() }.toSet()
             val currentArtist = queued.getOrNull(currentIndex)?.track?.artist
-            val next = runCatching { Radio.next(context, seed, exclude, session, currentArtist) }.getOrNull()
-                ?: localFallback(exclude, queued.getOrNull(currentIndex)?.track)
+            val found = runCatching { Radio.next(context, seed, exclude, session, currentArtist) }
+                .onFailure { DLog.w(TAG, "Radio: lookup failed", it) }
+                .getOrNull()
+            val next = found ?: localFallback(exclude, queued.getOrNull(currentIndex)?.track)
             radioBusy = false
+            val took = SystemClock.elapsedRealtime() - askedAt
             if (next == null || gen != generation || radioSeed !== seed) {
+                DLog.w(TAG, "Radio: nothing queued after ${took}ms (" + when {
+                    next == null -> "no pick, and nothing in the library to fall back on"
+                    gen != generation -> "playback restarted meanwhile"
+                    else -> "the queue changed meanwhile"
+                } + ")" + if (followNewTrack) ", a skip at the end was waiting on it" else "")
                 followNewTrack = false
                 return@execute
             }
-            Log.i(TAG, "Radio: queuing \"${next.title}\" — ${next.artist}")
+            DLog.i(TAG, "Radio: ${if (found == null) "library fallback" else "pick"} after ${took}ms")
+            DLog.i(TAG, "Radio: queuing \"${next.title}\" — ${next.artist}")
             enqueue(listOf(next))
             if (!exoActive) MediaCache.prefetch(context, next)
             if (followNewTrack) {
@@ -758,7 +783,7 @@ class FilePlayer private constructor(private val context: Context) {
             val freshIds = fresh.map { it.mediaId }.toSet()
             onPhone.filter { it.mediaId in freshIds }.ifEmpty { onPhone }.ifEmpty { fresh.ifEmpty { others } }
         }.randomOrNull()
-        if (pick != null) Log.i(TAG, "Radio: nothing new, falling back to \"${pick.title}\" from your library")
+        if (pick != null) DLog.i(TAG, "Radio: nothing new, falling back to \"${pick.title}\" from your library")
         return pick
     }
 
@@ -788,7 +813,7 @@ class FilePlayer private constructor(private val context: Context) {
         val last = lastProgressAt
         val now = SystemClock.elapsedRealtime()
         if (last == 0L || now - last < STALL_MS) return false
-        Log.w(TAG, "No progress for ${now - last} ms; output sink looks dead")
+        DLog.w(TAG, "No progress for ${now - last} ms; output sink looks dead")
         // Flushing a blocked write makes it return so the worker can react at all.
         current?.let { runCatching { it.track.pause(); it.track.flush() } }
         lastProgressAt = now
@@ -843,7 +868,7 @@ class FilePlayer private constructor(private val context: Context) {
     // ---------------------------------------------------------------- audio focus
 
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
-        Log.i(TAG, "focus change $change (state=${state.name}, userPaused=$userPaused)")
+        DLog.i(TAG, "focus change $change (state=${state.name}, userPaused=$userPaused)")
         when (change) {
             AudioManager.AUDIOFOCUS_LOSS -> {
                 // Another app took over. Not a user pause: in Android Auto the projection host
@@ -886,7 +911,7 @@ class FilePlayer private constructor(private val context: Context) {
             // resurrect playback they cancelled.
             if (userPaused || generation != genAtRequest) return
             if (tries >= FOCUS_RETRIES) {
-                Log.w(TAG, "focus refused ${tries + 1} times, giving up")
+                DLog.w(TAG, "focus refused ${tries + 1} times, giving up")
                 lastError = "Another app holds audio focus"
                 setState(State.ERROR)
                 return
@@ -895,7 +920,7 @@ class FilePlayer private constructor(private val context: Context) {
             focusHandler.postDelayed({
                 if (userPaused || generation != genAtRequest) return@postDelayed
                 if (requestFocus()) {
-                    Log.i(TAG, "focus granted on retry $tries")
+                    DLog.i(TAG, "focus granted on retry $tries")
                     then()
                 } else {
                     attempt()
@@ -918,7 +943,7 @@ class FilePlayer private constructor(private val context: Context) {
 
     private fun abandonFocus() {
         val ok = runCatching { audioManager.abandonAudioFocusRequest(focusRequest) }.getOrDefault(false)
-        Log.i(TAG, "abandonFocus -> $ok (state=${state.name})")
+        DLog.i(TAG, "abandonFocus -> $ok (state=${state.name})")
     }
 
     // ---------------------------------------------------------------- output
@@ -992,7 +1017,7 @@ class FilePlayer private constructor(private val context: Context) {
                 inputRate = r
                 if (handle != 0L) NativeDsp.setInputRate(handle, r)
             }
-            Log.i(TAG, if (r == rate) "no resampling: source is $r Hz" else "resampling ${r} -> $rate Hz")
+            DLog.i(TAG, if (r == rate) "no resampling: source is $r Hz" else "resampling ${r} -> $rate Hz")
         }
 
         /** Runs the whole chain (resample → EQ → limiter) into [outBuf]. */
@@ -1088,7 +1113,7 @@ class FilePlayer private constructor(private val context: Context) {
                     if (!returning && deferred.isNotEmpty()) {
                         val back = readyDeferredIndex(deferred)
                         if (back >= 0) {
-                            Log.i(TAG, "\"${queue[back].title}\" is ready now: playing it before the rest")
+                            DLog.i(TAG, "\"${queue[back].title}\" is ready now: playing it before the rest")
                             resumeAt = index
                             index = back
                             returning = true
@@ -1154,7 +1179,7 @@ class FilePlayer private constructor(private val context: Context) {
                     val outcome = try {
                         playTrack(track, deferIfNotReady = !explicit && queue.size > 1)
                     } catch (e: Exception) {
-                        Log.e(TAG, "Track ${queue.getOrNull(index)?.title} failed", e)
+                        DLog.e(TAG, "Track ${queue.getOrNull(index)?.title} failed", e)
                         Outcome.Failed(e.message ?: e.javaClass.simpleName)
                     }
                     // A skip that arrived while the source was still resolving cancels that
@@ -1186,7 +1211,7 @@ class FilePlayer private constructor(private val context: Context) {
                         }
                         is Outcome.NotReady -> {
                             consecutiveFailures = 0
-                            Log.i(TAG, "\"${track.title}\" is still caching (${outcome.message}): playing the next song, will come back to it")
+                            DLog.i(TAG, "\"${track.title}\" is still caching (${outcome.message}): playing the next song, will come back to it")
                             deferred[track.mediaId] = SystemClock.elapsedRealtime()
                             // The request itself started the caching; keep fetching it in the
                             // background so it is on the phone when its turn comes round again.
@@ -1380,7 +1405,7 @@ class FilePlayer private constructor(private val context: Context) {
                         else {
                             // Could not start (too big for the cache, refused…): stream directly,
                             // exactly as before.
-                            if (live && jumpTo < 0) Log.i(TAG, "\"${item.title}\": play-while-downloading unavailable (${opened.error ?: opened.state}); streaming directly")
+                            if (live && jumpTo < 0) DLog.i(TAG, "\"${item.title}\": play-while-downloading unavailable (${opened.error ?: opened.state}); streaming directly")
                             MediaCache.leave(opened)
                         }
                     }
@@ -1414,17 +1439,17 @@ class FilePlayer private constructor(private val context: Context) {
             try {
                 val g = growing
                 if (cached != null) {
-                    Log.i(TAG, "playing cached \"${item.title}\" (${cached.length() / 1024} kB)")
+                    DLog.i(TAG, "playing cached \"${item.title}\" (${cached.length() / 1024} kB)")
                     extractor.setDataSource(cached.path)
                 } else if (g != null) {
-                    Log.i(TAG, "playing \"${item.title}\" while it downloads (${g.written / 1024} of ${g.total / 1024} kB so far)")
+                    DLog.i(TAG, "playing \"${item.title}\" while it downloads (${g.written / 1024} of ${g.total / 1024} kB so far)")
                     try {
                         extractor.setDataSource(GrowingSource(g, buffering = true))
                     } catch (e: Exception) {
                         if (!live || jumpTo >= 0) throw e
                         // The platform could not read it this way: fall back to the direct stream.
                         val direct = url.ifBlank { g.currentUrl }
-                        Log.w(TAG, "\"${item.title}\": could not open the growing file (${e.javaClass.simpleName}: ${e.message}); streaming directly")
+                        DLog.w(TAG, "\"${item.title}\": could not open the growing file (${e.javaClass.simpleName}: ${e.message}); streaming directly")
                         runCatching { extractor.release() }
                         MediaCache.leave(g)
                         growing = null
@@ -1435,7 +1460,7 @@ class FilePlayer private constructor(private val context: Context) {
                     extractor.setDataSource(url, emptyMap<String, String>())
                 }
                 // Where the time between songs goes, for when a gap needs explaining.
-                Log.i(TAG, "\"${item.title}\" opened in ${SystemClock.elapsedRealtime() - beganAt} ms " +
+                DLog.i(TAG, "\"${item.title}\" opened in ${SystemClock.elapsedRealtime() - beganAt} ms " +
                     "(lookup ${lookupDoneAt - beganAt} ms, source: ${if (cached != null) "on the phone" else if (growing != null) "download" else "direct stream"})")
                 val trackIndex = (0 until extractor.trackCount).firstOrNull {
                     extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
@@ -1474,7 +1499,7 @@ class FilePlayer private constructor(private val context: Context) {
                     if (extractor.readSampleData(probe, 0) >= 0) extractor.advance()
                     extractor.seekTo(startAtMs * 1000, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
                     positionMs = startAtMs
-                    Log.i(TAG, "Resuming at ${positionMs}ms")
+                    DLog.i(TAG, "Resuming at ${positionMs}ms")
                     startAtMs = 0
                 }
 
@@ -1498,7 +1523,7 @@ class FilePlayer private constructor(private val context: Context) {
                         dec.flush()
                         inputDone = false
                         positionMs = resumeAt
-                        Log.i(TAG, "Rebuilt the output sink, resuming at ${resumeAt}ms")
+                        DLog.i(TAG, "Rebuilt the output sink, resuming at ${resumeAt}ms")
                         continue
                     }
                     val jump = jumpTo
@@ -1671,7 +1696,7 @@ class FilePlayer private constructor(private val context: Context) {
                     album = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)?.trim()?.ifBlank { null },
                 )
             } catch (e: Exception) {
-                Log.i(TAG, "No embedded tags: ${e.javaClass.simpleName}")
+                DLog.i(TAG, "No embedded tags: ${e.javaClass.simpleName}")
                 FileInfo(null, null, null, null)
             } finally {
                 runCatching { r.release() }
@@ -1752,14 +1777,14 @@ class FilePlayer private constructor(private val context: Context) {
             // Kept short: this runs on the caller's (often main) thread. A worker that is
             // still inside a network read notices it was retired and releases its own output.
             t.join(500)
-            if (t.isAlive) Log.w(TAG, "Player thread slow to stop; it will release its own output")
+            if (t.isAlive) DLog.w(TAG, "Player thread slow to stop; it will release its own output")
         }
         synchronized(eqLock) { current = null }
     }
 
     private fun setState(s: State, reason: String? = null) {
         if (s != state) {
-            Log.i(TAG, "State ${state.name} -> ${s.name}" + (reason?.let { " ($it)" } ?: ""))
+            DLog.i(TAG, "State ${state.name} -> ${s.name}" + (reason?.let { " ($it)" } ?: ""))
         }
         // The stall watchdog measures time since the last write. A pause writes nothing, so
         // entering PLAYING must restart that clock or a resume after >4 s looks like a stall.
@@ -1785,7 +1810,7 @@ class FilePlayer private constructor(private val context: Context) {
             val snap = if (tracks.isEmpty()) null
             else QueueSnapshot(title, tracks, index.coerceIn(0, tracks.lastIndex), pos)
             runCatching { settings.queueSnapshot = snap }
-                .onFailure { Log.w(TAG, "Couldn't save the queue: ${it.message}") }
+                .onFailure { DLog.w(TAG, "Couldn't save the queue: ${it.message}") }
         }
     }
 

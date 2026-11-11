@@ -39,7 +39,6 @@ import android.support.v4.media.MediaDescriptionCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.view.KeyEvent
 import androidx.media.MediaBrowserServiceCompat
-import android.util.Log
 import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.max
@@ -104,12 +103,12 @@ class EqService : MediaBrowserServiceCompat() {
             val pkg = intent.getStringExtra(AudioEffect.EXTRA_PACKAGE_NAME) ?: "unknown"
             when (intent.action) {
                 AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION -> {
-                    Log.i(TAG, "Session opened: $session ($pkg)")
+                    DLog.i(TAG, "Session opened: $session ($pkg)")
                     sessionPackages[session] = pkg
                     routeSession(session, pkg)
                 }
                 AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION -> {
-                    Log.i(TAG, "Session closed: $session ($pkg)")
+                    DLog.i(TAG, "Session closed: $session ($pkg)")
                     effects.detach(session)
                     muter.unmute(session)
                     sessionPackages.remove(session)
@@ -161,6 +160,7 @@ class EqService : MediaBrowserServiceCompat() {
 
     override fun onCreate() {
         super.onCreate()
+        Diag.init(this)
         settings = Settings(this)
         audioManager = getSystemService(AudioManager::class.java)
         // The session exists from the start, but stays inactive until we actually play or a
@@ -197,10 +197,10 @@ class EqService : MediaBrowserServiceCompat() {
         result.detach()
         Thread({
             val items = runCatching { MediaBrowse.children(this, parentId) }.getOrElse {
-                Log.w(TAG, "Browse $parentId failed: ${it.message}")
+                DLog.w(TAG, "Browse $parentId failed: ${it.message}")
                 emptyList()
             }
-            Log.d(TAG, "Browse $parentId -> ${items.size} items")
+            DLog.d(TAG, "Browse $parentId -> ${items.size} items")
             result.sendResult(items.map(::toCompat).toMutableList())
         }, "CabinEQ-Browse").start()
     }
@@ -214,10 +214,10 @@ class EqService : MediaBrowserServiceCompat() {
         result.detach()
         Thread({
             val items = runCatching { MediaBrowse.search(this, query) }.getOrElse {
-                Log.w(TAG, "Search \"$query\" failed: ${it.message}")
+                DLog.w(TAG, "Search \"$query\" failed: ${it.message}")
                 emptyList()
             }
-            Log.d(TAG, "Search \"$query\" -> ${items.size} items")
+            DLog.d(TAG, "Search \"$query\" -> ${items.size} items")
             if (items.isNotEmpty()) settings.addRecentSearch(query)   // feeds the car's Search tab
             result.sendResult(items.map(::toCompat).toMutableList())
         }, "CabinEQ-Search").start()
@@ -249,11 +249,11 @@ class EqService : MediaBrowserServiceCompat() {
         mediaSession?.isActive = true
         Thread({
             val spec = runCatching { MediaBrowse.playback(this, mediaId) }.getOrElse {
-                Log.w(TAG, "Can't resolve $mediaId: ${it.message}")
+                DLog.w(TAG, "Can't resolve $mediaId: ${it.message}")
                 null
             }
             if (spec == null) {
-                Log.w(TAG, "Nothing playable for $mediaId")
+                DLog.w(TAG, "Nothing playable for $mediaId")
                 return@Thread
             }
             FilePlayer.get(this).play(spec.tracks, spec.index, spec.title, radio = spec.radio)
@@ -286,7 +286,7 @@ class EqService : MediaBrowserServiceCompat() {
     }
 
     private fun playFromVoice(request: dev.alamo3.cabineq.music.VoiceRequest) {
-        Log.i(TAG, "voice request: focus=${request.focus} fields=" +
+        DLog.i(TAG, "voice request: focus=${request.focus} fields=" +
             listOfNotNull("artist".takeIf { request.artist != null }, "album".takeIf { request.album != null },
                 "title".takeIf { request.title != null }, "playlist".takeIf { request.playlist != null }) +
             " alternatives=${request.alternatives.size}")
@@ -296,7 +296,7 @@ class EqService : MediaBrowserServiceCompat() {
         Thread({
             val spec = runCatching { MediaBrowse.voicePlayback(this, request) }.getOrNull()
             if (spec == null) {
-                Log.w(TAG, "Nothing to play for the voice request")
+                DLog.w(TAG, "Nothing to play for the voice request")
                 // Say so where the car shows it, instead of silently doing nothing.
                 EngineState.playerMessage = if (request.isOpenEnded) "Nothing to play yet — like or play a few songs first."
                     else "Couldn't find “${dev.alamo3.cabineq.music.VoiceRequest.clean(request.query).take(60)}”."
@@ -407,7 +407,7 @@ class EqService : MediaBrowserServiceCompat() {
         if (hasLocationPermission()) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
         type = type or extraTypes
         runCatching { startForeground(NOTIF_ID, buildNotification(), type) }
-            .onFailure { Log.w(TAG, "startForeground failed: ${it.message}") }
+            .onFailure { DLog.w(TAG, "startForeground failed: ${it.message}") }
     }
 
     override fun onDestroy() {
@@ -457,16 +457,16 @@ class EqService : MediaBrowserServiceCompat() {
             lastSentInputGain = Float.NaN  // force a full parameter push
             lastSentBands.fill(Float.NaN)
             rerouteAllSessions()
-            Log.i(TAG, "DSP started at ${engine.sampleRate} Hz")
+            DLog.i(TAG, "DSP started at ${engine.sampleRate} Hz")
         } catch (e: Exception) {
-            Log.e(TAG, "Could not start DSP", e)
+            DLog.e(TAG, "Could not start DSP", e)
             stopDsp("DSP failed to start: ${e.message} — using Android EQ")
         }
     }
 
     /** Tears down capture and moves every session back to the Android EQ path. */
     private fun stopDsp(reason: String) {
-        Log.w(TAG, "Stopping DSP: $reason")
+        DLog.w(TAG, "Stopping DSP: $reason")
         capture?.stop()
         capture = null
         projection?.let {
@@ -538,7 +538,7 @@ class EqService : MediaBrowserServiceCompat() {
             )
             EngineState.gpsActive = lm.isProviderEnabled(LocationManager.GPS_PROVIDER)
         } catch (e: Exception) {
-            Log.w(TAG, "Could not start GPS", e)
+            DLog.w(TAG, "Could not start GPS", e)
             EngineState.gpsActive = false
         }
     }
@@ -644,7 +644,7 @@ class EqService : MediaBrowserServiceCompat() {
             audioManager.isMusicActive &&
             FilePlayer.peek()?.isActive != true  // our own player also makes isMusicActive true
         ) {
-            Log.w(TAG, "Capture silent while media is active; marking blocked: $dspPackages")
+            DLog.w(TAG, "Capture silent while media is active; marking blocked: $dspPackages")
             settings.markCaptureBlocked(dspPackages)  // triggers rerouteAllSessions via prefs listener
             EngineState.dspMessage = "${dspPackages.joinToString()} blocks audio capture — using Android EQ for it"
         }
@@ -725,7 +725,7 @@ class EqService : MediaBrowserServiceCompat() {
                 if (!rating.isRated) return
                 if (rating.isThumbUp) Taste.like(this@EqService, track)
                 else Taste.dislike(this@EqService, track)
-                Log.i(TAG, "rating: thumbUp=${rating.isThumbUp} for ${track.title}")
+                DLog.i(TAG, "rating: thumbUp=${rating.isThumbUp} for ${track.title}")
             }
 
             override fun onPlayFromMediaId(mediaId: String, extras: Bundle?) = playFromBrowse(mediaId)

@@ -2,7 +2,6 @@ package dev.alamo3.cabineq
 
 import android.content.Context
 import android.os.SystemClock
-import android.util.Log
 import dev.alamo3.cabineq.addon.EclipseAddon
 import dev.alamo3.cabineq.music.AddonMatch
 import dev.alamo3.cabineq.music.Discover
@@ -82,9 +81,16 @@ object Radio {
         // A queue with no artist anywhere (untagged files) goes by what this phone plays most.
         val artist = primaryArtist(seed.artist)
             ?: Taste.profile(context).topArtists(1).firstOrNull()?.let { primaryArtist(it.first) }
-            ?: return null
-        val candidates = poolFor(context, artist) ?: return null
+            ?: run {
+                DLog.i(TAG, "next: no artist to go on (seed \"${seed.title}\")")
+                return null
+            }
+        val candidates = poolFor(context, artist) ?: run {
+            DLog.i(TAG, "next: no related songs for $artist")
+            return null
+        }
         val ranked = rank(context, candidates, exclude, sessionArtists, currentArtist, artist)
+        DLog.i(TAG, "next: $artist, ${candidates.size} related, ${ranked.size} left after excluding ${exclude.size} queued")
         // Discovered songs need a Nebula match before they can play. Try the best few; a song
         // the addon doesn't have is remembered and skipped from then on.
         val link = Settings(context).addonLink
@@ -102,7 +108,7 @@ object Radio {
             val found = runCatching { AddonMatch.find(EclipseAddon(link), c.first.track) }.getOrNull()
             if (found == null) {
                 unmatched.add(k)
-                Log.i(TAG, "not on Nebula: ${c.first.track.title} (${c.first.track.artist})")
+                DLog.i(TAG, "not on Nebula: ${c.first.track.title} (${c.first.track.artist})")
                 continue
             }
             // The addon's copy plays; keep the discovered cover if the addon has none.
@@ -111,7 +117,10 @@ object Radio {
             picked = c
             break
         }
-        val best = picked ?: return null
+        val best = picked ?: run {
+            DLog.i(TAG, "next: none of the top picks are on Nebula ($tries tried)")
+            return null
+        }
         val t = track ?: return null
         val profile = Taste.profile(context)
         val currentKey = primaryArtist(currentArtist)?.lowercase()
@@ -124,7 +133,7 @@ object Radio {
         val why = "$source · ${profile.why(best.first.track, sessionArtists)}"
         lastReason = "${t.title} — $why"
         synchronized(reasons) { reasons[key(t)] = why }
-        Log.i(TAG, "pick: ${t.title} (${t.artist}) score=${"%.2f".format(best.second)} [$source]")
+        DLog.i(TAG, "pick: ${t.title} (${t.artist}) score=${"%.2f".format(best.second)} [$source]")
         return t
     }
 
@@ -136,11 +145,11 @@ object Radio {
         val seedArtist = Settings(context).radioSeed?.let { primaryArtist(it.artist) }
             ?: Taste.profile(context).topArtists(1).firstOrNull()?.let { primaryArtist(it.first) }
             ?: run {
-                Log.i(TAG, "recommend: no seed yet")
+                DLog.i(TAG, "recommend: no seed yet")
                 return emptyList()
             }
         val candidates = poolFor(context, seedArtist) ?: run {
-            Log.i(TAG, "recommend: no pool for $seedArtist")
+            DLog.i(TAG, "recommend: no pool for $seedArtist")
             return emptyList()
         }
         // The player may not exist yet when the home page renders; the snapshot is the same queue.
@@ -149,7 +158,7 @@ object Radio {
         val exclude = queue.flatMap { identity(it) }.toHashSet()
         val session = queue.takeLast(5).mapNotNull { it.artist }.toSet()
         val ranked = rank(context, candidates, exclude, session, queue.lastOrNull()?.artist, seedArtist)
-        Log.i(TAG, "recommend: ${queue.size} queued, ${ranked.size} ranked, first=${ranked.firstOrNull()?.first?.track?.title}")
+        DLog.i(TAG, "recommend: ${queue.size} queued, ${ranked.size} ranked, first=${ranked.firstOrNull()?.first?.track?.title}")
         // One song per artist first (a discovery shelf should be a spread), then a second each
         // if the pool is thin. Discovered songs are matched to Nebula when tapped.
         val out = ArrayList<Track>(count)
@@ -293,7 +302,7 @@ object Radio {
 
         val distinct = out.distinctBy { key(it.track) }
         if (distinct.isEmpty()) return null
-        Log.i(
+        DLog.i(
             TAG,
             "pool for $artist: ${distinct.size} songs — same artist=$sameArtistCount, " +
                 "other artists=${distinct.size - sameArtistCount}, taste seeds=$tasteArtists"

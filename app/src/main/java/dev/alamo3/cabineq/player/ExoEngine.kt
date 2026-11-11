@@ -2,6 +2,7 @@
 
 package dev.alamo3.cabineq.player
 
+import dev.alamo3.cabineq.DLog
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
@@ -10,7 +11,6 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -239,7 +239,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         p.repeatMode = repeatMode(owner.repeat)
         p.prepare()
         if (ready?.play == false) p.pause() else p.play()
-        Log.i(TAG, "queue: ${items.size} songs, starting at $at from ${position}ms" +
+        DLog.i(TAG, "queue: ${items.size} songs, starting at $at from ${position}ms" +
             if (ready?.play == false) ", paused" else "")
         queue.check("load", BuildConfig.DEBUG)
         startTicking()
@@ -278,12 +278,12 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         onMain()
         val p = player
         if (p == null || p.mediaItemCount == 0) {
-            if (!intents.isEmpty) Log.i(TAG, "held until the queue exists: ${intents.describe()}")
+            if (!intents.isEmpty) DLog.i(TAG, "held until the queue exists: ${intents.describe()}")
             return
         }
         intents.takeSkip()?.let { raw ->
             val index = raw.coerceIn(0, p.mediaItemCount - 1)
-            Log.i(TAG, "skip to $index")
+            DLog.i(TAG, "skip to $index")
             reportLeaving(skipped = true)
             stopWaitingForNetwork()
             p.seekToDefaultPosition(index)
@@ -291,11 +291,11 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             p.play()
         }
         intents.takeSeek()?.let { ms ->
-            Log.i(TAG, "seek to $ms ms")
+            DLog.i(TAG, "seek to $ms ms")
             p.seekTo(ms)
         }
         intents.takePlaying()?.let { play ->
-            Log.i(TAG, if (play) "play" else "pause")
+            DLog.i(TAG, if (play) "play" else "pause")
             if (play) {
                 if (p.playbackState == Player.STATE_IDLE) p.prepare()
                 p.play()
@@ -321,7 +321,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         if (p == null || p.mediaItemCount == 0) {
             // Nothing is loaded (the queue is still being built, or was stopped). The next start
             // reads FilePlayer's own list, which already has these; say so rather than desync.
-            Log.i(TAG, "queue edit before the queue exists: ${tracks.size} songs wait for the next start")
+            DLog.i(TAG, "queue edit before the queue exists: ${tracks.size} songs wait for the next start")
             return@post
         }
         val items = tracks.mapIndexed { i, t ->
@@ -330,7 +330,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         val first = queue.added(items, newKeys)
         // The queue had run out and this is what it was waiting for (the radio's next pick).
         if (p.playbackState == Player.STATE_ENDED) {
-            Log.i(TAG, "queue grew after it ended: playing \"${tracks.first().title}\"")
+            DLog.i(TAG, "queue grew after it ended: playing \"${tracks.first().title}\"")
             radioAsks = 0
             gaveUp = false
             p.seekToDefaultPosition(first)
@@ -343,12 +343,12 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     fun removed(index: Int) = main.post {
         val p = player
         if (p == null || index !in 0 until p.mediaItemCount) {
-            Log.i(TAG, "remove of $index ignored: the queue is not in the player")
+            DLog.i(TAG, "remove of $index ignored: the queue is not in the player")
             return@post
         }
         val gone = queue.removedAt(index)
         if (gone == null) {
-            Log.i(TAG, "remove of $index ignored: it is not in the queue mirror")
+            DLog.i(TAG, "remove of $index ignored: it is not in the queue mirror")
             return@post
         }
         tracksByKey.remove(gone)
@@ -360,11 +360,11 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     fun moved(from: Int, to: Int) = main.post {
         val p = player
         if (p == null || from !in 0 until p.mediaItemCount || to !in 0 until p.mediaItemCount) {
-            Log.i(TAG, "move $from -> $to ignored: the queue is not in the player")
+            DLog.i(TAG, "move $from -> $to ignored: the queue is not in the player")
             return@post
         }
         if (!queue.moved(from, to)) {
-            Log.i(TAG, "move $from -> $to ignored: it is not in the queue mirror")
+            DLog.i(TAG, "move $from -> $to ignored: it is not in the queue mirror")
             return@post
         }
         queue.check("moved", BuildConfig.DEBUG)
@@ -383,7 +383,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             if (sourceRate == null) {
                 // The route changed before the first format arrived: retry shortly (bounded).
                 if (rebuildRetries++ < REBUILD_RETRIES) main.postDelayed(this, 300)
-                else Log.i(TAG, "route changed, but there is no audio format to rebuild for yet")
+                else DLog.i(TAG, "route changed, but there is no audio format to rebuild for yet")
                 return
             }
             rebuildRetries = 0
@@ -400,7 +400,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         }
         // The engine is built for the old rate. Stopping and preparing again keeps the playlist
         // and the position, and makes Media3 configure the audio chain afresh.
-        Log.i(TAG, "output rate moved to $want Hz: rebuilding the audio chain")
+        DLog.i(TAG, "output rate moved to $want Hz: rebuilding the audio chain")
         val playing = p.playWhenReady
         p.stop()
         p.prepare()
@@ -496,7 +496,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         tracksByKey[key] = track
         // Already on the phone (a download, or the other engine's cache): play the file.
         val uri = if (local != null && local.isFile) Uri.fromFile(local) else Uri.parse("$SCHEME://t/$key")
-        Log.i(TAG, "source of \"${track.title}\": " + if (local != null && local.isFile) "file (${local.length()} bytes)" else "stream")
+        DLog.i(TAG, "source of \"${track.title}\": " + if (local != null && local.isFile) "file (${local.length()} bytes)" else "stream")
         return MediaItem.Builder()
             .setMediaId(key)
             .setUri(uri)
@@ -564,7 +564,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             val p = player ?: return
             val title = currentTrack()?.title ?: "song"
             val why = error.cause?.message ?: error.errorCodeName
-            Log.w(TAG, "\"$title\" failed: ${error.errorCodeName}: $why")
+            DLog.w(TAG, "\"$title\" failed: ${error.errorCodeName}: $why")
             // The link it had may be what failed: never reuse it.
             keys.getOrNull(p.currentMediaItemIndex)?.let { key ->
                 links.remove(key)
@@ -574,7 +574,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             // try the same song once more, from the same second, before treating it as failed.
             if (linkRetries < 1 && currentIsRemote(p) && wasLinkRefused(error)) {
                 linkRetries++
-                Log.i(TAG, "\"$title\": its link was refused (expired?): asking for a fresh one")
+                DLog.i(TAG, "\"$title\": its link was refused (expired?): asking for a fresh one")
                 p.prepare()
                 return
             }
@@ -653,7 +653,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     private fun onConnectionLost(p: ExoPlayer, title: String) {
         val online = MediaCache.isOnline(context)
         if (online && ++networkRetries > MAX_NETWORK_RETRIES) {
-            Log.w(TAG, "\"$title\" keeps timing out while online: giving up on it")
+            DLog.w(TAG, "\"$title\" keeps timing out while online: giving up on it")
             networkRetries = 0
             bridge.error("$title: the connection keeps failing")
             failures++
@@ -671,7 +671,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         val offlineAt = (at + 1 until p.mediaItemCount).firstOrNull { playableOffline(p, it) }
         if (offlineAt != null) {
             val key = keys.getOrNull(offlineAt)
-            Log.i(TAG, "no connection for \"$title\": playing a song that needs none first")
+            DLog.i(TAG, "no connection for \"$title\": playing a song that needs none first")
             if (key != null && offlineAt > at + 1) owner.moveUpcoming(key, at + 1)
             // Posted behind the move above, which is itself posted: it is in place by then.
             main.post {
@@ -698,7 +698,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                 main.postDelayed(this, NETWORK_POLL_MS)
                 return
             }
-            Log.i(TAG, "connection is back: carrying on")
+            DLog.i(TAG, "connection is back: carrying on")
             waitingForNetwork = false
             owner.setNote(null)
             // Same song, same position; it plays if it was meant to (a pause stays a pause).
@@ -737,7 +737,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         }
         runCatching { cm.registerDefaultNetworkCallback(callback) }
             .onSuccess { networkCallback = callback }
-            .onFailure { Log.w(TAG, "no connection callback: ${it.message}") }
+            .onFailure { DLog.w(TAG, "no connection callback: ${it.message}") }
     }
 
     private fun unregisterNetworkCallback() {
@@ -944,7 +944,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             )
             Link(resolved.url, resolved.quality, SystemClock.elapsedRealtime()).also {
                 links[key] = it
-                Log.i(TAG, "link for \"${track.title}\" in ${it.at - asked} ms")
+                DLog.i(TAG, "link for \"${track.title}\" in ${it.at - asked} ms")
             }
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
@@ -1059,11 +1059,11 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                 val started = SystemClock.elapsedRealtime()
                 writer.cache()
                 prefetched.add(key)
-                Log.i(TAG, "cached \"${track.title}\" ahead of its turn (${SystemClock.elapsedRealtime() - started} ms)")
+                DLog.i(TAG, "cached \"${track.title}\" ahead of its turn (${SystemClock.elapsedRealtime() - started} ms)")
             } catch (e: InterruptedIOException) {
                 // Cancelled: the song left the queue, or the queue was replaced.
             } catch (e: Exception) {
-                Log.i(TAG, "could not cache \"${track.title}\" ahead: ${e.javaClass.simpleName}: ${e.message}")
+                DLog.i(TAG, "could not cache \"${track.title}\" ahead: ${e.javaClass.simpleName}: ${e.message}")
                 // A refused link must not be handed out again by the next look-ahead.
                 if (e is HttpDataSource.InvalidResponseCodeException && e.responseCode in REFUSED_LINK_CODES) {
                     links.remove(key)
@@ -1113,7 +1113,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                 if (!bringBack) main.post { setAside(key, track) }
             } catch (e: Exception) {
                 // Not found, or the network: left for its turn, where it fails and is skipped.
-                Log.i(TAG, "look-ahead for \"${track.title}\": ${e.javaClass.simpleName}: ${e.message}")
+                DLog.i(TAG, "look-ahead for \"${track.title}\": ${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 checking.remove(key)
             }
@@ -1128,7 +1128,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         val index = keys.indexOf(key)
         if (index <= p.currentMediaItemIndex) return          // its turn already came
         if (deferred.put(key, SystemClock.elapsedRealtime()) == null) {
-            Log.i(TAG, "\"${track.title}\" is still caching on TorBox: playing others first, will come back to it")
+            DLog.i(TAG, "\"${track.title}\" is still caching on TorBox: playing others first, will come back to it")
         }
         publishWaiting()
         if (index < keys.lastIndex) {
@@ -1147,7 +1147,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         val index = keys.indexOf(key)
         val next = p.currentMediaItemIndex + 1
         if (index < 0) return
-        Log.i(TAG, "\"${track.title}\" is ready now: playing it next")
+        DLog.i(TAG, "\"${track.title}\" is ready now: playing it next")
         if (index > next) owner.moveUpcoming(key, next)
         if (p.playbackState == Player.STATE_ENDED) {
             p.seekToDefaultPosition(keys.indexOf(key))
@@ -1214,7 +1214,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                         LeastRecentlyUsedCacheEvictor(settings.cacheMaxMb.toLong() * 1024 * 1024),
                         StandaloneDatabaseProvider(context),
                     )
-                }.onFailure { Log.w(TAG, "no disk cache: ${it.message}") }.getOrNull()?.also { sharedCache = it }
+                }.onFailure { DLog.w(TAG, "no disk cache: ${it.message}") }.getOrNull()?.also { sharedCache = it }
             }
         }
     }

@@ -1,5 +1,6 @@
 package dev.alamo3.cabineq.music
 
+import dev.alamo3.cabineq.DLog
 import dev.alamo3.cabineq.Track
 import dev.alamo3.cabineq.addon.EclipseAddon
 import java.text.Normalizer
@@ -96,7 +97,7 @@ object AddonMatch {
         }
         // Say what the source did offer: a miss here is a matching rule to fix, and this is
         // what shows which (titles and artists only — nothing private).
-        android.util.Log.i("CabinEQ/Match", "no match for \"${track.title}\" by ${artist ?: "?"} (${dur ?: "?"}s) among " +
+        DLog.i("CabinEQ/Match", "no match for \"${track.title}\" by ${artist ?: "?"} (${dur ?: "?"}s) among " +
             seen.values.take(6).joinToString("; ") { "${it.title} — ${it.artist} (${it.durationSec ?: "?"}s)" }.ifEmpty { "no results" })
         return null
     }

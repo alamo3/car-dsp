@@ -203,6 +203,16 @@ class Settings(context: Context) {
      * (a playlist, an album, a shelf, a search). On by default. Off: the queue just ends, unless
      * the user started a radio on purpose ("Start radio from this song").
      */
+    /** Send playback diagnostics to the app's Firebase database (see Diag). On by default. */
+    var diagnosticsEnabled: Boolean
+        get() = prefs.getBoolean("diagnostics_enabled", true)
+        set(v) = prefs.edit().putBoolean("diagnostics_enabled", v).apply()
+
+    /** Random id this install's diagnostics are stored under. */
+    var diagnosticsId: String
+        get() = prefs.getString("diagnostics_id", "") ?: ""
+        set(v) = prefs.edit().putString("diagnostics_id", v).apply()
+
     var endlessPlayback: Boolean
         get() = prefs.getBoolean("endless_playback", true)
         set(v) = prefs.edit().putBoolean("endless_playback", v).apply()
