@@ -1,307 +1,265 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# CabinEQ + Spotify Soloist, test setup for Termux.
+# CabinEQ + Spotify Soloist, run from Termux.
 #
-#   bash cabineq-soloist.sh setup    install Debian, PulseAudio and Soloist (safe to re-run)
+#   bash cabineq-soloist.sh setup    install Debian, PulseAudio, socat and Soloist (safe to re-run)
+#   bash cabineq-soloist.sh key      store (or replace) the Soloist API key
 #   bash cabineq-soloist.sh pair     pair Soloist with your Spotify account (on Wi-Fi)
-#   bash cabineq-soloist.sh play     run Soloist and serve its audio on 127.0.0.1:4712
-#   bash cabineq-soloist.sh status   what is running, and is audio flowing
-#   bash cabineq-soloist.sh stop     stop Soloist and the audio daemons
+#   bash cabineq-soloist.sh start    run it in the background, restarted if it dies
+#   bash cabineq-soloist.sh stop     stop everything
+#   bash cabineq-soloist.sh status   what is running
 #
-# Audio path (no Android capture, nothing to mute, no double playback):
+# One clock: CabinEQ's. Everything runs in ONE proot session:
 #
-#   Soloist -> PulseAudio "CabinEQ" sink (Debian) -> module-simple-protocol-tcp
-#            -> 127.0.0.1:4712 as raw s16le 44100 stereo -> CabinEQ
+#   Soloist -> PulseAudio (Debian) "CabinEQ" pipe sink -> FIFO -> socat -> 127.0.0.1:4712 -> CabinEQ
 #
-# PulseAudio is used rather than PipeWire because the stream has to leave Debian as
-# PCM over a socket, and the simple protocol does exactly that. PipeWire is stopped so
-# Soloist falls back to libpulse.
+# A pipe sink has no clock of its own: it renders only as fast as the FIFO is drained, socat
+# drains it only as fast as the app reads the socket, and the app reads only as fast as its
+# AudioTrack plays. So Soloist is paced by the phone's audio output itself: no drift, no trims,
+# no rate correction, and no Termux PulseAudio / AAudio sink / tunnel in between.
+#
+# When the session dies (PulseAudio, socat or Soloist), the whole session is replaced: the pieces
+# share one lifetime, so there is never a stray Soloist advertising a second CabinEQ device.
+#
+# Logs: /sdcard/Download/cabineq-soloist.log (Termux side and the session's output).
 set -uo pipefail
 
 MODE=${1:-status}
-# proot-distro moved this between versions: newer keeps it in installed-rootfs/<name>,
-# older in containers/<name>/rootfs. Take whichever is a real rootfs (has etc/).
+PORT=${CABINEQ_PORT:-4712}
+DEVICE=CabinEQ
+KEYFILE="$HOME/.soloist-key"
+LOG=/sdcard/Download/cabineq-soloist.log
+PIDFILE="$HOME/.cabineq-soloist.pid"
 ROOTFS=""
 for c in "$PREFIX/var/lib/proot-distro/installed-rootfs/debian" \
          "$PREFIX/var/lib/proot-distro/containers/debian/rootfs"; do
-  if [ -d "$c/etc" ]; then ROOTFS="$c"; break; fi
+  [ -d "$c/etc" ] && { ROOTFS="$c"; break; }
 done
-[ -n "$ROOTFS" ] || ROOTFS="$PREFIX/var/lib/proot-distro/containers/debian/rootfs"
-KEYFILE="$HOME/.soloist-key"
-PORT=${CABINEQ_PORT:-4712}
-LOG=/sdcard/Download/soloist-$MODE.log
-say() { echo "[cabineq] $*" | tee -a "$LOG"; }
+say() { printf '%s [cabineq] %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
 
-case "$MODE" in setup|pair|play|status|stop|key) ;; *)
-  echo "usage: bash $0 setup|pair|play|status|stop|key"; exit 2 ;;
+case "$MODE" in setup|key|pair|start|stop|status|__supervise) ;; *)
+  echo "usage: bash $0 setup|key|pair|start|stop|status"; exit 2 ;;
 esac
-exec > >(tee -a "$LOG") 2>&1
-say "== $MODE  $(date)"
 
-# ---- Termux side -----------------------------------------------------------------------
+# Every piece by name, from the Termux side (proot's processes are ordinary processes here).
+# Includes the previous design's Termux PulseAudio, whose AAudio sink is what hung.
+kill_all() {
+  pkill -f "cabineq-soloist.sh __supervise" 2>/dev/null
+  pkill -x soloist 2>/dev/null
+  pkill -x socat 2>/dev/null
+  pkill -x parec 2>/dev/null
+  pkill -f "cabineq-session.sh" 2>/dev/null
+  pkill -x pulseaudio 2>/dev/null
+  pkill -f "soloist-supervisor.sh" 2>/dev/null
+  rm -f "$PIDFILE"
+}
+
+supervised() { [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+
+status() {
+  echo "supervisor: $(supervised && echo "running (pid $(cat "$PIDFILE"))" || echo stopped)"
+  echo "soloist:    $(pgrep -x soloist >/dev/null && echo running || echo stopped)"
+  echo "pulseaudio: $(pgrep -x pulseaudio >/dev/null && echo running || echo stopped)"
+  echo "socat:      $(pgrep -x socat >/dev/null && echo "listening on 127.0.0.1:$PORT" || echo stopped)"
+  echo "key:        $([ -s "$KEYFILE" ] && echo stored || echo missing)"
+  echo "log:        $LOG (last lines below)"
+  tail -n 8 "$LOG" 2>/dev/null
+}
+
+case "$MODE" in
+  stop)   kill_all; command -v termux-wake-unlock >/dev/null && termux-wake-unlock; say "stopped"; exit 0 ;;
+  status) status; exit 0 ;;
+esac
+
+# ---- Termux side: prerequisites -------------------------------------------------------------
 
 if [ ! -d "$HOME/storage" ]; then
-  say "Allow storage access in the prompt (used for logs)."
+  echo "Allow storage access in the prompt (the log goes to Downloads)."
   termux-setup-storage || true
   sleep 3
 fi
-
 command -v proot-distro >/dev/null || { say "installing proot-distro"; pkg install -y proot-distro; }
-if ! proot-distro list 2>&1 | grep -q 'debian'; then
-  say "installing Debian (a few minutes, once)"; proot-distro install debian
+if [ -z "$ROOTFS" ]; then
+  say "installing Debian (a few minutes, once)"
+  proot-distro install debian
+  ROOTFS="$PREFIX/var/lib/proot-distro/installed-rootfs/debian"
+  [ -d "$ROOTFS/etc" ] || ROOTFS="$PREFIX/var/lib/proot-distro/containers/debian/rootfs"
 fi
-[ -d "$ROOTFS/etc" ] || { say "Debian rootfs not found; run setup once Debian is installed"; exit 1; }
+[ -d "$ROOTFS/etc" ] || { say "Debian rootfs not found"; exit 1; }
 
-if [ "$MODE" = key ] || { [ "$MODE" != stop ] && [ ! -s "$KEYFILE" ]; }; then
-  if [ "$MODE" = key ] || [ ! -s "$KEYFILE" ]; then
-    read -rsp "Paste your Soloist API key (leave empty to try without one): " k; echo
-    if [ -n "$k" ]; then umask 077; printf '%s' "$k" > "$KEYFILE"; say "key saved"; else say "no key: Soloist will run with its built-in one"; fi
-  fi
+if [ "$MODE" = key ] || { [ "$MODE" != __supervise ] && [ ! -s "$KEYFILE" ]; }; then
+  read -rsp "Paste your Soloist API key (it won't be shown): " k; echo
+  [ -n "$k" ] || { say "no key given"; exit 1; }
+  ( umask 077; printf '%s' "$k" > "$KEYFILE" )
+  say "key saved"
   [ "$MODE" = key ] && exit 0
 fi
 
-# Termux's own PulseAudio is the clock: it runs natively, outside proot, so its null sink
-# keeps real time. The Debian sink is slaved to it with a tunnel sink (see the inner script).
-export PULSE_RUNTIME_PATH="$PREFIX/var/run/pulse"
-mkdir -p "$PULSE_RUNTIME_PATH"
-command -v pulseaudio >/dev/null || yes | pkg install -y pulseaudio >/dev/null 2>&1
-# One chain only: a second PulseAudio cannot have the same socket, and two daemons fighting over
-# it is how "play" ends up blocked forever on --start.
-# Soloist is the Spotify Connect endpoint: a stray copy (it is started detached, so killing the
-# proot session does NOT kill it) keeps advertising the same device, and Spotify then loses it
-# from the speaker list. Kill every piece by name before starting one of each.
-pkill -x soloist 2>/dev/null; pkill -x socat 2>/dev/null; pkill -x parec 2>/dev/null
-pkill -f proot 2>/dev/null; pkill -x pulseaudio 2>/dev/null; sleep 2
-pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1
-# Wait for the server, and bound every client call from here on: a bare pactl with no server
-# autospawns one and blocks forever — that is how `play` hung with nothing on screen.
-up=""
-for i in $(seq 1 40); do timeout 2 pactl info >/dev/null 2>&1 && { up=1; break; }; sleep 0.5; done
-say "termux pulseaudio: ${up:+up}"; [ -n "$up" ] || say "termux pulseaudio: not up"
-# The sink everything is paced by must be a *device*, not a null sink: a null sink swallows
-# whatever it is given as fast as it arrives, so Soloist runs free and delivers bursts (measured
-# 60x realtime). Android's audio hardware keeps real time, so AAudio is the clock — muted, since
-# the sound comes from CabinEQ, not from Termux.
-if [ -n "$up" ]; then
-  timeout 2 pactl list short modules 2>/dev/null | grep -q module-aaudio-sink || timeout 8 pactl load-module module-aaudio-sink >/dev/null 2>&1
-  # A second socket, anonymous, for the proot side: it has its own cookie and no way to read
-  # Termux's. Clients there speak the same protocol, so they talk to the same server.
-  PROOT_SOCK="$PULSE_RUNTIME_PATH/proot"
-  timeout 2 pactl list short modules 2>/dev/null | grep -q "socket=$PROOT_SOCK" || \
-    timeout 8 pactl load-module module-native-protocol-unix socket="$PROOT_SOCK" auth-anonymous=1 >/dev/null 2>&1
-  say "proot socket: $(test -S "$PROOT_SOCK" && echo ready || echo missing)"
-  AA=$(timeout 2 pactl list short sinks 2>/dev/null | awk '$2 ~ /AAudio/ {print $2; exit}')
-  if [ -n "$AA" ]; then
-    timeout 2 pactl set-default-sink "$AA" >/dev/null 2>&1
-    timeout 2 pactl set-sink-volume "$AA" 0 >/dev/null 2>&1
-    timeout 2 pactl set-sink-mute "$AA" 0 >/dev/null 2>&1
-    say "termux clock sink: $AA (muted; it exists to pace)"
-  else
-    say "no AAudio sink: Android audio will not pace playback"
-  fi
-else
-  say "termux pulseaudio did not start: the source will not work"
-fi
-
 mkdir -p "$ROOTFS/root/.soloist"
-[ -s "$KEYFILE" ] && install -m 600 "$KEYFILE" "$ROOTFS/root/.soloist/key"
-
-# Reuse a pairing done earlier (the old layout, or one imported from another machine).
+install -m 600 "$KEYFILE" "$ROOTFS/root/.soloist/key"
+# Keep a pairing made with the earlier scripts.
 OLD="$ROOTFS/root/.local/share/soloist/soloist-data"
 if [ ! -d "$ROOTFS/root/.soloist/data" ] && [ -d "$OLD" ]; then
   cp -r "$OLD" "$ROOTFS/root/.soloist/data"; say "reusing the earlier pairing"
 fi
-SEED="$HOME/storage/downloads/soloist-data"
-if [ ! -d "$ROOTFS/root/.soloist/data/settings" ] && [ -d "$SEED" ]; then
-  cp -r "$SEED" "$ROOTFS/root/.soloist/data"; say "imported the pairing from Downloads/soloist-data"
-fi
 
-# ---- Debian side (written fresh each run) -----------------------------------------------
+# ---- Debian side: written fresh each run ------------------------------------------------------
 
-mkdir -p "$ROOTFS/root" || { say "cannot write into $ROOTFS"; exit 1; }
-cat > "$ROOTFS/root/cabineq-soloist-inner.sh" <<'INNER'
+cat > "$ROOTFS/root/cabineq-session.sh" <<'SESSION'
 #!/bin/bash
+# One session: PulseAudio + socat + Soloist, sharing one lifetime.
 set -uo pipefail
-MODE=$1
-PORT=$2
+MODE=$1; PORT=$2; DEVICE=$3
 BASE=/root/.soloist
 BIN=$BASE/bin/soloist
 DATA=$BASE/data
-KEY=$(cat $BASE/key 2>/dev/null || true)
-CMD=/root/.soloist/cli.sh
-TERMUX_SOCK=/data/data/com.termux/files/usr/var/run/pulse/native
-say() { echo "[debian] $*"; }
-# proot has no /run/user/0: PulseAudio needs somewhere to put its socket.
-export XDG_RUNTIME_DIR=/tmp/cabineq-runtime
-mkdir -p "$XDG_RUNTIME_DIR/pulse" && chmod 700 "$XDG_RUNTIME_DIR"
-export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
-# Pin the socket: pulseaudio runs as root here, and clients must not have to guess its path.
-export PULSE_SERVER="unix:$XDG_RUNTIME_DIR/pulse/native"
+RUN=/tmp/cabineq-runtime
+FIFO=$RUN/cabineq.fifo
+export XDG_RUNTIME_DIR=$RUN
+export PULSE_SERVER=unix:$RUN/pulse/native
+say() { echo "$(date '+%H:%M:%S') [debian] $*"; }
 
 install_deps() {
   local need=""
-  for p in curl ca-certificates libatomic1 pulseaudio pulseaudio-utils dbus sox socat netcat-openbsd; do
+  for p in curl ca-certificates libatomic1 pulseaudio pulseaudio-utils socat; do
     dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
   done
   if [ -n "$need" ]; then
     say "installing:$need"
-    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $need >/dev/null
+    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $need >/dev/null || return 1
   fi
 }
 
 fetch_soloist() {
-  [ -x "$BIN" ] && "$BIN" --version >/dev/null 2>&1 && return 0
+  # An expired build exits with 10 (also on --version, presumably): download a fresh one.
+  if [ -x "$BIN" ] && "$BIN" --version >/dev/null 2>&1; then return 0; fi
   say "downloading Soloist from Spotify"
   local tmp; tmp=$(mktemp -d)
-  curl -fsSL -o "$tmp/s.tgz" https://soloist-builds.spotifycdn.com/soloist_release_arm64.tar.gz || { say "download failed"; return 1; }
+  curl -fsSL -o "$tmp/s.tgz" https://soloist-builds.spotifycdn.com/soloist_release_arm64.tar.gz \
+    || { say "download failed"; rm -rf "$tmp"; return 1; }
   tar xzf "$tmp/s.tgz" -C "$tmp"
   local f; f=$(find "$tmp" -type f -name soloist | head -1)
-  [ -n "$f" ] || { say "no soloist binary in the archive"; return 1; }
+  [ -n "$f" ] || { say "no soloist binary in the archive"; rm -rf "$tmp"; return 1; }
   mkdir -p "$BASE/bin" && install -m 755 "$f" "$BIN" && rm -rf "$tmp"
-  "$BIN" --version | head -1
+  say "Soloist $("$BIN" --version 2>&1 | head -1)"
 }
 
-write_pulse_conf() {
-  mkdir -p /root/.config/pulse
-  # No .fail and no set-default-sink here: a tunnel that cannot connect must not take the
-  # daemon (and with it the whole source) down. The default is set once the sink is known.
-  cat > /root/.config/pulse/default.pa <<'EOF'
-load-module module-native-protocol-unix socket=/tmp/cabineq-runtime/pulse/native auth-anonymous=1
-load-module module-tunnel-sink server=unix:/data/data/com.termux/files/usr/var/run/pulse/native sink_name=CabinEQ
-EOF
-  # A tunnel to Termux's own PulseAudio, for testing on the phone speaker:
-  #   pactl load-module module-tunnel-sink server=unix:/data/data/com.termux/files/usr/var/run/pulse/native sink_name=Speaker
-  #   pactl load-module module-loopback source=CabinEQ.monitor sink=Speaker
-}
+key_args() { [ -s "$BASE/key" ] && printf -- '-k\n%s\n' "$(cat "$BASE/key")"; }
 
-start_audio() {
-  pkill -x soloist 2>/dev/null
-  pkill -x pipewire 2>/dev/null; pkill -x wireplumber 2>/dev/null
-  pulseaudio --kill 2>/dev/null; sleep 1
-  rm -f "$XDG_RUNTIME_DIR/pulse/native"
-  # Not --start: a daemonised PulseAudio is orphaned when this proot session ends, so it runs
-  # here in the background and lives exactly as long as the session does.
-  pulseaudio --exit-idle-time=-1 --log-target=stderr >/tmp/cabineq-pulse.log 2>&1 &
-  for _ in $(seq 1 40); do pactl info >/dev/null 2>&1 && break; sleep 0.5; done
-  pactl set-default-sink CabinEQ
-  pactl set-sink-volume CabinEQ 100%
-  pactl info | grep -E "Default Sink|Server String"
-  pactl list short sinks
-  # The tunnel may take a moment, or fail if Termux's PulseAudio is not up yet. Say which, and
-  # only claim a default when the sink is really there.
-  for i in $(seq 1 20); do
-    pactl list short sinks | grep -q CabinEQ && break
-    sleep 0.5
-  done
-  if pactl list short sinks | grep -q CabinEQ; then
-    pactl set-default-sink CabinEQ
-    say "CabinEQ sink ready"
-  else
-    say "CabinEQ sink missing: is Termux PulseAudio running? (tail -5 /tmp/cabineq-pulse.log)"
-  fi
-}
+# Soloist leaves its session marker behind when it is killed, and then refuses to start
+# ("another session is running for data directory"): only stale ones get here.
+clear_stale() { rm -f "$DATA/soloist.pid" "$DATA/.lock" "$DATA/ws.addr" "$DATA/ws.port" 2>/dev/null; }
 
-serve_pcm() {
-  # socat, not a standing parec | nc: a reader that is always attached but has no client lets
-  # the monitor accumulate, and then the app starts on a backlog (measured: 68 s behind). socat
-  # starts a fresh parec for each connection, so a client always joins the live edge.
-  pkill -f "nc -l -p $PORT" 2>/dev/null
+children=()
+cleanup() {
+  for p in "${children[@]}"; do kill "$p" 2>/dev/null; done
   pkill -x socat 2>/dev/null
-  pkill -x parec 2>/dev/null
-  nohup socat TCP-LISTEN:$PORT,reuseaddr,fork \
-    EXEC:"parec -d CabinEQ.monitor --format=s16le --rate=44100 --channels=2 --raw",nofork \
-    >/tmp/cabineq-socat.log 2>&1 &
-  sleep 1
-  say "serving PCM on 127.0.0.1:$PORT (socat + parec per connection)"
-}
-
-start_soloist() {
-  # setsid: the proot session that starts this exits, and a plain child would be hung up.
-  if [ -n "$KEY" ]; then
-    setsid nohup "$BIN" -n CabinEQ -k "$KEY" -D "$DATA" -i 100 >/tmp/cabineq-soloist.log 2>&1 &
-  else
-    setsid nohup "$BIN" -n CabinEQ -D "$DATA" -i 100 >/tmp/cabineq-soloist.log 2>&1 &
-  fi
-  sleep 3
-  if pgrep -x soloist >/dev/null; then
-    say "Soloist running (pid $(pgrep -x soloist | head -1))"
-    grep -E "AudioDriver|PipeWire|Pulse|error|Error| E " /tmp/cabineq-soloist.log | tail -5
-    return 0
-  else
-    say "Soloist exited:"
-    tail -20 /tmp/cabineq-soloist.log
-    return 1
-  fi
+  pulseaudio --kill 2>/dev/null
 }
 
 case "$MODE" in
-  setup) install_deps && fetch_soloist && write_pulse_conf && say "setup done" ;;
+  setup)
+    install_deps && fetch_soloist && say "setup done"
+    ;;
+
   pair)
     install_deps && fetch_soloist || exit 1
-    write_pulse_conf; start_audio
-    say "on Wi-Fi: open Spotify, tap the devices icon and pick CabinEQ"
-    if [ -n "$KEY" ]; then
-      "$BIN" --pair -n CabinEQ -k "$KEY" -D "$DATA" 2>&1 | grep -E 'pairing|error|Error| E ' --line-buffered
-    else
-      "$BIN" --pair -n CabinEQ -D "$DATA" 2>&1 | grep -E 'pairing|error|Error| E ' --line-buffered
-    fi
+    clear_stale
+    mapfile -t K < <(key_args)
+    say "on Wi-Fi: open Spotify, play anything, tap the devices icon and pick '$DEVICE'"
+    "$BIN" --pair -n "$DEVICE" "${K[@]}" -D "$DATA" 2>&1 | grep -E 'pairing|error|Error| E ' --line-buffered
     ;;
-  play)
-    install_deps && fetch_soloist && write_pulse_conf || exit 1
-    start_audio
-    serve_pcm
-    start_soloist || say "Soloist is not up yet: give it a key (bash cabineq-soloist.sh key)"
-    say "playing. In Spotify, pick CabinEQ and press play."
-    # Hold the session open while its PulseAudio is alive. proot's PulseAudio does die on its
-    # own now and then; when it does, exit so the supervisor below replaces the whole session.
+
+  run)
+    install_deps && fetch_soloist || exit 1
+    trap cleanup EXIT
+    pkill -x pipewire 2>/dev/null; pkill -x wireplumber 2>/dev/null
+    pulseaudio --kill 2>/dev/null; pkill -x socat 2>/dev/null; sleep 1
+    mkdir -p "$RUN/pulse" /root/.config/pulse && chmod 700 "$RUN"
+    rm -f "$RUN/pulse/native" "$FIFO"
+
+    # The only sink: a pipe, paced by whoever drains it. No suspend-on-idle (the module is not
+    # loaded), so a paused Spotify still yields a steady stream of silence at the reader's pace.
+    cat > /root/.config/pulse/default.pa <<EOF
+load-module module-native-protocol-unix socket=$RUN/pulse/native auth-anonymous=1
+load-module module-pipe-sink file=$FIFO sink_name=CabinEQ format=s16le rate=44100 channels=2 use_system_clock_for_timing=no
+set-default-sink CabinEQ
+EOF
+    pulseaudio --exit-idle-time=-1 --log-target=stderr >/tmp/cabineq-pulse.log 2>&1 &
+    children+=($!)
+    up=""
+    for _ in $(seq 1 40); do pactl list short sinks 2>/dev/null | grep -q CabinEQ && { up=1; break; }; sleep 0.5; done
+    if [ -z "$up" ]; then
+      say "PulseAudio did not come up:"; grep -E '^E:' /tmp/cabineq-pulse.log | tail -5; exit 1
+    fi
+    pactl set-sink-volume CabinEQ 100% 2>/dev/null
+    say "pipe sink ready ($FIFO)"
+
+    # One client at a time; a new socat (fresh FIFO reader) for each. Small socket buffers keep
+    # the backlog — and so the delay between a tap in Spotify and the sound — short.
+    (
+      while true; do
+        socat -u OPEN:"$FIFO",rdonly TCP-LISTEN:"$PORT",bind=127.0.0.1,reuseaddr,sndbuf=32768 2>/dev/null
+        sleep 0.3
+      done
+    ) &
+    children+=($!)
+    say "serving PCM on 127.0.0.1:$PORT"
+
+    clear_stale
+    mapfile -t K < <(key_args)
+    say "starting Soloist as '$DEVICE'"
+    "$BIN" -n "$DEVICE" "${K[@]}" -D "$DATA" -i 100 >/tmp/cabineq-soloist.log 2>&1 &
+    sp=$!
+    children+=($sp)
+
+    # The session lives exactly as long as all three pieces do.
     while true; do
       sleep 5
-      timeout 3 pactl info >/dev/null 2>&1 || { say "pulseaudio went away: restarting the session"; exit 1; }
+      if ! kill -0 "$sp" 2>/dev/null; then
+        wait "$sp"; code=$?
+        if [ "$code" = 10 ]; then
+          say "Soloist build expired: downloading a new one"; rm -f "$BIN"; fetch_soloist
+        elif grep -q 'pairing mode' /tmp/cabineq-soloist.log; then
+          say "Soloist is not paired: run 'bash cabineq-soloist.sh pair'"; sleep 60
+        else
+          say "Soloist exited ($code):"; grep -E ' E | W ' /tmp/cabineq-soloist.log | tail -5
+        fi
+        exit 1
+      fi
+      pgrep -x pulseaudio >/dev/null || { say "PulseAudio died:"; grep -E '^E:' /tmp/cabineq-pulse.log | tail -3; exit 1; }
     done
     ;;
-  status)
-    say "--- pulse"; pactl info 2>&1 | grep -E "Default Sink|Server String|Server Name"
-    say "--- sinks"; pactl list short sinks
-    say "--- playback streams"; pactl list short sink-inputs
-    say "--- pcm server"; pgrep -af "socat TCP-LISTEN:$PORT" | head -2 || say "no PCM server running"
-    say "--- soloist"; pgrep -x soloist >/dev/null && echo "running" || echo "not running"
-    say "--- volume"; pactl get-sink-volume CabinEQ 2>&1 | head -1
+esac
+SESSION
+chmod 755 "$ROOTFS/root/cabineq-session.sh"
+
+# ---- run --------------------------------------------------------------------------------------
+
+session() { proot-distro login debian -- bash /root/cabineq-session.sh "$1" "$PORT" "$DEVICE"; }
+
+case "$MODE" in
+  setup) session setup ;;
+  pair)  kill_all; session pair; say "paired. Next: bash $0 start" ;;
+  start)
+    kill_all
+    command -v termux-wake-lock >/dev/null && termux-wake-lock
+    setsid nohup bash "$0" __supervise >>"$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    say "started (supervisor pid $!). In Spotify, pick '$DEVICE' and press play; then switch on"
+    say "'Spotify via Soloist' in CabinEQ. Watch: tail -f $LOG"
     ;;
-  stop)
-    pkill -x soloist 2>/dev/null
-    pkill -f "nc -l -p $PORT" 2>/dev/null
-    pkill -x socat 2>/dev/null
-    pkill -x parec 2>/dev/null
-    pactl unload-module module-simple-protocol-tcp 2>/dev/null
-    pulseaudio --kill 2>/dev/null
-    say "stopped"
+  __supervise)
+    say "supervisor up"
+    fails=0
+    while true; do
+      t0=$(date +%s)
+      session run
+      # A session that dies within a minute, repeatedly, is broken, not unlucky: back off.
+      if [ $(( $(date +%s) - t0 )) -lt 60 ]; then fails=$((fails + 1)); else fails=0; fi
+      wait_s=$(( fails < 5 ? 3 : 30 ))
+      say "session ended; restarting in ${wait_s}s"
+      pkill -x soloist 2>/dev/null; pkill -x socat 2>/dev/null; pkill -x pulseaudio 2>/dev/null
+      sleep "$wait_s"
+    done
     ;;
 esac
-INNER
-chmod 755 "$ROOTFS/root/cabineq-soloist-inner.sh"
-[ -s "$ROOTFS/root/cabineq-soloist-inner.sh" ] || { say "the inner script was not written"; exit 1; }
-
-# ---- run it -----------------------------------------------------------------------------
-
-[ "$MODE" != stop ] && command -v termux-wake-lock >/dev/null && termux-wake-lock || true
-status=0
-if [ "$MODE" = play ]; then
-  # Detached: the session must outlive this shell, because PulseAudio and Soloist are its
-  # children. stop kills the session.
-  pkill -f "while true; do proot-distro login" 2>/dev/null
-  PORT_FOR_WATCH="$PORT" LOG_FOR_WATCH=/sdcard/Download/soloist-play.log \
-  setsid nohup bash -c 'while true; do
-      proot-distro login debian -- bash /root/cabineq-soloist-inner.sh play "$PORT_FOR_WATCH" >> "$LOG_FOR_WATCH" 2>&1
-      echo "[cabineq] session ended, restarting in 3 s" >> "$LOG_FOR_WATCH"
-      sleep 3
-    done' >/dev/null 2>&1 &
-  sleep 12
-  say "started in the background; log: /sdcard/Download/soloist-play.log"
-else
-  if [ "$MODE" = stop ]; then
-    pkill -f cabineq-soloist-inner 2>/dev/null
-  fi
-  proot-distro login debian -- bash /root/cabineq-soloist-inner.sh "$MODE" "$PORT" || status=$?
-fi
-[ "$MODE" = stop ] && command -v termux-wake-unlock >/dev/null && termux-wake-unlock || true
-say "exit $status (log: $LOG)"
-exit $status
