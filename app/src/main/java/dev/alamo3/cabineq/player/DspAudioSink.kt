@@ -97,11 +97,24 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         // Only decoded PCM may enter the engine. Claiming a compressed format makes Media3 take
         // the sink at its word and enable bypass: no decoder, and MP3 bytes arrive here to be
         // read as samples, which is heard as pure distortion.
-        format.sampleMimeType == MimeTypes.AUDIO_RAW && delegate.supportsFormat(sinkFormat(format))
+        getFormatSupport(format) != AudioSink.SINK_FORMAT_UNSUPPORTED
 
-    override fun getFormatSupport(format: Format): Int =
-        if (format.sampleMimeType == MimeTypes.AUDIO_RAW) delegate.getFormatSupport(sinkFormat(format))
-        else AudioSink.SINK_FORMAT_UNSUPPORTED
+    override fun getFormatSupport(format: Format): Int {
+        if (format.sampleMimeType != MimeTypes.AUDIO_RAW) return AudioSink.SINK_FORMAT_UNSUPPORTED
+        val support = delegate.getFormatSupport(sinkFormat(format))
+        // Media3 asks "do you take float directly?" and, on a yes, tells every decoder to produce
+        // float. Not every decoder that accepts that request keeps its word about what comes
+        // out, and a stream read at the wrong word size is full-scale noise. Answering "yes, but
+        // not directly" leaves decoders on their own 16-bit output, declared honestly — exactly
+        // what the built-in player is fed — while a source that really is float PCM still plays.
+        // The setting asks for float anyway, for a phone whose decoders are known to be honest.
+        if (format.pcmEncoding == C.ENCODING_PCM_FLOAT && support == AudioSink.SINK_FORMAT_SUPPORTED_DIRECTLY &&
+            !bridge.settings.floatDecoding
+        ) {
+            return AudioSink.SINK_FORMAT_SUPPORTED_WITH_TRANSCODING
+        }
+        return support
+    }
 
     /** What we will actually give the delegate: float, stereo, at the device's rate. */
     private fun sinkFormat(format: Format): Format {
@@ -228,33 +241,20 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         pending?.let { p ->
             if (!delegate.handleBuffer(p, pendingUs, 0)) return false
             pending = null
-            return true
         }
+        // The re-offered input was converted on the earlier call (its position is at its end).
+        // Anything else is new audio — after a change of stream the buffer is not the one that
+        // was refused — and goes through the engine as usual.
         if (!buffer.hasRemaining()) return true
         if (inChannels <= 0) {
             Log.e(TAG, "buffer with $inChannels channels: dropped")
             buffer.position(buffer.limit())
             return true
         }
-        // The decoder's word for its own samples is checked continuously while we read float. It
-        // has to be: Media3 configures the sink once per format, so a later song that decodes to
-        // a different word size — which is what file-backed songs were doing — never reconfigures
-        // it, and the previous song's interpretation turns the new one into noise.
-        if (readEncoding == Pcm.ENCODING_FLOAT) {
-            if (Pcm.floatIsImpossible(buffer, inChannels)) {
-                val reading = Pcm.alternativeToFloat(buffer, inChannels)
-                if (reading.switched) {
-                    readEncoding = reading.encoding
-                    inputDescription = "declared ${Pcm.name(inEncoding)}, reads as ${Pcm.name(readEncoding)}"
-                    Log.w(TAG, "sample format: ${reading.note}")
-                }
-            }
-        } else if (Pcm.floatReadsAsAudio(buffer, inChannels)) {
-            // The correction was for the song before this one: what arrives now is plainly float.
-            Log.i(TAG, "sample format: back to ${Pcm.name(inEncoding)} — the data is audio as declared")
-            readEncoding = inEncoding
-            inputDescription = "declared ${Pcm.name(inEncoding)}"
-        }
+        // The samples are read as what the decoder declared, and nothing else. An earlier version
+        // second-guessed the declaration from the look of each buffer; at the quiet start or end
+        // of a song that guess could flip for a buffer or two, and float read as 16-bit (or the
+        // reverse) is a burst of full-scale noise — the screech at every change of song.
         val frameBytes = Pcm.bytesPerSample(readEncoding) * inChannels
         val frames = buffer.remaining() / frameBytes
         if (!described) {
@@ -276,6 +276,8 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
             if (produced > 0) out = floatBuffer(produced)
         }
         buffer.position(buffer.limit())
+        tailFlushed = false
+        if (inRate > 0) endUs = presentationTimeUs + frames * 1_000_000L / inRate
         // Nothing came out (the resampler is filling, or the engine failed): consumed, no write.
         if (out == null) return true
         if (delegate.handleBuffer(out, presentationTimeUs, 0)) return true
@@ -295,18 +297,40 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         return outBytes
     }
 
+    /** Where the audio handed in so far ends, for the tail's timestamp. */
+    private var endUs = 0L
+    /** The resampler's look-ahead has been pushed out for this stream. */
+    private var tailFlushed = false
+
+    /** Called on every render pass once the stream has ended, until [isEnded]. */
     override fun playToEndOfStream() {
-        var produced = 0
-        synchronized(bridge.dspLock) {
-            if (handle != 0L) {
-                val cap = NativeDsp.maxFrames(handle, 1024)
-                if (cap > 0) {
-                    if (outFloat.size < cap * 2) outFloat = FloatArray(cap * 2)
-                    produced = NativeDsp.flush(handle, outFloat, cap)
+        // Audio the AudioTrack had no room for comes first, and [outBytes] is not reused until
+        // the delegate has all of it.
+        pending?.let { p ->
+            if (!delegate.handleBuffer(p, pendingUs, 0)) return
+            pending = null
+        }
+        if (!tailFlushed) {
+            tailFlushed = true
+            var produced = 0
+            synchronized(bridge.dspLock) {
+                if (handle != 0L) {
+                    val cap = NativeDsp.maxFrames(handle, 1024)
+                    if (cap > 0) {
+                        if (outFloat.size < cap * 2) outFloat = FloatArray(cap * 2)
+                        produced = NativeDsp.flush(handle, outFloat, cap)
+                    }
+                }
+            }
+            if (produced > 0) {
+                val tail = floatBuffer(produced)
+                if (!delegate.handleBuffer(tail, endUs, 0)) {
+                    pending = tail
+                    pendingUs = endUs
+                    return
                 }
             }
         }
-        if (produced > 0) delegate.handleBuffer(floatBuffer(produced), 0, 0)
         delegate.playToEndOfStream()
     }
 
@@ -314,15 +338,15 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         // ExoPlayer says this on every stream change, gapless or not (MediaCodecAudioRenderer
         // .onProcessedStreamChange). Tearing the resampler down and fading in here is what made
         // every join duck; a format change arrives through configure(), a seek through flush().
-        pending = null
-        // A new song: whatever word size the last one needed says nothing about this one. The
-        // per-buffer check re-learns it on this very buffer, before it is converted.
-        readEncoding = inEncoding
+        // Audio of the song that is ending which the AudioTrack had no room for stays queued: it
+        // is written before the next song's first buffer. Dropping it here cut the last few
+        // milliseconds off every song.
         delegate.handleDiscontinuity()
     }
 
     override fun flush() {
         pending = null
+        tailFlushed = false
         synchronized(bridge.dspLock) {
             if (handle != 0L) {
                 NativeDsp.setInputRate(handle, 0)

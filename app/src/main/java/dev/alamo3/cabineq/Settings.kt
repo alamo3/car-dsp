@@ -189,6 +189,16 @@ class Settings(context: Context) {
         set(v) = prefs.edit().putBoolean(KEY_MEDIA3, v).apply()
 
     /**
+     * Ask decoders for 32-bit float instead of their own 16-bit output (Media3 engine only), so
+     * 24-bit files reach the DSP at full precision. Off by default: a decoder that accepts the
+     * request but still produces 16-bit is heard as noise, and the declared format is all there
+     * is to go by.
+     */
+    var floatDecoding: Boolean
+        get() = prefs.getBoolean("float_decoding", false)
+        set(v) = prefs.edit().putBoolean("float_decoding", v).apply()
+
+    /**
      * 4th-order high-pass at 30 Hz, before the EQ. On by default: a boosted shelf in front of
      * nothing spends its headroom on frequencies a car door cannot reproduce, and the limiter
      * then pulls the audible bass down with them.

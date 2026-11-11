@@ -2350,6 +2350,14 @@ class MusicActivity : Activity() {
             "Media3 is Google's player: it does the fetching, buffering and the hand-over between songs, and your EQ and limiter run on its audio exactly as before. " +
                 "Loudness matching is not available with it yet: use the built-in engine if you depend on it. Applies from the next song you start.",
             12f, Ui.TEXT_2, lines = 6).apply { setPadding(0, dp(8), 0, dp(12)) })
+        page.addView(Ui.pill(this, "High-resolution decoding: ${if (settings.floatDecoding) "on" else "off"}", filled = false) {
+            settings.floatDecoding = !settings.floatDecoding
+            renderSettings()
+        }, wrapLp(top = 4))
+        page.addView(Ui.text(this,
+            "Media3 engine only. Off: songs are decoded to 16-bit, as the built-in engine does. On: decoders are asked for 32-bit float, so 24-bit files keep their full precision through the EQ. " +
+                "Experimental: if songs turn to noise with it on, this phone's decoders don't honour the request, so turn it off. Applies after the app is restarted.",
+            12f, Ui.TEXT_2, lines = 6).apply { setPadding(0, dp(8), 0, dp(12)) })
         page.addView(Ui.pill(this, "Play while downloading: ${if (settings.progressivePlayback) "on" else "off"}", filled = false) {
             settings.progressivePlayback = !settings.progressivePlayback
             renderSettings()
