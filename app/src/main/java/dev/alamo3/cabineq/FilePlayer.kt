@@ -695,6 +695,8 @@ class FilePlayer private constructor(private val context: Context) {
 
     /** True while the radio tops the queue up by itself. */
     val radioActive: Boolean get() = radioSeed != null
+    /** A radio lookup is running (the queue screen says so while nothing is queued yet). */
+    val radioLooking: Boolean get() = radioBusy
 
     /** Removes an upcoming entry. Refuses to touch the current or already-played entries. */
     fun removeUpcoming(key: String): Boolean {
