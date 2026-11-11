@@ -47,6 +47,8 @@ object AudioPath {
         val carPolicy: String,
         /** Is the Bluetooth high-frequency guard engaged on this route? */
         val hfGuard: String,
+        /** Spotify through Soloist (loopback PCM), when it is running. */
+        val soloist: String?,
         /** What the decoder feeds the Media3 sink (null on the built-in engine, or before a song). */
         val dspIn: String?,
         /** False when the player is idle: the rows then describe the device, not a stream. */
@@ -96,6 +98,7 @@ object AudioPath {
             route = device?.label(),
             carPolicy = CarVolume.describe(context),
             hfGuard = hfGuardState(context, device),
+            soloist = SoloistInput.describe().takeIf { SoloistInput.isRunning },
             dspIn = player?.dspInputDescription,
             hasStream = player?.currentTrack != null || (player?.sourceSampleRate ?: 0) > 0,
         )
@@ -124,6 +127,7 @@ object AudioPath {
         if (f.hasStream && rate > 0) add(Row("Track", "PCM float · ${rate / 1000.0} kHz · stereo"))
         // What the decoder actually hands the DSP: the one place a lying decoder is visible.
         f.dspIn?.let { add(Row("DSP in", it)) }
+        f.soloist?.let { add(Row("Soloist", it)) }
 
         if (f.deviceRate != null) {
             val buf = f.framesPerBuffer?.let { " · $it frames/buffer" } ?: ""

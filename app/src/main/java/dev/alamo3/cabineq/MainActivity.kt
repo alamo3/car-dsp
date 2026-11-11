@@ -241,6 +241,27 @@ class MainActivity : Activity() {
             alpha = 0.7f
             setPadding(0, 0, 0, dp(8))
         })
+        root.addView(switch("Spotify via Soloist", SoloistInput.isRunning) { on ->
+            if (on) {
+                // Two players at once is not a feature: the app's own queue steps aside.
+                FilePlayer.peek()?.pause()
+                if (!SoloistInput.start(this)) {
+                    // describe() carries the reason; the report below shows it.
+                    android.widget.Toast.makeText(this, SoloistInput.describe(), android.widget.Toast.LENGTH_LONG).show()
+                }
+            } else {
+                SoloistInput.stop()
+            }
+            refreshOutputPath()
+        })
+        root.addView(TextView(this).apply {
+            text = "Spotify played by Soloist in Termux, collected over the loopback socket " +
+                "(tools/cabineq-soloist.sh) and run through the same EQ and limiter. Nothing else " +
+                "has to be muted, and it works while the screen is off."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(8))
+        })
         root.addView(switch("Volume to max in the car", settings.maxVolumeInCar) { on ->
             settings.maxVolumeInCar = on
             CarVolume.sync(this)
