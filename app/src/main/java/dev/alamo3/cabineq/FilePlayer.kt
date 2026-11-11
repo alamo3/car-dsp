@@ -1,6 +1,7 @@
 package dev.alamo3.cabineq
 
 import android.content.Context
+import dev.alamo3.cabineq.music.GrowingDownload
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
@@ -56,6 +57,13 @@ class FilePlayer private constructor(private val context: Context) {
         private set
     /** Stable per-entry ids for the queue, aligned with [queue]; used by the Jam session. */
     @Volatile private var queueKeys: List<String> = emptyList()
+    /**
+     * Entries moved down the queue because their source is still caching them (see
+     * [dev.alamo3.cabineq.player.ExoEngine]): the lists say so, so a song that jumps to the end
+     * does not look like it was lost.
+     */
+    @Volatile var waitingKeys: Set<String> = emptySet()
+        private set
     @Volatile var positionMs = 0L
         private set
     /** When the decode loop last moved the play head; used to detect a dead output sink. */
@@ -152,6 +160,7 @@ class FilePlayer private constructor(private val context: Context) {
     fun setRepeat(mode: Repeat) {
         if (repeat == mode) return
         repeat = mode
+        exo?.repeat(mode)
         version++
         persistPool.execute { runCatching { settings.repeatMode = mode.name } }
     }
@@ -183,6 +192,7 @@ class FilePlayer private constructor(private val context: Context) {
         if (r > 0 && r != deviceRate) {
             deviceRate = r
             routeEpoch++
+            if (exoActive) exo?.routeChanged()
             runCatching { refreshRouteDependentParams() }
             Log.i(TAG, "device mixes at $r Hz")
             runCatching { CarVolume.sync(context) }
@@ -226,6 +236,7 @@ class FilePlayer private constructor(private val context: Context) {
     fun onRateSettingChanged() {
         refreshDeviceRate()
         routeEpoch++
+        if (exoActive) exo?.routeChanged()
     }
     private var thread: Thread? = null
 
@@ -274,6 +285,114 @@ class FilePlayer private constructor(private val context: Context) {
     @Volatile private var current: Output? = null
     private val meterScratch = FloatArray(5)
 
+    /**
+     * Designs the whole chain for [rate] (user EQ, cabin correction, limiter, Bluetooth guard)
+     * and pushes it into the native engine at [handle]. One implementation for both players, so
+     * the engine is configured identically whichever one feeds it. Call under [eqLock].
+     */
+    private fun pushEqLocked(handle: Long, rate: Int, bluetooth: Boolean): Boolean {
+        val bands = eqBands ?: return false
+        if (handle == 0L) return false
+        val user = EqDesign.designAll(bands, rate.toDouble())
+        // Cabin correction rides on the same engine, as extra biquads after the user's bands.
+        val cabin = cabinCurve()
+        val coeffs = if (cabin == null) user else user + cabin.coeffs(rate.toDouble(), settings.cabinAmount)
+        val bandCount = bands.size + (cabin?.bands?.size ?: 0)
+        val preamp = eqPreampDb + (cabin?.preampFor(settings.cabinAmount) ?: 0.0).toFloat()
+        val guard = if (settings.bluetoothHfGuard && bluetooth) EqDesign.lowPass(rate.toDouble(), 15500.0) else null
+        NativeDsp.setParams(
+            handle, coeffs, bandCount, EqService.dbToLin(preamp), eqLimiterLin,
+            guard, if (guard == null) 0 else 2,
+        )
+        return true
+    }
+
+    /** The active cabin correction, unless it is off or bypassed. */
+    private fun cabinCurve(): dev.alamo3.cabineq.cabin.CabinCorrection.Curve? {
+        if (settings.cabinBypass || settings.cabinAmount <= 0f) return null
+        val name = settings.cabinActive
+        if (name.isBlank()) return null
+        return dev.alamo3.cabineq.cabin.CabinCorrection.Curve.fromJson(settings.cabinCurve(name))
+    }
+
+    // ---------------------------------------------------------------- the Media3 engine
+
+    /** The second player (Settings → Playback → Player engine). Created on first use. */
+    @Volatile private var exo: dev.alamo3.cabineq.player.ExoEngine? = null
+    /** True while the Media3 engine, not the worker below, is the one playing the queue. */
+    @Volatile private var exoActive = false
+
+    /**
+     * Builds the Media3 engine before the first tap when it is the one in use: opening its disk
+     * cache and creating the player took a few hundred ms of the first song's start.
+     */
+    private fun warmUp() {
+        if (settings.media3Player) exoEngine().warmUp()
+    }
+
+    private fun exoEngine(): dev.alamo3.cabineq.player.ExoEngine =
+        exo ?: synchronized(this) {
+            exo ?: dev.alamo3.cabineq.player.ExoEngine(this, Bridge()).also { exo = it }
+        }
+
+    /**
+     * Everything the Media3 engine may do to this player's published state. The engine runs on
+     * one thread (the main looper) and reports through here; nothing else of the player is open
+     * to it.
+     */
+    internal inner class Bridge {
+        val context: Context get() = this@FilePlayer.context
+        val settings: Settings get() = this@FilePlayer.settings
+        val dspLock: Any get() = eqLock
+        val eqVersion: Int get() = this@FilePlayer.eqVersion
+        val radioOn: Boolean get() = radioSeed != null && repeat == Repeat.OFF
+        val radioLooking: Boolean get() = radioBusy
+
+        fun state(s: State, reason: String? = null) = setState(s, reason)
+        fun index(i: Int) {
+            currentIndex = i
+            version++
+        }
+        fun position(ms: Long) {
+            positionMs = ms
+            lastProgressAt = SystemClock.elapsedRealtime()
+        }
+        fun duration(ms: Long, exact: Boolean) {
+            durationMs = ms
+            durationExact = exact
+        }
+        fun error(text: String?) {
+            lastError = text
+        }
+        fun info(info: FileInfo?) {
+            currentInfo = info
+            version++
+        }
+        fun quality(q: String?) {
+            declaredQuality = q
+        }
+        fun format(mime: String, rate: Int, channels: Int) = updateFormatInfo(mime, rate, 0, channels)
+        fun clearFormat() {
+            formatInfo = null
+            declaredQuality = null
+        }
+        fun snapshot(): Pair<List<Track>, List<String>> = synchronized(eqLock) { queue to queueKeys }
+        fun trackStarted() {
+            extendRadioIfNeeded()
+            scheduleSave()
+        }
+        fun askRadio() = extendRadioIfNeeded(force = true)
+        fun waiting(keys: Set<String>) {
+            if (keys == waitingKeys) return
+            waitingKeys = keys
+            version++
+        }
+        fun targetRate(sourceRate: Int): Int = this@FilePlayer.targetRate(sourceRate)
+        fun pushEq(handle: Long, rate: Int, bluetooth: Boolean): Boolean = pushEqLocked(handle, rate, bluetooth)
+        fun seedEq() = seedEqFromSettings()
+        fun save() = saveQueue()
+    }
+
     // ---------------------------------------------------------------- controls
 
     fun play(
@@ -306,8 +425,11 @@ class FilePlayer private constructor(private val context: Context) {
             // keys, or every guest's "up next" would refer to a track that no longer exists.
         }
         queueTitle = title
-        radioSeed = radio
-        persistPool.execute { runCatching { settings.radioSeed = radio } }
+        // Whatever is played, the music carries on after its last song: an album or playlist ends
+        // into a radio seeded from its last track (when the source knows it), never into silence.
+        val seed = radio ?: tracks.lastOrNull()?.takeIf { it.sourceId != null }
+        radioSeed = seed
+        persistPool.execute { runCatching { settings.radioSeed = seed } }
         lastError = null
         userPaused = false
         focusPaused = false
@@ -322,6 +444,24 @@ class FilePlayer private constructor(private val context: Context) {
         // picked while the player was paused (focus loss, speaker guard, prior pause) would never
         // even open — it looked like "tap a song, nothing happens".
         if (state != State.LOADING) setState(State.LOADING)
+        if (settings.media3Player) {
+            // The Media3 engine takes it from here: it owns fetching, buffering, decoding and
+            // the hand-over between songs. The worker stays retired (stopWorker above).
+            // Show the tapped song at once: the engine reports the index itself, but only after it
+            // has started, and until then the lists, the notification and the car would still show
+            // the previous song while this one loads.
+            currentIndex = startIndex.coerceIn(0, tracks.lastIndex)
+            currentInfo = null
+            note = null
+            version++
+            exoActive = true
+            exoEngine().start(startIndex.coerceIn(0, tracks.lastIndex), startAtMs.coerceAtLeast(0))
+            return
+        }
+        if (exoActive) {
+            exoActive = false
+            exo?.shutdown()
+        }
         val gen = ++generation
         val worker = Worker(gen, startIndex.coerceIn(0, tracks.lastIndex), startAtMs.coerceAtLeast(0))
         val begin = {
@@ -347,6 +487,11 @@ class FilePlayer private constructor(private val context: Context) {
 
     fun pause() {
         if (!isActive) return
+        if (exoActive) {
+            userPaused = true
+            exo?.pause()
+            return
+        }
         userPaused = true
         interrupted = false
         setState(State.PAUSED, "paused by user")
@@ -360,6 +505,11 @@ class FilePlayer private constructor(private val context: Context) {
             if (queue.isNotEmpty()) {
                 play(queue, max(0, currentIndex), queueTitle, startAtMs = positionMs, radio = radioSeed)
             }
+            return
+        }
+        if (exoActive) {
+            userPaused = false
+            exo?.resume()
             return
         }
         userPaused = false
@@ -400,10 +550,31 @@ class FilePlayer private constructor(private val context: Context) {
 
     fun skipTo(index: Int) {
         if (index !in queue.indices) return
+        if (exoActive && isActive) {
+            userPaused = false
+            exo?.skipTo(index)
+            return
+        }
         if (thread?.isAlive == true) {
             userPaused = false
             jumpTo = index
             if (state == State.PAUSED) setState(State.LOADING)
+            // The worker only looks at jumpTo between steps. While it sits inside a network open
+            // or read (the extractor has no way to be interrupted), nothing looks, and the tap
+            // seems dead for as long as that connection takes. If the request is still pending
+            // shortly after, retire that worker and start a fresh one on the wanted track; the
+            // old one finishes on its own and releases what it holds.
+            if (state == State.LOADING) {
+                val genAtTap = generation
+                saveHandler.postDelayed({
+                    if (genAtTap == generation && jumpTo == index && state == State.LOADING &&
+                        index in queue.indices
+                    ) {
+                        Log.w(TAG, "skip to $index not picked up in ${SKIP_PICKUP_MS}ms (worker busy opening a stream): starting a fresh worker")
+                        play(queue, index, queueTitle, radio = radioSeed)
+                    }
+                }, SKIP_PICKUP_MS)
+            }
         } else {
             play(queue, index, queueTitle, radio = radioSeed)
         }
@@ -413,6 +584,13 @@ class FilePlayer private constructor(private val context: Context) {
     fun seekTo(ms: Long) {
         if (!isActive) return
         val target = if (durationMs > 0) ms.coerceIn(0, durationMs) else ms.coerceAtLeast(0)
+        if (exoActive) {
+            positionMs = target
+            version++
+            exo?.seekTo(target)
+            scheduleSave()
+            return
+        }
         seekToMs = target
         positionMs = target
         version++
@@ -422,12 +600,16 @@ class FilePlayer private constructor(private val context: Context) {
     // ---------------------------------------------------------------- queue editing
 
     /** A queue entry with its stable key (the Jam session addresses entries by key). */
-    class QueuedTrack(val key: String, val track: Track)
+    class QueuedTrack(val key: String, val track: Track, val waiting: Boolean = false)
 
     fun queuedTracks(): List<QueuedTrack> = synchronized(eqLock) {
         val q = queue
         val keys = queueKeys
-        q.mapIndexed { i, t -> QueuedTrack(keys.getOrElse(i) { "" }, t) }
+        val waiting = waitingKeys
+        q.mapIndexed { i, t ->
+            val key = keys.getOrElse(i) { "" }
+            QueuedTrack(key, t, key in waiting)
+        }
     }
 
     private fun newKey(): String =
@@ -444,11 +626,14 @@ class FilePlayer private constructor(private val context: Context) {
         synchronized(eqLock) {
             queue = queue + tracks
             queueKeys = queueKeys + keys
+            // Mirrored in the same order the lists change, so the two never disagree.
+            if (exoActive) exo?.added(tracks, keys)
         }
         version++
         saveQueue()
         // A guest or the radio just queued the immediate next track: start caching it now.
-        if (queue.size - tracks.size == currentIndex + 1) {
+        // (The Media3 engine buffers ahead through its own cache.)
+        if (!exoActive && queue.size - tracks.size == currentIndex + 1) {
             MediaCache.prefetch(context, tracks.first())
         }
         return keys
@@ -470,6 +655,7 @@ class FilePlayer private constructor(private val context: Context) {
             if (i <= currentIndex) return false
             queue = queue.toMutableList().also { it.removeAt(i) }
             queueKeys = queueKeys.toMutableList().also { it.removeAt(i) }
+            if (exoActive) exo?.removed(i)
         }
         version++
         saveQueue()
@@ -491,6 +677,7 @@ class FilePlayer private constructor(private val context: Context) {
             k.add(target, keyAt)
             queue = q
             queueKeys = k
+            if (exoActive) exo?.moved(from, target)
         }
         version++
         saveQueue()
@@ -505,7 +692,9 @@ class FilePlayer private constructor(private val context: Context) {
         val seed = radioSeed ?: return
         if (radioBusy) return
         if (repeat != Repeat.OFF) return                   // looping is the user's chosen queue
-        if (!force && currentIndex != queue.lastIndex) return   // something is already queued ahead
+        // Keep two songs queued ahead, not one: a single slow lookup then no longer decides
+        // whether the music carries on, and the song after next can be fetched early too.
+        if (!force && currentIndex < queue.lastIndex - 1) return
         if (!force && state != State.PLAYING && state != State.LOADING) return
         radioBusy = true
         val gen = generation
@@ -515,6 +704,7 @@ class FilePlayer private constructor(private val context: Context) {
             val session = queued.takeLast(5).mapNotNull { it.track.artist?.trim()?.lowercase() }.toSet()
             val currentArtist = queued.getOrNull(currentIndex)?.track?.artist
             val next = runCatching { Radio.next(context, seed, exclude, session, currentArtist) }.getOrNull()
+                ?: localFallback(exclude, queued.getOrNull(currentIndex)?.track)
             radioBusy = false
             if (next == null || gen != generation || radioSeed !== seed) {
                 followNewTrack = false
@@ -522,6 +712,7 @@ class FilePlayer private constructor(private val context: Context) {
             }
             Log.i(TAG, "Radio: queuing \"${next.title}\" — ${next.artist}")
             enqueue(listOf(next))
+            if (!exoActive) MediaCache.prefetch(context, next)
             if (followNewTrack) {
                 // The user pressed "next" at the end of the queue: jump to what just arrived.
                 followNewTrack = false
@@ -530,13 +721,40 @@ class FilePlayer private constructor(private val context: Context) {
                 // Playback ran dry while we were fetching: pick the new track up.
                 skipTo(queue.lastIndex)
             }
+            extendRadioIfNeeded()   // top up to two ahead
         }
+    }
+
+    /**
+     * The radio found nothing (offline, or its pool is used up): something of the listener's own
+     * instead, so the music never just stops. Songs not queued yet first; if all are, any other.
+     */
+    private fun localFallback(exclude: Set<String>, current: Track?): Track? {
+        val pool = runCatching {
+            (Library.liked(context) + MediaBrowse.recentTracks(context)).distinctBy { it.mediaId }
+        }.getOrDefault(emptyList())
+        val fresh = pool.filter { t -> Radio.identity(t).none { it in exclude } }
+        val others = pool.filter { it.mediaId != current?.mediaId }
+        val pick = if (MediaCache.isOnline(context)) {
+            fresh.ifEmpty { others }
+        } else {
+            // No connection: only what is on the phone can play, so choose from that first.
+            val onPhone = others.filter { MediaCache.fileFor(context, it) != null || dev.alamo3.cabineq.player.ExoEngine.cachedWhole(context, it) }
+            val freshIds = fresh.map { it.mediaId }.toSet()
+            onPhone.filter { it.mediaId in freshIds }.ifEmpty { onPhone }.ifEmpty { fresh.ifEmpty { others } }
+        }.randomOrNull()
+        if (pick != null) Log.i(TAG, "Radio: nothing new, falling back to \"${pick.title}\" from your library")
+        return pick
     }
 
     fun stop() {
         followNewTrack = false
         radioSeed = null
         persistPool.execute { runCatching { settings.radioSeed = null } }
+        if (exoActive) {
+            exoActive = false
+            exo?.shutdown()
+        }
         stopWorker()
         abandonFocus()
         positionMs = 0
@@ -550,6 +768,7 @@ class FilePlayer private constructor(private val context: Context) {
      * unblock the worker and pause with a message the user can act on.
      */
     fun recoverStalledOutput(): Boolean {
+        if (exoActive) return false          // Media3 watches its own output
         if (state != State.PLAYING) return false
         val last = lastProgressAt
         val now = SystemClock.elapsedRealtime()
@@ -590,13 +809,14 @@ class FilePlayer private constructor(private val context: Context) {
             eqLimiterLin = limiterThresholdLin
             eqVersion++
             current?.applyEqLocked()
+            if (exoActive) exo?.sink?.applyEq()
         }
     }
 
     /** [inPeak, outPeak, minLimiterGain] since the last call, or null if not playing. */
     fun readMeters(): FloatArray? {
         synchronized(eqLock) {
-            val h = current?.handle ?: 0L
+            val h = if (exoActive) exo?.sink?.handleOrZero ?: 0L else current?.handle ?: 0L
             if (h == 0L || state != State.PLAYING) return null
             NativeDsp.readMeters(h, meterScratch)
             return meterScratch.copyOf()
@@ -734,36 +954,10 @@ class FilePlayer private constructor(private val context: Context) {
         fun routed(): AudioDeviceInfo? = runCatching { track.routedDevice }.getOrNull()
 
         fun applyEqLocked() {
-            val bands = eqBands ?: return
             if (handle == 0L || appliedEq == eqVersion) return
-            val user = EqDesign.designAll(bands, rate.toDouble())
-            // Cabin correction rides on the same engine, as extra biquads after the user's bands.
-            val cabin = cabinCurve()
-            val coeffs = if (cabin == null) user else user + cabin.coeffs(rate.toDouble(), settings.cabinAmount)
-            val bandCount = bands.size + (cabin?.bands?.size ?: 0)
-            val preamp = eqPreampDb + (cabin?.preampFor(settings.cabinAmount) ?: 0.0).toFloat()
-            val guard = guardCoeffs()
-            NativeDsp.setParams(
-                handle, coeffs, bandCount, EqService.dbToLin(preamp), eqLimiterLin,
-                guard, if (guard == null) 0 else 2,
-            )
-            appliedEq = eqVersion
-        }
-
-        /** The active cabin correction, unless it is off or bypassed. */
-        private fun cabinCurve(): dev.alamo3.cabineq.cabin.CabinCorrection.Curve? {
-            if (settings.cabinBypass || settings.cabinAmount <= 0f) return null
-            val name = settings.cabinActive
-            if (name.isBlank()) return null
-            return dev.alamo3.cabineq.cabin.CabinCorrection.Curve.fromJson(settings.cabinCurve(name))
-        }
-
-        /** The Bluetooth guard, or null when it does not apply to this route. */
-        private fun guardCoeffs(): DoubleArray? {
-            if (!settings.bluetoothHfGuard) return null
-            val type = runCatching { track.routedDevice?.type }.getOrNull() ?: return null
+            val type = runCatching { track.routedDevice?.type }.getOrNull()
             val bt = type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-            return if (bt) EqDesign.lowPass(rate.toDouble(), 15500.0) else null
+            if (pushEqLocked(handle, rate, bt)) appliedEq = eqVersion
         }
 
         /** Re-evaluates the guard after a route change, without rebuilding the sink. */
@@ -838,6 +1032,8 @@ class FilePlayer private constructor(private val context: Context) {
         object Cancelled : Outcome()
         class Jump(val index: Int) : Outcome()
         class Failed(val message: String) : Outcome()
+        /** The source is still caching this song: play on, and come back when it is ready. */
+        class NotReady(val message: String) : Outcome()
     }
 
     private inner class Worker(private val gen: Int, private val start: Int, private var startAtMs: Long) : Runnable {
@@ -864,13 +1060,56 @@ class FilePlayer private constructor(private val context: Context) {
             var index = start
             var consecutiveFailures = 0
             var lastOutcomeFailed = false
+            // Songs the source was still caching when their turn came (media id → when they were
+            // set aside). The first song and a song picked by a skip are waited for, with their
+            // progress shown; one reached by itself is set aside so the music does not stop.
+            val deferred = LinkedHashMap<String, Long>()
+            var explicit = true
+            var returning = false
+            var resumeAt = -1
             try {
                 while (live) {
+                    // A song that was still caching comes back as soon as it is on the phone.
+                    if (!returning && deferred.isNotEmpty()) {
+                        val back = readyDeferredIndex(deferred)
+                        if (back >= 0) {
+                            Log.i(TAG, "\"${queue[back].title}\" is ready now: playing it before the rest")
+                            resumeAt = index
+                            index = back
+                            returning = true
+                            explicit = false
+                        }
+                    }
                     if (index !in queue.indices) {
                         // End of the queue: loop it, or stop.
-                        if (repeat == Repeat.ALL && queue.isNotEmpty() && !lastOutcomeFailed) {
+                        if (repeat == Repeat.ALL && queue.isNotEmpty() && !lastOutcomeFailed && deferred.isEmpty()) {
                             index = 0
                             continue
+                        }
+                        // The queue ran out, but more is on its way: songs set aside while the
+                        // source cached them, or the radio's next pick. The worker used to stop
+                        // here; a pick that arrived a moment later then sat in the queue unplayed.
+                        if (!returning && (deferred.isNotEmpty() || (radioSeed != null && repeat == Repeat.OFF))) {
+                            output?.let { drain(it) }
+                            val more = waitForMore(index, deferred)
+                            if (more >= 0) {
+                                resumeAt = queue.size
+                                index = more
+                                returning = true
+                                explicit = false
+                                continue
+                            }
+                            if (more == QUEUE_GREW) {
+                                explicit = false
+                                continue
+                            }
+                            val jump = jumpTo
+                            if (jump >= 0 && live) {
+                                jumpTo = -1
+                                index = jump
+                                explicit = true
+                                continue
+                            }
                         }
                         break
                     }
@@ -898,7 +1137,7 @@ class FilePlayer private constructor(private val context: Context) {
                     queue.getOrNull(index + 1)?.let { MediaCache.prefetch(context, it) }
                     queue.getOrNull(index + 2)?.let { MediaCache.prefetch(context, it) }
                     val outcome = try {
-                        playTrack(track)
+                        playTrack(track, deferIfNotReady = !explicit && queue.size > 1)
                     } catch (e: Exception) {
                         Log.e(TAG, "Track ${queue.getOrNull(index)?.title} failed", e)
                         Outcome.Failed(e.message ?: e.javaClass.simpleName)
@@ -911,6 +1150,8 @@ class FilePlayer private constructor(private val context: Context) {
                         consecutiveFailures = 0
                         reportSkip()
                         index = pendingJump
+                        returning = false
+                        explicit = true
                         continue
                     }
                     lastOutcomeFailed = outcome is Outcome.Failed
@@ -921,7 +1162,22 @@ class FilePlayer private constructor(private val context: Context) {
                             if (repeat != Repeat.ONE) index++   // ONE: replay the same track
                         }
                         Outcome.Cancelled -> return
-                        is Outcome.Jump -> { consecutiveFailures = 0; reportSkip(); index = outcome.index }
+                        is Outcome.Jump -> {
+                            consecutiveFailures = 0
+                            reportSkip()
+                            index = outcome.index
+                            returning = false
+                            explicit = true
+                        }
+                        is Outcome.NotReady -> {
+                            consecutiveFailures = 0
+                            Log.i(TAG, "\"${track.title}\" is still caching (${outcome.message}): playing the next song, will come back to it")
+                            deferred[track.mediaId] = SystemClock.elapsedRealtime()
+                            // The request itself started the caching; keep fetching it in the
+                            // background so it is on the phone when its turn comes round again.
+                            MediaCache.prefetch(context, track, waitMs = DEFERRED_WAIT_MS)
+                            index++
+                        }
                         is Outcome.Failed -> {
                             lastError = "${queue.getOrNull(index)?.title}: ${outcome.message}"
                             if (++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -929,6 +1185,14 @@ class FilePlayer private constructor(private val context: Context) {
                                 return
                             }
                             index++
+                        }
+                    }
+                    if (outcome !is Outcome.Jump) {
+                        explicit = false
+                        // A song that came back from being set aside: carry on where the queue was.
+                        if (returning) {
+                            returning = false
+                            index = resumeAt
                         }
                     }
                 }
@@ -976,6 +1240,74 @@ class FilePlayer private constructor(private val context: Context) {
             }
         }
 
+        /** Index of a set-aside song that is on the phone now (removing it from [deferred]), else -1. */
+        private fun readyDeferredIndex(deferred: MutableMap<String, Long>): Int {
+            val q = queue
+            val now = SystemClock.elapsedRealtime()
+            val iter = deferred.entries.iterator()
+            var found = -1
+            while (iter.hasNext()) {
+                val entry = iter.next()
+                val i = q.indexOfFirst { it.mediaId == entry.key }
+                // Gone from the queue, or set aside too long ago to still be worth waiting for.
+                if (i < 0 || now - entry.value > DEFERRED_MAX_AGE_MS) {
+                    iter.remove()
+                    continue
+                }
+                if (found < 0 && MediaCache.fileFor(context, q[i]) != null) {
+                    found = i
+                    iter.remove()
+                }
+            }
+            return found
+        }
+
+        /**
+         * The queue has run out. Waits for what can still arrive: a set-aside song finishing its
+         * caching (returns its index), or the radio adding its next pick ([QUEUE_GREW]). Returns
+         * -1 on a skip, a stop, or when nothing came.
+         */
+        private fun waitForMore(index: Int, deferred: MutableMap<String, Long>): Int {
+            val started = SystemClock.elapsedRealtime()
+            var lastKick = 0L
+            var lastAsk = 0L
+            var asks = 0
+            try {
+                while (live) {
+                    if (jumpTo >= 0) return -1
+                    if (index in queue.indices) return QUEUE_GREW
+                    val back = readyDeferredIndex(deferred)
+                    if (back >= 0) return back
+                    val now = SystemClock.elapsedRealtime()
+                    val radio = radioSeed != null && repeat == Repeat.OFF
+                    if (radio && !radioBusy && now - lastAsk > 1_500L) {
+                        // Not looking right now: ask (again). A lookup can come back empty.
+                        if (asks >= RADIO_ASKS && deferred.isEmpty()) return -1
+                        if (asks < RADIO_ASKS) {
+                            asks++
+                            lastAsk = now
+                            extendRadioIfNeeded(force = true)
+                        }
+                    }
+                    if (!radio && deferred.isEmpty()) return -1
+                    if (now - started > (if (deferred.isEmpty()) RADIO_WAIT_MS else DEFERRED_WAIT_MS)) return -1
+                    val waitingFor = queue.firstOrNull { it.mediaId in deferred }
+                    setNote(if (radio) "Finding the next song…" else "“${waitingFor?.title ?: "A song"}” is still caching on TorBox…")
+                    if (state != State.PAUSED && state != State.LOADING) setState(State.LOADING)
+                    if (deferred.isNotEmpty() && now - lastKick > 15_000L) {
+                        lastKick = now
+                        // A no-op while its download is still running; restarts one that gave up.
+                        queue.filter { it.mediaId in deferred }
+                            .forEach { MediaCache.prefetch(context, it, waitMs = DEFERRED_WAIT_MS) }
+                    }
+                    SystemClock.sleep(200)
+                }
+                return -1
+            } finally {
+                setNote(null)
+            }
+        }
+
         private fun outputFor(rate: Int): Output {
             output?.let { if (it.rate == rate) return it }
             output?.let { drain(it); it.release() }
@@ -995,29 +1327,63 @@ class FilePlayer private constructor(private val context: Context) {
             }
         }
 
-        private fun playTrack(item: Track): Outcome {
+        private fun playTrack(item: Track, deferIfNotReady: Boolean = false): Outcome {
             // Resolving can block for minutes (TorBox caching, addon 503/Retry-After), so it runs
             // here on the player thread and publishes progress through the note.
             // A pending skip must abandon a slow resolve (TorBox can wait minutes), otherwise
             // pressing next while "preparing" does nothing until it finishes.
             // Downloaded or prefetched: play the local file. Checked before resolving, so a
             // song on the phone starts at once and plays with no network at all.
+            val beganAt = SystemClock.elapsedRealtime()
             val cached = MediaCache.fileFor(context, item)
-            val url = if (cached != null) "" else {
-                val resolved = TrackResolver.resolve(
-                    context,
-                    item,
-                    onNote = { setNote(it) },
-                    isCancelled = { !live || jumpTo >= 0 },
-                )
+            val cancelled = { !live || jumpTo >= 0 }
+            // Not on the phone yet. One download serves both playing and keeping: the player
+            // reads the file while it arrives. If the next-song download is already under way,
+            // join it where it is instead of starting over on a second connection.
+            var growing: GrowingDownload? = if (cached != null || !settings.progressivePlayback) null else
+                MediaCache.activeFor(item)?.takeIf { it.awaitStart(JOIN_WAIT_MS, cancelled) }
+            var url = ""
+            if (cached == null && growing == null) {
+                val resolved = try {
+                    TrackResolver.resolve(
+                        context,
+                        item,
+                        onNote = { setNote(it) },
+                        isCancelled = cancelled,
+                        waitIfPending = !deferIfNotReady,
+                    )
+                } catch (e: dev.alamo3.cabineq.addon.AddonNotReady) {
+                    note = null
+                    return Outcome.NotReady(e.message ?: "still caching")
+                }
                 declaredQuality = resolved.quality
-                resolved.url
+                url = resolved.url
+                if (live && settings.progressivePlayback && (url.startsWith("http://") || url.startsWith("https://"))) {
+                    val opened = runCatching { MediaCache.open(context, item, url) }.getOrNull()
+                    if (opened != null) {
+                        if (opened.awaitStart(START_WAIT_MS, cancelled)) growing = opened
+                        else {
+                            // Could not start (too big for the cache, refused…): stream directly,
+                            // exactly as before.
+                            if (live && jumpTo < 0) Log.i(TAG, "\"${item.title}\": play-while-downloading unavailable (${opened.error ?: opened.state}); streaming directly")
+                            MediaCache.leave(opened)
+                        }
+                    }
+                }
             }
-            if (!live) return Outcome.Cancelled
+            val lookupDoneAt = SystemClock.elapsedRealtime()
+            if (!live) {
+                growing?.let { MediaCache.leave(it) }
+                return Outcome.Cancelled
+            }
             note = null
             // Files without source artwork (e.g. TorBox library tracks): read the cover and tags
             // embedded in the file itself, which is exact per song even on compilations.
-            if (item.artworkUrl == null) readFileInfo(cached?.path ?: url, cached != null, gen, currentIndex)
+            if (item.artworkUrl == null) {
+                val g = growing
+                if (g != null) readFileInfo("", false, gen, currentIndex, g)
+                else readFileInfo(cached?.path ?: url, cached != null, gen, currentIndex)
+            }
 
             leveler = if (!settings.loudnessMatch) null else {
                 val album = item.album?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
@@ -1028,15 +1394,34 @@ class FilePlayer private constructor(private val context: Context) {
                         ?: dev.alamo3.cabineq.music.Leveler.DEFAULT_START_DB,
                 )
             }
-            val extractor = MediaExtractor()
+            var extractor = MediaExtractor()
             var codec: MediaCodec? = null
             try {
+                val g = growing
                 if (cached != null) {
                     Log.i(TAG, "playing cached \"${item.title}\" (${cached.length() / 1024} kB)")
                     extractor.setDataSource(cached.path)
+                } else if (g != null) {
+                    Log.i(TAG, "playing \"${item.title}\" while it downloads (${g.written / 1024} of ${g.total / 1024} kB so far)")
+                    try {
+                        extractor.setDataSource(GrowingSource(g, buffering = true))
+                    } catch (e: Exception) {
+                        if (!live || jumpTo >= 0) throw e
+                        // The platform could not read it this way: fall back to the direct stream.
+                        val direct = url.ifBlank { g.currentUrl }
+                        Log.w(TAG, "\"${item.title}\": could not open the growing file (${e.javaClass.simpleName}: ${e.message}); streaming directly")
+                        runCatching { extractor.release() }
+                        MediaCache.leave(g)
+                        growing = null
+                        extractor = MediaExtractor()
+                        extractor.setDataSource(direct, emptyMap<String, String>())
+                    }
                 } else {
                     extractor.setDataSource(url, emptyMap<String, String>())
                 }
+                // Where the time between songs goes, for when a gap needs explaining.
+                Log.i(TAG, "\"${item.title}\" opened in ${SystemClock.elapsedRealtime() - beganAt} ms " +
+                    "(lookup ${lookupDoneAt - beganAt} ms, source: ${if (cached != null) "on the phone" else if (growing != null) "download" else "direct stream"})")
                 val trackIndex = (0 until extractor.trackCount).firstOrNull {
                     extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
                 } ?: return Outcome.Failed("no audio stream")
@@ -1231,6 +1616,7 @@ class FilePlayer private constructor(private val context: Context) {
                 runCatching { codec?.stop() }
                 runCatching { codec?.release() }
                 runCatching { extractor.release() }
+                growing?.let { MediaCache.leave(it) }
             }
         }
     }
@@ -1250,7 +1636,7 @@ class FilePlayer private constructor(private val context: Context) {
         return codec
     }
 
-    private fun readFileInfo(source: String, isFile: Boolean, gen: Int, index: Int) {
+    private fun readFileInfo(source: String, isFile: Boolean, gen: Int, index: Int, growing: GrowingDownload? = null) {
         val key = "$gen:$index"
         if (infoBusy.size > 32) infoBusy.clear()   // abandoned generations never clean themselves
         if (!infoBusy.add(key)) return
@@ -1261,7 +1647,8 @@ class FilePlayer private constructor(private val context: Context) {
             }
             val r = MediaMetadataRetriever()
             val info = try {
-                if (isFile) r.setDataSource(source) else r.setDataSource(source, HashMap<String, String>())
+                if (growing != null) r.setDataSource(GrowingSource(growing, buffering = false, forGen = gen))
+                else if (isFile) r.setDataSource(source) else r.setDataSource(source, HashMap<String, String>())
                 FileInfo(
                     art = r.embeddedPicture?.let { decodeCover(it, 1000) },
                     title = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)?.trim()?.ifBlank { null },
@@ -1280,6 +1667,44 @@ class FilePlayer private constructor(private val context: Context) {
                 version++
             }
         }
+    }
+
+    /**
+     * Hands a [GrowingDownload] to the platform's extractor. A read that has to wait for bytes
+     * still on their way gives up as soon as the track is skipped or the player retired, which is
+     * what the platform's own network reader could never do.
+     */
+    private inner class GrowingSource(
+        private val download: GrowingDownload,
+        /** True for the audio itself: waiting shows "Buffering…" and holds off the stall watchdog. */
+        private val buffering: Boolean,
+        private val forGen: Int = generation,
+    ) : android.media.MediaDataSource() {
+        override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+            var waitingSince = 0L
+            var noted = false
+            try {
+                return download.readAt(position, buffer, offset, size) {
+                    val now = SystemClock.elapsedRealtime()
+                    if (buffering) {
+                        if (waitingSince == 0L) waitingSince = now
+                        // Waiting on the network is not a dead output: keep the watchdog quiet.
+                        lastProgressAt = now
+                        if (!noted && now - waitingSince > BUFFERING_NOTE_MS && state == State.PLAYING) {
+                            noted = true
+                            setNote("Buffering…")
+                        }
+                    }
+                    forGen != generation || (buffering && jumpTo >= 0)
+                }
+            } finally {
+                if (noted && note == "Buffering…") setNote(null)
+            }
+        }
+
+        override fun getSize(): Long = download.total
+
+        override fun close() = Unit   // the player releases the download itself
     }
 
     private fun decodeCover(bytes: ByteArray, maxPx: Int): Bitmap? {
@@ -1363,6 +1788,7 @@ class FilePlayer private constructor(private val context: Context) {
     /** Re-pushes EQ and the Bluetooth guard after a route or setting change; no sink rebuild. */
     fun refreshRouteDependentParams() {
         liveOutput?.refreshRouteDependentParams()
+        if (exoActive) exo?.sink?.refreshRouteDependentParams()
     }
 
     fun routedDevice(): AudioDeviceInfo? = liveOutput?.routed()
@@ -1374,6 +1800,7 @@ class FilePlayer private constructor(private val context: Context) {
      */
     val audiblePositionMs: Long
         get() {
+            if (exoActive) return exo?.audiblePositionMs() ?: positionMs
             val pos = positionMs
             val o = liveOutput ?: return pos
             val queued = runCatching {
@@ -1383,7 +1810,7 @@ class FilePlayer private constructor(private val context: Context) {
             return (pos - queued * 1000L / o.rate).coerceAtLeast(0)
         }
 
-    val outputSampleRate: Int? get() = liveOutput?.trackRate()
+    val outputSampleRate: Int? get() = if (exoActive) exo?.sink?.outputRate else liveOutput?.trackRate()
 
     private fun updateFormatInfo(mime: String, rate: Int, bits: Int, channels: Int) {
         sourceCodec = mimeLabel(mime)
@@ -1412,6 +1839,22 @@ class FilePlayer private constructor(private val context: Context) {
         private const val SAVE_DELAY_MS = 1_500L
         private const val SAVE_INTERVAL_MS = 10_000L
         private const val STALL_MS = 4_000L
+        /** How long a skip may wait for the busy worker before a fresh one takes over. */
+        private const val SKIP_PICKUP_MS = 600L
+        /** [Worker.waitForMore]: the queue has a new entry at the index that was past its end. */
+        private const val QUEUE_GREW = -2
+        /** How long the end of a radio queue waits for the next pick, and how often it asks. */
+        private const val RADIO_WAIT_MS = 90_000L
+        private const val RADIO_ASKS = 4
+        /** How long to wait for a new download's first reply before streaming directly instead. */
+        private const val START_WAIT_MS = 20_000L
+        /** How long to wait for an already-running download to show it has started. */
+        private const val JOIN_WAIT_MS = 3_000L
+        private const val BUFFERING_NOTE_MS = 800L
+        /** How long to wait for set-aside songs once nothing else is left to play. */
+        private const val DEFERRED_WAIT_MS = 5 * 60_000L
+        /** A song set aside this long ago is dropped from the list of ones to come back to. */
+        private const val DEFERRED_MAX_AGE_MS = 10 * 60_000L
         /** A rebuilt sink gets this long before another stall is treated as fatal. */
         private const val STALL_REBUILD_WINDOW_MS = 30_000L
 
@@ -1426,55 +1869,20 @@ class FilePlayer private constructor(private val context: Context) {
 
         fun get(context: Context): FilePlayer =
             instance ?: synchronized(this) {
-                instance ?: FilePlayer(context.applicationContext).also { instance = it }
+                instance ?: FilePlayer(context.applicationContext).also {
+                    instance = it
+                    it.warmUp()
+                }
             }
 
         /** The instance if one was ever created (doesn't create one). */
         fun peek(): FilePlayer? = instance
 
-        private fun bytesPerSample(encoding: Int): Int = when (encoding) {
-            AudioFormat.ENCODING_PCM_8BIT -> 1
-            AudioFormat.ENCODING_PCM_16BIT -> 2
-            AudioFormat.ENCODING_PCM_24BIT_PACKED -> 3
-            AudioFormat.ENCODING_PCM_32BIT, AudioFormat.ENCODING_PCM_FLOAT -> 4
-            else -> 2
-        }
+        // PCM conversion lives in [dev.alamo3.cabineq.music.Pcm], shared with the Media3 engine so
+        // both feed the DSP the same samples.
+        private fun bytesPerSample(encoding: Int): Int = dev.alamo3.cabineq.music.Pcm.bytesPerSample(encoding)
 
-        /**
-         * Converts [frames] interleaved frames of any PCM encoding / channel count into
-         * interleaved stereo float. Mono is duplicated; for >2 channels the front L/R are kept.
-         */
-        private fun toStereoFloat(buf: ByteBuffer, encoding: Int, channels: Int, frames: Int, out: FloatArray) {
-            val bps = bytesPerSample(encoding)
-            val base = buf.position()
-            for (i in 0 until frames) {
-                val p = base + i * channels * bps
-                val l = sanitize(readSample(buf, p, encoding))
-                val r = if (channels >= 2) sanitize(readSample(buf, p + bps, encoding)) else l
-                out[2 * i] = l
-                out[2 * i + 1] = r
-            }
-        }
-
-        /** One bad sample must never reach the IIR filters: NaN/Inf would poison them for good. */
-        private fun sanitize(x: Float): Float = when {
-            x.isNaN() || x.isInfinite() -> 0f
-            x > 4f -> 4f
-            x < -4f -> -4f
-            else -> x
-        }
-
-        private fun readSample(buf: ByteBuffer, p: Int, encoding: Int): Float = when (encoding) {
-            AudioFormat.ENCODING_PCM_FLOAT -> buf.getFloat(p)
-            AudioFormat.ENCODING_PCM_32BIT -> buf.getInt(p) / 2147483648f
-            AudioFormat.ENCODING_PCM_24BIT_PACKED -> {
-                val v = (buf.get(p).toInt() and 0xFF) or
-                    ((buf.get(p + 1).toInt() and 0xFF) shl 8) or
-                    (buf.get(p + 2).toInt() shl 16)   // sign comes from the top byte
-                v / 8388608f
-            }
-            AudioFormat.ENCODING_PCM_8BIT -> ((buf.get(p).toInt() and 0xFF) - 128) / 128f
-            else -> buf.getShort(p) / 32768f
-        }
+        private fun toStereoFloat(buf: ByteBuffer, encoding: Int, channels: Int, frames: Int, out: FloatArray) =
+            dev.alamo3.cabineq.music.Pcm.toStereoFloat(buf, encoding, channels, frames, out)
     }
 }

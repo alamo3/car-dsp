@@ -42,6 +42,11 @@ import java.util.concurrent.atomic.AtomicInteger
 private val uiIo = Executors.newSingleThreadExecutor { r ->
     Thread(r, "CabinEQ-CarUI").apply { isDaemon = true }
 }
+// Home's two network lookups (artist shelf, recommendations) run side by side, not one after
+// the other, and apart from uiIo so another screen's load never waits behind them.
+private val homeIo = Executors.newFixedThreadPool(2) { r ->
+    Thread(r, "CabinEQ-CarHome").apply { isDaemon = true }
+}
 private val artIo = Executors.newFixedThreadPool(4) { r ->
     Thread(r, "CabinEQ-CarArt").apply { isDaemon = true }
 }
@@ -78,6 +83,10 @@ private fun carIcon(context: Context, url: String?, query: String?): CarIcon =
         ?.let { CarIcon.Builder(IconCompat.createWithContentUri(it)).build() }
     // No art anywhere: our EQ glyph instead of the host's blank block.
         ?: CarIcon.Builder(IconCompat.createWithResource(context, R.drawable.ic_launcher_foreground)).build()
+
+/** A header or strip action must carry an icon: a custom action may not be text-only. */
+private fun headerIcon(context: Context, res: Int): CarIcon =
+    CarIcon.Builder(IconCompat.createWithResource(context, res)).build()
 
 private fun Track.subtitle(): String =
     listOfNotNull(artist, album).filter { it.isNotBlank() }.joinToString(" · ")
@@ -117,9 +126,47 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
     @Volatile private var recent: List<Track>? = null
     @Volatile private var recommended: List<Track>? = null
     @Volatile private var forYou: MediaBrowse.ForYou? = null
+    /** Counts the network lookups still running; the page is drawn from local data meanwhile. */
+    private val remoteLeft = AtomicInteger(0)
     private var loading = false
     private var loadStarted = false
     private var tokenTries = 0
+    private var emptyRetries = 0
+    private var retryScheduled = false
+
+    init {
+        // The page used to be built once, when the car screen opened, and never again: a link
+        // added or a song started afterwards stayed invisible. Coming back to the front (from
+        // search, the player, another app) now reads everything again.
+        lifecycle.addObserver(object : androidx.lifecycle.DefaultLifecycleObserver {
+            override fun onResume(owner: androidx.lifecycle.LifecycleOwner) {
+                emptyRetries = 0
+                reloadIfIdle()
+            }
+        })
+    }
+
+    /** Re-reads history, library and recommendations, unless a read is already running. */
+    private fun reloadIfIdle() {
+        if (!loadStarted || remoteLeft.get() > 0) return
+        load()
+    }
+
+    /**
+     * An empty home can change under us (a song started on the phone, a Nebula link saved
+     * there). Look again for about a minute; coming back to the front restarts this.
+     */
+    private fun lookAgainSoon() {
+        if (retryScheduled || emptyRetries >= 8) return
+        retryScheduled = true
+        main.postDelayed({
+            retryScheduled = false
+            if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+                emptyRetries++
+                reloadIfIdle()
+            }
+        }, 8000)
+    }
 
     override fun onGetTemplate(): Template {
         // Logged once per render (throttled): if the car shows something that is not this
@@ -140,10 +187,14 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
             load()
         }
 
+        // Local data (history, library, downloads) draws at once; the artist shelf and the
+        // recommendations need the network and are added when they arrive. Waiting for all of
+        // it before drawing anything was the slow first launch.
         val rows = recent
         val you = forYou
-        val picks = recommended
-        if (rows == null || you == null || picks == null) {
+        val picks = recommended.orEmpty()
+        val stillLoading = remoteLeft.get() > 0
+        if (rows == null) {
             return MessageTemplate.Builder("Loading your music…")
                 .setHeaderAction(Action.APP_ICON)
                 .setLoading(true)
@@ -154,10 +205,11 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         // search header 9. Sending a template the host doesn't know fails on the host side, so
         // older hosts get the closest thing they can draw.
         val api = carContext.carAppApiLevel
-        if (api < 8) return legacyHome(rows, picks)
+        if (api < 8) return legacyHome(rows, picks, stillLoading)
 
         val jamAction = Action.Builder()
             .setTitle(if (JamHost.running) "Jam ●" else "Jam")
+            .setIcon(headerIcon(carContext, R.drawable.ic_jam))
             .setOnClickListener { screenManager.push(JamScreen(carContext)) }
             .build()
         val builder = SectionedItemTemplate.Builder()
@@ -199,16 +251,25 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         }
         if (rows.isNotEmpty()) builder.addSection(recentSection(rows))
         if (picks.isNotEmpty()) builder.addSection(recommendedSection(picks))
-        if (you.albums.isNotEmpty()) builder.addSection(albumSection(you))
+        if (you != null && you.albums.isNotEmpty()) builder.addSection(albumSection(you))
 
         // A SectionedItemTemplate must have at least one section.
-        if (rows.isEmpty() && picks.isEmpty() && you.albums.isEmpty() && downloads.isEmpty() &&
+        if (rows.isEmpty() && picks.isEmpty() && (you == null || you.albums.isEmpty()) && downloads.isEmpty() &&
             liked.isEmpty() && playlists.isEmpty()
         ) {
+            if (stillLoading) {
+                return MessageTemplate.Builder("Loading your music…")
+                    .setHeaderAction(Action.APP_ICON)
+                    .setLoading(true)
+                    .build()
+            }
+            lookAgainSoon()
             return MessageTemplate.Builder("Nothing to play yet — search for something, or start a song on your phone.")
-                .setHeaderAction(searchAction())
+                .setHeaderAction(Action.APP_ICON)
+                .addAction(searchButton())
                 .build()
         }
+        emptyRetries = 0
         // Required by the MFT-1 quality guideline: a way back to the playback screen from every
         // browse screen. Hosts render this as the minimised control panel (bottom right).
         builder.addAction(Action.MEDIA_PLAYBACK)
@@ -216,7 +277,7 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
     }
 
     /** Car API 7 hosts: one list of recent songs and picks, search and Jam in the header. */
-    private fun legacyHome(rows: List<Track>, picks: List<Track>): Template {
+    private fun legacyHome(rows: List<Track>, picks: List<Track>, stillLoading: Boolean = false): Template {
         val items = ItemList.Builder()
         fun add(tracks: List<Track>, label: String) {
             tracks.take(10).forEachIndexed { i, track ->
@@ -234,9 +295,17 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
         }
         add(rows, "Recently played")
         add(picks, "For you")
+        if (rows.isEmpty() && picks.isEmpty() && stillLoading) {
+            return MessageTemplate.Builder("Loading your music…")
+                .setHeaderAction(Action.APP_ICON)
+                .setLoading(true)
+                .build()
+        }
         if (rows.isEmpty() && picks.isEmpty()) {
+            lookAgainSoon()
             return MessageTemplate.Builder("Nothing to play yet — search for something, or start a song on your phone.")
-                .setHeaderAction(searchAction())
+                .setHeaderAction(Action.APP_ICON)
+                .addAction(searchButton())
                 .build()
         }
         return ListTemplate.Builder()
@@ -259,41 +328,59 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
 
     private fun load() {
         val ctx = carContext.applicationContext
+        remoteLeft.set(2)
+
+        // 1. Local history: a disk read. The page can draw as soon as this is in.
         uiIo.execute {
-            val recentRaw = runCatching { MediaBrowse.recentTracks(ctx) }.getOrDefault(emptyList())
+            val local = runCatching { MediaBrowse.recentTracks(ctx) }.getOrDefault(emptyList())
+            recent = local
+            refresh()
+            // What was played last is what gets tapped next: have its links ready, so it starts at once.
+            dev.alamo3.cabineq.TrackResolver.warm(ctx, local.take(3))
+            warmArt(ctx, local.take(10).map { it.artworkUrl to artQuery(it.artist, it.album, it.title) }) { refresh() }
+        }
+
+        // 2. The artist shelf and 3. the recommendations: network lookups, in parallel. Each one
+        // adds its section when it lands; a slow or failing one no longer holds the page back.
+        homeIo.execute {
             val content = runCatching { MediaBrowse.forYouContent(ctx) }.getOrNull()
-            val picks = runCatching { Radio.recommend(ctx, 12) }.getOrDefault(emptyList())
-
-            // The same song can arrive from different places: a played track may only have a
-            // stream URL (no cover), while the addon's copy of it carries the real artwork.
-            // Reuse the known cover so a song looks the same in every section.
-            val artBySong = HashMap<String, String>()
-            content?.tracks?.forEach { t ->
-                t.artworkUrl?.let { artBySong[songKey(t.artist, t.title)] = it }
-            }
-            content?.albums?.forEach { a ->
-                a.artworkUrl?.let { artBySong[songKey(a.artist, a.title)] = it }
-            }
-            picks.forEach { t ->
-                t.artworkUrl?.let { artBySong[songKey(t.artist, t.title)] = it }
-            }
-            val recent = recentRaw.map { t ->
-                if (t.artworkUrl != null) t
-                else artBySong[songKey(t.artist, t.title)]?.let { t.copy(artworkUrl = it) } ?: t
-            }
-
-            // Warm the art cache for everything we are about to show, then publish.
-            val art = ArrayList<Pair<String?, String?>>(32)
-            recent.take(10).forEach { art += it.artworkUrl to artQuery(it.artist, it.album, it.title) }
-            picks.take(10).forEach { art += it.artworkUrl to artQuery(it.artist, it.album, it.title) }
+            forYou = content ?: MediaBrowse.ForYou("", emptyList(), emptyList())
+            remoteLeft.decrementAndGet()
+            enrichRecent()
+            refresh()
+            val art = ArrayList<Pair<String?, String?>>()
             content?.albums?.take(10)?.forEach { art += it.artworkUrl to artQuery(it.artist, it.title, null) }
-            warmArt(ctx, art) {
-                this.recent = recent
-                this.recommended = picks
-                forYou = content
-                loading = false
-                runCatching { invalidate() }
-            }
+            warmArt(ctx, art) { refresh() }
+        }
+        homeIo.execute {
+            val picks = runCatching { Radio.recommend(ctx, 12) }.getOrDefault(emptyList())
+            recommended = picks
+            remoteLeft.decrementAndGet()
+            enrichRecent()
+            refresh()
+            warmArt(ctx, picks.take(10).map { it.artworkUrl to artQuery(it.artist, it.album, it.title) }) { refresh() }
+        }
+    }
+
+    private fun refresh() {
+        main.post { runCatching { invalidate() } }
+    }
+
+    /**
+     * The same song can arrive from different places: a played track may only have a stream URL
+     * (no cover), while the addon's copy of it carries the real artwork. Reuse the known cover so
+     * a song looks the same in every section.
+     */
+    private fun enrichRecent() {
+        val rows = recent ?: return
+        val artBySong = HashMap<String, String>()
+        forYou?.tracks?.forEach { t -> t.artworkUrl?.let { artBySong[songKey(t.artist, t.title)] = it } }
+        forYou?.albums?.forEach { a -> a.artworkUrl?.let { artBySong[songKey(a.artist, a.title)] = it } }
+        recommended?.forEach { t -> t.artworkUrl?.let { artBySong[songKey(t.artist, t.title)] = it } }
+        if (artBySong.isEmpty()) return
+        recent = rows.map { t ->
+            if (t.artworkUrl != null) t
+            else artBySong[songKey(t.artist, t.title)]?.let { t.copy(artworkUrl = it) } ?: t
         }
     }
 
@@ -301,8 +388,14 @@ class HomeScreen(carContext: CarContext) : Screen(carContext) {
     private fun songKey(artist: String?, title: String?): String =
         "${title?.trim()?.lowercase().orEmpty()}|${artist?.trim()?.lowercase().orEmpty()}"
 
+    /** A titled search button, for places where an icon-only action isn't allowed (message bodies). */
+    private fun searchButton(): Action = Action.Builder()
+        .setTitle("Search")
+        .setOnClickListener { screenManager.push(SearchScreen(carContext)) }
+        .build()
+
     private fun searchAction(): Action = Action.Builder()
-        .setIcon(CarIcon.Builder(IconCompat.createWithResource(carContext, R.drawable.ic_search)).build())
+        .setIcon(headerIcon(carContext, R.drawable.ic_search))
         .setOnClickListener { screenManager.push(SearchScreen(carContext)) }
         .build()
 
@@ -719,15 +812,19 @@ class NowPlayingScreen(carContext: CarContext) : Screen(carContext) {
             .setHeader(
                 Header.Builder()
                     .setStartHeaderAction(Action.BACK)
+                    // Header slots require an icon on every custom action, and allow two of
+                    // them: these are the only way into lyrics and the queue from here.
                     .addEndHeaderAction(
                         Action.Builder()
                             .setTitle("Lyrics")
+                            .setIcon(headerIcon(carContext, R.drawable.ic_lyrics))
                             .setOnClickListener { screenManager.push(LyricsScreen(carContext)) }
                             .build()
                     )
                     .addEndHeaderAction(
                         Action.Builder()
                             .setTitle("Queue")
+                            .setIcon(headerIcon(carContext, R.drawable.ic_queue))
                             .setOnClickListener { screenManager.push(QueueScreen(carContext)) }
                             .build()
                     )
@@ -901,14 +998,17 @@ class QueueScreen(carContext: CarContext) : Screen(carContext) {
         val now = player?.currentTrack
         val header = Header.Builder().setStartHeaderAction(Action.BACK)
         if (now != null) {
-            // The media playback template is host-drawn, so these live here, one tap away.
+            // The header's end actions are moved into an action strip, which allows two actions
+            // but only one with a title: keep the words on the like, use a glyph for the dislike.
             header.addEndHeaderAction(
-                Action.Builder().setTitle("♡")
+                Action.Builder().setTitle("Like")
+                    .setIcon(headerIcon(carContext, R.drawable.ic_heart))
                     .setOnClickListener { Taste.like(app, now); runCatching { invalidate() } }
                     .build()
             )
             header.addEndHeaderAction(
-                Action.Builder().setTitle("✕")
+                Action.Builder()
+                    .setIcon(headerIcon(carContext, R.drawable.ic_close))
                     .setOnClickListener { Taste.dislike(app, now); runCatching { invalidate() } }
                     .build()
             )
@@ -921,11 +1021,16 @@ class QueueScreen(carContext: CarContext) : Screen(carContext) {
                 .setOnClickListener { player?.cycleRepeat(); runCatching { invalidate() } }
                 .build()
         )
+        val waiting = player?.waitingKeys.orEmpty()
+        val keys = player?.queuedTracks()?.map { it.key }.orEmpty()
         queue.forEachIndexed { i, track ->
+            val caching = keys.getOrNull(i)?.let { it in waiting } == true
             items.addItem(
                 Row.Builder()
                     .setTitle(track.title)
                     .addText(listOfNotNull(track.artist, track.album).joinToString(" · "))
+                    // Moved down while its source caches it: say so, or it looks lost.
+                    .apply { if (caching) addText("⏳ Still being prepared — other songs go first") }
                     .setImage(carIcon(carContext, track.artworkUrl, artQuery(track.artist, track.album, track.title)))
                     .setBrowsable(i == current)
                     .setOnClickListener { CarPlayback.playTracks(carContext, queue, i, "Up next") }

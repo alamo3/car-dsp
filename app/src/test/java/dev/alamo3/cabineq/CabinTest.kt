@@ -205,6 +205,8 @@ class CabinTest {
     check("stream: notice progress parsed", notices[0]?.title == "Waiting on TorBox" && notices[1]?.progress == 0.8, notices)
     check("stream: waited ~2s", System.currentTimeMillis() - t0 in 1800..6000)
     check("stream: metadata", st.sampleRate == 44100 && st.bitDepth == 16 && st.format == "flac")
+    val notReady = runCatching { EclipseAddon(addonLink).resolveStream("fresh2", waitIfPending = false) }.exceptionOrNull()
+    check("stream: a not-ready song can be set aside instead of waited for", notReady is dev.alamo3.cabineq.addon.AddonNotReady, notReady)
     val cancelled = runCatching { EclipseAddon(addonLink).resolveStream("fresh", isCancelled = { true }) }.exceptionOrNull()
     check("stream: cancellable while waiting", cancelled is AddonException && cancelled.message == "Cancelled", cancelled)
     val missing = runCatching { nebula.streamOnce("missing") }.exceptionOrNull()
@@ -381,5 +383,127 @@ class CabinTest {
         check("match: other artist's Die Young still rejected", am.best("Die Young", "Kesha", 212, listOf(at("Die Young", "Roddy Ricch", 212))) == null)
         check("match: AC/DC vs ACDC", am.best("Thunderstruck", "AC/DC", null, listOf(at("Thunderstruck", "ACDC"))) != null)
         check("match: misspelt artist tolerated", am.best("Halo", "Beyonce", null, listOf(at("Halo", "Beyoncee"))) != null)
+
+        // ---- Play-while-downloading: one download, read while it grows
+        run {
+            val GD = dev.alamo3.cabineq.music.GrowingDownload::class
+            val dir = java.io.File(System.getProperty("java.io.tmpdir"), "cabin-gd-" + System.nanoTime()).apply { mkdirs() }
+            val base = "http://127.0.0.1:${server.port}/file/"
+            val size = MockServer.FILE_SIZE
+            fun start(name: String, max: Long = 10L * 1024 * 1024, refresh: (() -> String?)? = null, stall: Long = 5_000L) =
+                dev.alamo3.cabineq.music.GrowingDownload(
+                    base + name, java.io.File(dir, "$name.part"), java.io.File(dir, "$name.audio"), max, name,
+                    refreshUrl = refresh, maxStallMs = stall, readTimeoutMs = 3_000, farAheadBytes = 64L * 1024,
+                ).also { d -> Thread({ d.run() }, "gd-$name").apply { isDaemon = true }.start() }
+            fun rightBytes(d: dev.alamo3.cabineq.music.GrowingDownload, at: Int, n: Int): Boolean {
+                val buf = ByteArray(n)
+                var got = 0
+                while (got < n) {
+                    val r = d.readAt((at + got).toLong(), buf, got, n - got)
+                    if (r < 0) break
+                    got += r
+                }
+                return got == n && (0 until n).all { buf[it] == MockServer.fileByte(at + it) }
+            }
+            fun waitDone(d: dev.alamo3.cabineq.music.GrowingDownload, ms: Long = 20_000L) {
+                val until = System.currentTimeMillis() + ms
+                while (d.isAlive && System.currentTimeMillis() < until) Thread.sleep(20)
+            }
+
+            val plain = start("plain")
+            check("growing: starts and reports the size", plain.awaitStart(5_000) && plain.total == size.toLong(), "${plain.state} ${plain.total}")
+            check("growing: bytes read while downloading are the file's", rightBytes(plain, 0, 4096) && rightBytes(plain, 150_000, 5000))
+            waitDone(plain)
+            check("growing: completes into the cache file", plain.isFinished && java.io.File(dir, "plain.audio").length() == size.toLong() && !java.io.File(dir, "plain.part").exists(), plain.state)
+            check("growing: readable after completion, with the end reported", rightBytes(plain, size - 100, 100) && plain.readAt(size.toLong(), ByteArray(10), 0, 10) == -1)
+
+            val drop = start("drop")
+            check("growing: a dropped connection resumes where it stopped", rightBytes(drop, 100 * 1024 - 50, 5000))
+            waitDone(drop)
+            check("growing: resumed download is complete and correct", drop.isFinished && drop.written == size.toLong() && rightBytes(drop, size - 4096, 4096) && (server.fileHits["drop"] ?: 0) >= 2, "${drop.state} ${drop.written} hits=${server.fileHits["drop"]}")
+
+            val slow = start("slow")
+            slow.awaitStart(5_000)
+            val t0 = System.currentTimeMillis()
+            val tail = rightBytes(slow, size - 2000, 2000)
+            check("growing: a read near the end is served without waiting for the rest", tail && slow.written < size - 2000 && System.currentTimeMillis() - t0 < 3_000, "written=${slow.written} in ${System.currentTimeMillis() - t0}ms")
+            val blocked = runCatching { slow.readAt(slow.written + 1000, ByteArray(10), 0, 10) { true } }.exceptionOrNull()
+            check("growing: a waiting read can be cancelled", blocked is java.io.IOException, blocked)
+            slow.cancel()
+            check("growing: a cancelled download is not joinable", !slow.isAlive)
+            run { val until = System.currentTimeMillis() + 3_000; while (slow.state != dev.alamo3.cabineq.music.GrowingDownload.State.CANCELLED && System.currentTimeMillis() < until) Thread.sleep(20) }
+            check("growing: cancel stops it and removes the partial file", slow.state == dev.alamo3.cabineq.music.GrowingDownload.State.CANCELLED && !java.io.File(dir, "slow.part").exists(), slow.state)
+
+            val norange = start("norange")
+            waitDone(norange)
+            check("growing: a server without ranges still downloads", norange.isFinished && rightBytes(norange, 200_000, 3000))
+
+            var refreshed = 0
+            val expired = start("expired", refresh = { refreshed++; base + "expired" })
+            waitDone(expired)
+            check("growing: an expired link is replaced with a fresh one", expired.isFinished && refreshed == 1 && rightBytes(expired, 0, 1000), "${expired.state} refreshed=$refreshed")
+
+            val gone = start("gone")
+            check("growing: a refused download reports failure at the start", !gone.awaitStart(5_000) && gone.state == dev.alamo3.cabineq.music.GrowingDownload.State.FAILED, gone.state)
+            check("growing: reading a failed download throws", runCatching { gone.readAt(0, ByteArray(10), 0, 10) }.exceptionOrNull() is java.io.IOException)
+
+            val big = start("plain2", max = 100L * 1024)
+            waitDone(big)
+            check("growing: a file over the cache limit is refused", big.state == dev.alamo3.cabineq.music.GrowingDownload.State.FAILED && !java.io.File(dir, "plain2.audio").exists(), big.state)
+            dir.deleteRecursively()
+        }
+
+        // ---- PCM into the DSP: both players use this one conversion
+        run {
+            val P = dev.alamo3.cabineq.music.Pcm
+            fun le(n: Int) = java.nio.ByteBuffer.allocate(n).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val s16 = le(8).apply { putShort(0, 16384); putShort(2, (-32768).toShort()); putShort(4, 32767); putShort(6, 0) }
+            val out = FloatArray(4)
+            P.toStereoFloat(s16, P.ENCODING_16BIT, 2, 2, out)
+            check("pcm: 16-bit stereo maps to the exact float values", out[0] == 0.5f && out[1] == -1f && out[2] == 32767 / 32768f && out[3] == 0f, out.toList())
+            check("pcm: the buffer position is left alone", s16.position() == 0)
+            val mono = le(4).apply { putShort(0, 8192); putShort(2, -8192) }
+            P.toStereoFloat(mono, P.ENCODING_16BIT, 1, 2, out)
+            check("pcm: mono is duplicated to both channels", out[0] == 0.25f && out[1] == 0.25f && out[2] == -0.25f && out[3] == -0.25f, out.toList())
+            val six = le(24).apply { for (c in 0 until 6) putShort(c * 2, (c * 1000).toShort()) }
+            P.toStereoFloat(six, P.ENCODING_16BIT, 6, 1, out)
+            check("pcm: surround keeps front left and right", out[0] == 0f && out[1] == 1000 / 32768f, out.toList())
+            val s24 = le(6).apply { put(0, 0); put(1, 0); put(2, 0x40); put(3, 0); put(4, 0); put(5, 0x80.toByte()) }
+            P.toStereoFloat(s24, P.ENCODING_24BIT_PACKED, 2, 1, out)
+            check("pcm: 24-bit keeps its full precision and sign", out[0] == 0.5f && out[1] == -1f, out.toList())
+            val fl = le(8).apply { putFloat(0, Float.NaN); putFloat(4, 9f) }
+            P.toStereoFloat(fl, P.ENCODING_FLOAT, 2, 1, out)
+            check("pcm: bad samples never reach the filters", out[0] == 0f && out[1] == 4f, out.toList())
+            check("pcm: frame sizes", P.bytesPerSample(P.ENCODING_16BIT) == 2 && P.bytesPerSample(P.ENCODING_24BIT_PACKED) == 3 && P.bytesPerSample(P.ENCODING_FLOAT) == 4)
+        }
+
+        // ---- Playlist import: a YouTube library export (channels, liked videos, one real playlist)
+        val csv = """Track name,Artist name,Album,Playlist name,Type,ISRC
+"Katy Perry - Roar","","","Liked videos","Favorite",""
+"Crawling [Official HD Music Video] - Linkin Park","","","Liked videos","Favorite",""
+"Holly x drivvin - Til The End | Trap | NCS - Copyright Free Music","","","Liked videos","Favorite",""
+"100 MEMES in 1 SONG (in 10 minutes)","","","Liked videos","Favorite",""
+"Linus Tech Tips","","","My Subscriptions (Artists)","Artist",""
+"Veritasium","","","My Subscriptions (Artists)","Artist",""
+"Shots Fired","Le Castle Vania","John Wick (Original Motion Picture Soundtrack)","John Wick Mode: Action Bass","Playlist","US3M51430918"
+"""
+        val pf = dev.alamo3.cabineq.Playlists.parseFile("lib.csv", csv)
+        check("import: channel subscriptions are skipped", pf.skipped == 2 && pf.rows.size == 5, "${pf.skipped} skipped, ${pf.rows.size} rows")
+        check("import: playlist names are kept", pf.rows.map { it.playlist }.toSet() == setOf("Liked videos", "John Wick Mode: Action Bass"), pf.rows.map { it.playlist })
+        check("import: real song keeps artist and ISRC", pf.rows.last().artist == "Le Castle Vania" && pf.rows.last().isrc == "US3M51430918")
+        val PL = dev.alamo3.cabineq.Playlists
+        check("import: video name cleaned", PL.videoQuery("Crawling [Official HD Music Video] - Linkin Park") == "Crawling Linkin Park" &&
+            PL.videoQuery("Beartooth \u2013 The Lines (Low Gain Mix) (Audio)") == "Beartooth The Lines" &&
+            PL.videoQuery("Holly x drivvin - Til The End | Trap | NCS - Copyright Free Music") == "Holly x drivvin Til The End",
+            PL.videoQuery("Holly x drivvin - Til The End | Trap | NCS - Copyright Free Music"))
+        fun vrow(t: String) = dev.alamo3.cabineq.Playlists.Row(null, t, null, null)
+        fun vm(t: String, vararg c: Track) = PL.bestVideoMatch(vrow(t), PL.videoQuery(t), c.toList())
+        fun trk(title: String, artist: String) = Track(title = title, artist = artist, source = Track.Source.ADDON)
+        check("import: 'Artist - Song' finds the song", vm("Katy Perry - Roar (Official Video)", trk("Roar", "Katy Perry"))?.title == "Roar")
+        check("import: 'Song - Artist' finds the song", vm("Crawling [Official HD Music Video] - Linkin Park", trk("Crawling", "Linkin Park"))?.title == "Crawling")
+        check("import: wrong artist is not accepted", vm("Katy Perry - Roar", trk("Roar", "Some Cover Band")) == null)
+        check("import: a longer different song is not accepted", vm("Hans Zimmer - Time", trk("Time After Time", "Hans Zimmer")) == null)
+        check("import: one-word titles are not guessed", vm("midnight", trk("Midnight", "Someone")) == null)
+        check("import: meme videos find nothing", vm("100 MEMES in 1 SONG (in 10 minutes)", trk("Memes", "Various")) == null)
     }
 }

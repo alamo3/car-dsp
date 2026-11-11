@@ -8,6 +8,7 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import dev.alamo3.cabineq.music.GrowingDownload
 import java.util.concurrent.Executors
 
 /**
@@ -28,7 +29,9 @@ object MediaCache {
     private const val PREFETCH_WAIT_MS = 90_000L
     private const val MIN_FREE_BYTES = 256L * 1024 * 1024
 
-    private val io = Executors.newSingleThreadExecutor { r ->
+    // Two at a time: the next song and the one after it must not queue behind each other (one
+    // slow caching wait on a single thread used to hold up every download behind it).
+    private val io = Executors.newFixedThreadPool(2) { r ->
         Thread(r, "CabinEQ-Cache").apply { isDaemon = true }
     }
     private val inFlight = HashSet<String>()
@@ -65,10 +68,14 @@ object MediaCache {
      * Downloads [track] in the background unless it is already cached, caching is off, or the
      * network policy forbids it. [url] skips resolution when the caller already has one.
      */
-    fun prefetch(context: Context, track: Track, url: String? = null) {
+    fun prefetch(context: Context, track: Track, url: String? = null, waitMs: Long = PREFETCH_WAIT_MS) {
         val app = context.applicationContext
         val settings = Settings(app)
         if (!settings.cacheEnabled) return
+        // Media3 has its own disk cache (cacheDir/media3) and evicts by the same setting; filling
+        // this one too would store every prefetched song twice and double the storage the user
+        // asked for. With that engine on, its cache is the only one doing the caching.
+        if (settings.media3Player) return
         if (settings.cacheWifiOnly && !onUnmeteredNetwork(app)) {
             Log.i(TAG, "skip ${track.title}: not on Wi-Fi and Wi-Fi-only is set")
             return
@@ -79,28 +86,96 @@ object MediaCache {
             return
         }
         val key = track.mediaId
+        if (activeFor(track) != null) return
         synchronized(inFlight) { if (!inFlight.add(key)) return }
         io.execute {
             try {
-                val max = settings.cacheMaxMb.toLong() * 1024 * 1024
                 val resolvedUrl = url ?: runCatching {
-                    TrackResolver.resolve(app, track, { }, { false }, PREFETCH_WAIT_MS).url
+                    TrackResolver.resolve(app, track, { }, { false }, waitMs).url
                 }.getOrNull()
                 if (resolvedUrl == null) {
                     Log.i(TAG, "skip ${track.title}: no stream URL")
                     return@execute
                 }
-                val size = download(app, track, resolvedUrl, max)
-                if (size > 0) {
-                    Log.i(TAG, "cached \"${track.title}\" (${size / 1024} kB)")
-                    trim(app, max)
-                }
+                // Someone (the player) may have started this song while the link was resolving.
+                val mine = register(app, track, resolvedUrl) ?: return@execute
+                runDownload(app, track, mine)
             } catch (e: Exception) {
                 Log.w(TAG, "prefetch ${track.title} failed: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 synchronized(inFlight) { inFlight.remove(key) }
             }
         }
+    }
+
+    // ------------------------------------------------------------ play while downloading
+
+    /** Downloads in progress, by media id. The player reads from these while they grow. */
+    private val active = HashMap<String, GrowingDownload>()
+
+    /** The download of [track] if one is under way. */
+    fun activeFor(track: Track): GrowingDownload? =
+        synchronized(active) { active[track.mediaId]?.takeIf { it.isAlive } }
+
+    /**
+     * For the player: the download of [track] to read from while it arrives — the one already
+     * under way, or a new one from [url]. Null when the cache cannot take it (switched off, no
+     * space); the caller then streams the old way.
+     */
+    fun open(context: Context, track: Track, url: String): GrowingDownload? {
+        val app = context.applicationContext
+        activeFor(track)?.let { return it }
+        if (!Settings(app).cacheEnabled) return null
+        if (app.cacheDir.usableSpace < MIN_FREE_BYTES) return null
+        val mine = register(app, track, url) ?: return activeFor(track)
+        Thread({ runDownload(app, track, mine) }, "CabinEQ-Fetch").apply { isDaemon = true }.start()
+        return mine
+    }
+
+    /** Creates and records a download; null when one is already recorded for this song. */
+    private fun register(app: Context, track: Track, url: String): GrowingDownload? {
+        val max = Settings(app).cacheMaxMb.toLong() * 1024 * 1024
+        val target = File(dir(app), name(track))
+        synchronized(active) {
+            if (active[track.mediaId]?.isAlive == true) return null
+            val download = GrowingDownload(
+                url = url,
+                part = File(target.parentFile, target.name + "." + System.nanoTime() + ".part"),
+                target = target,
+                maxBytes = max,
+                label = track.title,
+                // The addon's links are short-lived tickets: ask for a new one if this one lapses.
+                refreshUrl = {
+                    runCatching { TrackResolver.resolve(app, track, { }, { false }, 20_000L).url }.getOrNull()
+                },
+                log = { Log.i(TAG, it) },
+            )
+            active[track.mediaId] = download
+            return download
+        }
+    }
+
+    private fun runDownload(app: Context, track: Track, download: GrowingDownload) {
+        try {
+            download.run()
+            if (download.isFinished) {
+                Log.i(TAG, "cached \"${track.title}\" (${download.written / 1024} kB)")
+                trim(app, Settings(app).cacheMaxMb.toLong() * 1024 * 1024)
+            }
+        } finally {
+            synchronized(active) { if (active[track.mediaId] === download) active.remove(track.mediaId) }
+        }
+    }
+
+    /**
+     * The player has left this song. A download that is nearly complete is allowed to finish (the
+     * song is then on the phone next time); one that is not is stopped, so skipping through songs
+     * does not leave a trail of downloads running.
+     */
+    fun leave(download: GrowingDownload) {
+        val total = download.total
+        if (download.isAlive && (total <= 0 || download.written < total * 8 / 10)) download.cancel()
+        download.release()
     }
 
     /** Applies a new cap immediately (the settings screen calls this when the size changes). */
@@ -188,7 +263,15 @@ object MediaCache {
         Log.i(TAG, "trimmed cache to ${total / 1024 / 1024} MB (cap ${max / 1024 / 1024} MB)")
     }
 
-    private fun onUnmeteredNetwork(context: Context): Boolean {
+    /** True when the active network can actually reach the internet (not just connected to a router). */
+    internal fun isOnline(context: Context): Boolean {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return true
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    internal fun onUnmeteredNetwork(context: Context): Boolean {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return true
         val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
         // "Wi-Fi only" means "not paying per megabyte": a car hotspot or a phone tethered to

@@ -27,6 +27,21 @@ object Updater {
 
     data class Release(val tag: String, val versionCode: Long, val apkUrl: String, val apkSize: Long)
 
+    /**
+     * True when Google Play installed this copy. Play updates it itself, and an app installed
+     * from Play must not fetch and install APKs from elsewhere (it is against Play's policy and
+     * the two would fight over the installer of record).
+     */
+    fun installedFromPlay(context: Context): Boolean = runCatching {
+        val pm = context.packageManager
+        val installer = if (android.os.Build.VERSION.SDK_INT >= 30) {
+            pm.getInstallSourceInfo(context.packageName).installingPackageName
+        } else {
+            @Suppress("DEPRECATION") pm.getInstallerPackageName(context.packageName)
+        }
+        installer == "com.android.vending"
+    }.getOrDefault(false)
+
     fun installedVersionCode(context: Context): Long =
         context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
 

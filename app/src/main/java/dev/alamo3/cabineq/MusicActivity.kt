@@ -87,6 +87,8 @@ class MusicActivity : Activity() {
 
     // Lyrics page (the car has its own screen; both share Lyrics.kt and its disk cache).
     private var lyricsOpen = false
+    /** Media id the open lyrics page was drawn for; a different song redraws it. */
+    private var lyricsFor: String? = null
     private var lyricsBlock: LinearLayout? = null
     private var lyricViews = ArrayList<TextView>()
     private var lyricSheet: Lyrics.Sheet? = null
@@ -526,6 +528,8 @@ class MusicActivity : Activity() {
         if (recent.isNotEmpty()) {
             page.addView(sectionTitle("Recently played"))
             page.addView(trackCarousel(recent) { i -> play(recent, i, "Recently played") })
+            // What was played last is what gets tapped next: have its links ready, so it starts at once.
+            TrackResolver.warm(applicationContext, recent.take(3))
         }
 
         // The same content the car's home screen shows: more from the artist you play most,
@@ -707,6 +711,7 @@ class MusicActivity : Activity() {
                 })
                 upcoming.forEachIndexed { n, (index, entry) ->
                     box.addView(queueRow(entry.track,
+                        waiting = entry.waiting,
                         onPlay = { transport { p.skipTo(index) } },
                         onUp = if (n > 0) ({ p.moveUpcoming(entry.key, index - 1) }) else null,
                         onDown = if (n < upcoming.lastIndex) ({ p.moveUpcoming(entry.key, index + 1) }) else null,
@@ -731,7 +736,7 @@ class MusicActivity : Activity() {
         queueRefresh = { draw() }
     }
 
-    private fun queueRow(t: Track, onPlay: () -> Unit, onUp: (() -> Unit)?, onDown: (() -> Unit)?, onRemove: () -> Unit): View {
+    private fun queueRow(t: Track, waiting: Boolean = false, onPlay: () -> Unit, onUp: (() -> Unit)?, onDown: (() -> Unit)?, onRemove: () -> Unit): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -745,6 +750,8 @@ class MusicActivity : Activity() {
         Ui.selectable(texts)
         texts.addView(Ui.text(this, t.title, 16f))
         if (!t.artist.isNullOrBlank()) texts.addView(Ui.text(this, t.artist, 13f, Ui.TEXT_2))
+        // Moved down because the source is still caching it: say so, or it looks lost.
+        if (waiting) texts.addView(Ui.text(this, "⏳ Still being prepared — other songs go first", 12f, Ui.TEXT_2))
         row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         // Large, separate targets: moving a song is a tap, not a drag.
         fun button(label: String, action: (() -> Unit)?) {
@@ -1465,7 +1472,11 @@ class MusicActivity : Activity() {
             fullNote.setTextColor(if (p.note != null) Ui.TEXT_2 else Ui.ERROR)
             fullNote.visibility = if (note == null) View.GONE else View.VISIBLE
         }
-        if (lyricsOpen) updateLyricsHighlight()
+        if (lyricsOpen) {
+            // The page stays open across songs: follow the player to the new song's lyrics.
+            val nowId = p.currentTrack?.mediaId
+            if (nowId != null && nowId != lyricsFor) renderLyrics() else updateLyricsHighlight()
+        }
     }
 
     private fun showFull(show: Boolean) {
@@ -1492,6 +1503,7 @@ class MusicActivity : Activity() {
         page.addView(Ui.text(this, "Lyrics", 24f, bold = true).apply { setPadding(0, dp(4), 0, dp(4)) })
         val p = player
         val t = p.currentTrack
+        lyricsFor = t?.mediaId
         if (t == null) {
             page.addView(Ui.text(this, "Nothing playing.", 15f, Ui.TEXT_2).apply { setPadding(0, dp(12), 0, 0) })
             return
@@ -1754,14 +1766,19 @@ class MusicActivity : Activity() {
         val token = ++importToken
         importStatus.text = "Parsing…"
         importExecutor.execute {
-            val rows = Playlists.parse(name, raw)
+            val parsed = Playlists.parseFile(name, raw)
+            val rows = parsed.rows
             if (rows.isEmpty()) {
-                runOnUiThread { if (token == importToken) importStatus.text = "No tracks found in that text." }
+                runOnUiThread {
+                    if (token == importToken) importStatus.text = if (parsed.skipped > 0)
+                        "No songs found: ${parsed.skipped} entries were channel subscriptions, which aren't music."
+                    else "No tracks found in that text."
+                }
                 return@execute
             }
             val label = Playlists.sourceName(name)
             val result = runCatching {
-                Playlists.match(EclipseAddon(link), rows, label, onProgress = { done, total ->
+                Playlists.match(EclipseAddon(link), rows, label, skipped = parsed.skipped, onProgress = { done, total ->
                     if (done % 5 == 0 || done == total) {
                         runOnUiThread {
                             if (token == importToken) importStatus.text = "Matching $done/$total…"
@@ -1773,17 +1790,26 @@ class MusicActivity : Activity() {
                 return@execute
             }
             val added = Taste.importPlaylist(this, result.matched, label)
-            // The import is also a playlist you can open and play, not only a taste hint.
-            runCatching { Library.createPlaylist(this, label, result.matched) }
+            // The import is also a playlist you can open and play, not only a taste hint. A file
+            // with several playlists in it becomes several playlists, named as they were.
+            val groups = result.byPlaylist.ifEmpty { mapOf(label to result.matched) }
+            for ((playlistName, tracks) in groups) {
+                if (tracks.isNotEmpty()) runCatching { Library.createPlaylist(this, playlistName, tracks) }
+            }
             runOnUiThread {
                 if (token != importToken) return@runOnUiThread
                 lastImportStatus = buildString {
                     append("${result.rows.size} rows")
                     append(" · ${result.matchedRows} matched")
                     if (result.unmatched > 0) append(" · ${result.unmatched} not in the catalogue")
+                    if (result.skipped > 0) append("\n${result.skipped} channel subscriptions skipped (not music).")
                     if (result.withIsrc > 0) append(" · ${result.withIsrc} with ISRC")
                     append("\n$added new tracks added to your taste profile.")
-                    if (result.matched.isNotEmpty()) append("\nSaved as the playlist “$label” in your library.")
+                    if (result.matched.isNotEmpty()) {
+                        val names = groups.filterValues { it.isNotEmpty() }.keys
+                        append(if (names.size > 1) "\nSaved ${names.size} playlists in your library: ${names.joinToString(", ") { "“$it”" }}."
+                        else "\nSaved as the playlist “${names.firstOrNull() ?: label}” in your library.")
+                    }
                 }
                 importStatus.text = lastImportStatus
                 showMessage("Imported $label")
@@ -2316,6 +2342,22 @@ class MusicActivity : Activity() {
         }
 
         page.addView(sectionTitle("Playback"))
+        page.addView(Ui.pill(this, "Player engine: ${if (settings.media3Player) "Media3 (new)" else "built-in"}", filled = false) {
+            settings.media3Player = !settings.media3Player
+            renderSettings()
+        }, wrapLp(top = 4))
+        page.addView(Ui.text(this,
+            "Media3 is Google's player: it does the fetching, buffering and the hand-over between songs, and your EQ and limiter run on its audio exactly as before. " +
+                "It is new here and still being proven in the car. Loudness matching is not available with it yet. Applies from the next song you start.",
+            12f, Ui.TEXT_2, lines = 6).apply { setPadding(0, dp(8), 0, dp(12)) })
+        page.addView(Ui.pill(this, "Play while downloading: ${if (settings.progressivePlayback) "on" else "off"}", filled = false) {
+            settings.progressivePlayback = !settings.progressivePlayback
+            renderSettings()
+        }, wrapLp(top = 4))
+        page.addView(Ui.text(this,
+            "The song plays from its own download as it arrives: it carries on after a signal drop and is kept for next time. " +
+                "Needs the song cache switched on. Turn this off to go back to plain streaming if a song won't start. Applies from the next song.",
+            12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, dp(12)) })
         page.addView(Ui.pill(this, "Match loudness between songs: ${if (settings.loudnessMatch) "on" else "off"}", filled = false) {
             settings.loudnessMatch = !settings.loudnessMatch
             renderSettings()

@@ -12,7 +12,11 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.SecureRandom
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 /**
  * Host side of the Jam session.
@@ -33,6 +37,12 @@ object JamHost {
     private const val MAX_SEEN = 2000
     private const val MAX_QUEUE = 500
     private const val BASE_DELAY_MS = 700L
+    /** With the push channel up, commands are collected when it says one arrived; this is the net. */
+    private const val PUSH_FALLBACK_MS = 3_000L
+    /** How often the loop glances at the player while idle: local and free, no network involved. */
+    private const val IDLE_TICK_MS = 400L
+    /** An unchanged state is re-sent this often, so guests can tell the host is alive. */
+    private const val HEARTBEAT_MS = 5_000L
     private const val RATE_WINDOW_MS = 10_000L
     private const val RATE_MAX_OPS = 12
     /** All guests together: the guest id is self-chosen, so a per-guest budget alone is no cap. */
@@ -52,6 +62,23 @@ object JamHost {
         Thread(r, "CabinEQ-Jam").apply { isDaemon = true }
     }
     private val seen = HashSet<String>()
+
+    /** Released by the push channel the moment a guest command lands, ending the loop's wait. */
+    private val wake = Semaphore(0)
+    @Volatile private var pushLive = false
+    @Volatile private var pushConn: HttpURLConnection? = null
+
+    /** Commands already applied, still to be removed from the relay (off the critical path). */
+    private val pendingDeletes = ConcurrentLinkedQueue<String>()
+    private val deleteIo = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "CabinEQ-JamDelete").apply { isDaemon = true }
+    }
+
+    /** The newest search each guest asked for: older ones still queued are not worth answering. */
+    private val latestSearch = ConcurrentHashMap<String, String>()
+    private class Searched(val at: Long, val tracks: List<EclipseAddon.Track>)
+    private val searchCache = ConcurrentHashMap<String, Searched>()
+    private const val SEARCH_CACHE_MS = 120_000L
 
     /** Set when an op changed something, so the next loop iteration publishes state at once. */
     @Volatile private var dirty = false
@@ -89,6 +116,8 @@ object JamHost {
         val sid = randomId()
         sessionId = sid
         seen.clear()
+        pendingDeletes.clear()
+        latestSearch.clear()
         synchronized(budgets) { budgets.clear() }
         running = true
         val orphan = settings.lastJamSession?.takeIf { it != sid }
@@ -101,26 +130,43 @@ object JamHost {
                 wipe(it)
             }
             put("$sid/info.json", JSONObject().put("createdAt", System.currentTimeMillis()))
+            startPush(sid)
             var lastState = 0L
+            var lastOps = 0L
+            var lastVersion = -1
             var failures = 0
+            var woken = true
             while (running && sessionId == sid) {
-                var ok = false
+                var ok = true
                 try {
-                    ok = pollOps(app, sid)
-                    val now = System.currentTimeMillis()
-                    // An applied op must show up immediately, not on the next 900 ms tick: the
-                    // guest is looking at "adding…" until this state lands.
-                    if (dirty || now - lastState > 900) {
+                    val now = SystemClock.elapsedRealtime()
+                    // Guests' commands: when the push channel says one arrived, or on a timer. The
+                    // push channel is the shortcut; the timer is what keeps this correct without it.
+                    if (woken || !pushLive || now - lastOps > PUSH_FALLBACK_MS) {
+                        lastOps = now
+                        ok = pollOps(app, sid)
+                    }
+                    val version = FilePlayer.peek()?.version ?: -1
+                    // An applied op must show up at once: the guest is looking at "adding…" until
+                    // this state lands. Otherwise: when the player changed, or as a heartbeat.
+                    if (dirty || version != lastVersion || now - lastState > HEARTBEAT_MS) {
                         dirty = false
                         lastState = now
+                        lastVersion = version
                         ok = publishState(sid) && ok
                     }
+                    // Only now: removing applied commands is bookkeeping, and a round trip each
+                    // used to sit in front of the guest's answer.
+                    flushDeletes(sid)
                 } catch (e: Exception) {
                     Log.w(TAG, "loop: ${e.javaClass.simpleName}: ${e.message}")
+                    ok = false
                 }
                 // Back off while the relay is unreachable instead of hammering it twice a second.
                 failures = if (ok) 0 else (failures + 1).coerceAtMost(4)
-                Thread.sleep(BASE_DELAY_MS shl failures)
+                val wait = if (failures > 0 || !pushLive) BASE_DELAY_MS shl failures else IDLE_TICK_MS
+                woken = wake.tryAcquire(wait, TimeUnit.MILLISECONDS)
+                wake.drainPermits()
             }
             // stop() wipes from another thread, but this loop may have been mid-publish and
             // written the state back afterwards. It is the last writer, so it cleans up last.
@@ -134,6 +180,8 @@ object JamHost {
         val sid = sessionId
         running = false
         sessionId = null
+        wake.release()                 // the loop is waiting: let it see that it is over
+        pushConn?.disconnect()         // and so is the push channel's blocking read
         if (sid != null) {
             appContext?.let { Settings(it).lastJamSession = null }
             Log.i(TAG, "Ending session $sid")
@@ -187,10 +235,71 @@ object JamHost {
                 runCatching { apply(app, sid, op) }
                     .onFailure { Log.w(TAG, "op $key (${op.optString("op")}) failed: ${it.message}") }
             }
-            // Consumed either way: keep the node small.
-            delete("$sid/ops/$key.json")
+            // Consumed either way: removed from the relay later, after the state is published.
+            pendingDeletes.add(key)
         }
         return true
+    }
+
+    private fun flushDeletes(sid: String) {
+        if (pendingDeletes.isEmpty()) return
+        deleteIo.execute {
+            while (true) {
+                val key = pendingDeletes.poll() ?: break
+                delete("$sid/ops/$key.json")
+            }
+        }
+    }
+
+    /**
+     * Firebase can push changes over a held-open request (server-sent events). It is used only as
+     * a doorbell: any new guest command wakes the loop, which then fetches and applies it as
+     * before. That makes a command start in about a round trip instead of waiting out a poll
+     * interval, and if this connection fails the polling timer still does the job.
+     */
+    private fun startPush(sid: String) {
+        Thread({
+            var backoff = 1_000L
+            while (running && sessionId == sid) {
+                try {
+                    val conn = (URL("$DB/jam/$sid/ops.json").openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        setRequestProperty("Accept", "text/event-stream")
+                        connectTimeout = 5_000
+                        readTimeout = 70_000        // the server sends a keep-alive about every 30 s
+                    }
+                    pushConn = conn
+                    if (conn.responseCode in 200..299) {
+                        pushLive = true
+                        backoff = 1_000L
+                        Log.i(TAG, "push channel up")
+                        conn.inputStream.bufferedReader().use { reader ->
+                            var event = ""
+                            while (running && sessionId == sid) {
+                                val line = reader.readLine() ?: break
+                                if (line.startsWith("event:")) {
+                                    event = line.substring(6).trim()
+                                } else if (line.startsWith("data:") && (event == "put" || event == "patch")) {
+                                    // "data":null is the initial empty node, a keep-alive or a removal.
+                                    if (!line.contains("\"data\":null")) wake.release()
+                                }
+                            }
+                        }
+                    } else {
+                        Log.w(TAG, "push channel -> HTTP ${conn.responseCode}")
+                    }
+                } catch (e: Exception) {
+                    if (running) Log.w(TAG, "push channel: ${e.javaClass.simpleName}: ${e.message}")
+                } finally {
+                    pushLive = false
+                    pushConn?.disconnect()
+                    pushConn = null
+                }
+                if (!(running && sessionId == sid)) break
+                runCatching { Thread.sleep(backoff) }
+                backoff = (backoff * 2).coerceAtMost(10_000L)
+            }
+        }, "CabinEQ-JamPush").apply { isDaemon = true; start() }
     }
 
     private fun apply(app: Context, sid: String, op: JSONObject) {
@@ -232,11 +341,17 @@ object JamHost {
     }
 
     /** Searches can take seconds; keep them off the polling loop so ops stay responsive. */
-    private val searchIo = Executors.newSingleThreadExecutor { r ->
+    private val searchIo = Executors.newFixedThreadPool(3) { r ->
         Thread(r, "CabinEQ-JamSearch").apply { isDaemon = true }
     }
 
     private fun answerSearch(app: Context, sid: String, op: JSONObject) {
+        // Typing asks several questions in a row. Only a guest's newest is worth answering, and
+        // answering them in turn (one thread, a second or two each) made the one that mattered
+        // wait behind the rest.
+        val guest = op.optString("guest").take(64)
+        val reqId = op.optString("reqId")
+        if (reqId.isNotBlank()) latestSearch[guest] = reqId
         searchIo.execute { answerSearchNow(app, sid, op) }
     }
 
@@ -246,9 +361,21 @@ object JamHost {
         if (link.isBlank() || reqId.isBlank() || reqId.length > 40) return
         // Becomes part of a database path: only the characters the web client generates.
         if (!reqId.all { it.isLetterOrDigit() || it == '-' || it == '_' }) return
+        val guest = op.optString("guest").take(64)
+        if (latestSearch[guest] != reqId) return           // the guest has asked something newer
         val query = op.optString("q").take(200)
-        val tracks = runCatching { EclipseAddon(link).search(query).tracks }
+        // Guests in one room search for the same things: a recent answer is reused.
+        val cacheKey = query.trim().lowercase()
+        val cached = searchCache[cacheKey]?.takeIf { SystemClock.elapsedRealtime() - it.at < SEARCH_CACHE_MS }
+        val tracks = cached?.tracks ?: runCatching { EclipseAddon(link).search(query).tracks }
             .getOrDefault(emptyList())
+            .also {
+                if (it.isNotEmpty()) {
+                    if (searchCache.size > 40) searchCache.clear()
+                    searchCache[cacheKey] = Searched(SystemClock.elapsedRealtime(), it)
+                }
+            }
+        if (latestSearch[guest] != reqId) return           // asked something newer meanwhile
         val items = JSONArray()
         tracks.take(20).forEach { t ->
             items.put(
@@ -278,7 +405,8 @@ object JamHost {
         val player = FilePlayer.peek() ?: return false
         val queue = JSONArray()
         player.queuedTracks().forEach { entry ->
-            queue.put(trackTo(entry.track).put("key", entry.key))
+            // "waiting": the source is still caching it, so it was moved down; the page says why.
+            queue.put(trackTo(entry.track).put("key", entry.key).put("waiting", entry.waiting))
         }
         val state = JSONObject()
             .put("playing", player.state == FilePlayer.State.PLAYING)
@@ -344,16 +472,19 @@ object JamHost {
                 }
             }
             val code = conn.responseCode
+            // Read to the end and close, but do not disconnect: a finished response hands its
+            // connection back to the pool, and the next request skips the DNS, TCP and TLS set-up
+            // (several round trips) that disconnecting here made every single request pay.
             if (code in 200..299) conn.inputStream.bufferedReader().use { it.readText() }
             else {
                 Log.w(TAG, "$method $path -> HTTP $code")
+                runCatching { conn.errorStream?.close() }
                 null
             }
         } catch (e: Exception) {
             Log.w(TAG, "$method $path failed: ${e.javaClass.simpleName}: ${e.message}")
+            conn?.disconnect()      // a broken connection must not go back to the pool
             null
-        } finally {
-            conn?.disconnect()
         }
     }
 }

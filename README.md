@@ -291,6 +291,79 @@ under-correct deliberately. A proper least-squares solve (evaluate the designed 
 until the residual is minimal) is the next step — under-correcting sounds like a smaller
 improvement, over-correcting sounds broken.
 
+### Testing without a phone
+
+**`tools/check.sh`** is the closed loop: it builds and runs the two native harnesses
+(`dsp-test`, `resampler-test`), then the JVM tests and lint, and exits non-zero on the first
+regression. Both native harnesses now *assert* rather than print — the limiter must land on its
+threshold with no added discontinuity, the fade-in must reach full scale in 15 ms, the true-peak
+meter must be within 0.3 dB, the click detector must ignore a 19 kHz tone and catch a spike, and
+the resampler must stay above 110 dB SNR (it does ~120) with a second track starting clean.
+
+```
+tools/check.sh          # everything
+tools/check.sh native   # the C++ harnesses only, seconds, no Gradle
+tools/check.sh gradle   # tests + lint
+```
+
+**`tools/dhu.sh [serial] [1080p|720p]`** runs Google's Desktop Head Unit against the phone over
+USB: the car's screen becomes a window on this machine, so it can be screenshot with
+`adb exec-out screencap -p` and clicked without reaching for the phone. It loads the DHU's own
+libraries (`extras/google/auto/libs`), which it needs to start at all.
+
+**`tools/emulator.sh`** is the emulator loop, and it works now:
+
+```
+tools/emulator.sh                        # boot (if needed), build x86_64, install, launch, screenshot
+SEED_PREFS=/tmp/seed.xml tools/emulator.sh   # …and seed prefs first (e.g. the addon link)
+tools/emulator.sh --window               # …with a visible window and audio, to watch and listen
+tools/emulator.sh --shot                 # screenshot the running emulator
+tools/emulator.sh --stop                 # shut it down
+```
+
+Three things had to be discovered to make it work, all recorded in the script:
+
+- **`-gpu host`, not SwiftShader.** With `-gpu swiftshader_indirect` (or `-gpu guest`) QEMU
+  segfaults in SwiftShader's `libGLESv2.so` on a RenderThread about two seconds into boot — found
+  with gdb, not guessed. `-gpu host` boots the AAOS image in ~12 s. Memory was never the problem.
+- **AAOS runs the app as user 10**, the driver profile. Seeding prefs with `run-as` writes user 0
+  and the app still looks unconfigured; the script uses `adb root` (the AOSP image allows it) to
+  write the file for every user the app is installed under, with the app's own uid.
+- **The car-app screens can't be opened on AAOS through the media card.** The system logs
+  `MediaDispatcherActivity: Application did not set CarAppActivity component`, because the
+  dispatcher looks for `androidx.car.app.activity.CarAppActivity`, which the CAL 1.9 artifact no
+  longer ships. The media UI, playback, the DSP, search and the app's own screens all work in the
+  emulator; for the template (grid/lyrics) screens, use `tools/dhu.sh` against the phone.
+
+Verified in the emulator: install, launch in the car's window, the Nebula addon search returning
+real results with artwork, and screenshots via `screencap`.
+
+### The Media3 engine and the DSP
+
+Media3's `DefaultAudioSink` runs custom audio processors **only on its integer path**:
+
+```java
+if (shouldUseFloatOutput(inputFormat.pcmEncoding)) {
+    pipelineProcessors.add(toFloatPcmAudioProcessor);          // chain skipped entirely
+} else {
+    pipelineProcessors.add(toInt16PcmAudioProcessor);
+    pipelineProcessors.add(audioProcessorChain.getAudioProcessors());   // ours
+}
+```
+
+So an `AudioProcessor` cannot give us both float and the equaliser: float output silently drops
+the whole chain (audio plays, at the source rate, untouched — which is how it behaved before this
+was found), and the integer path runs it at 16-bit.
+
+The engine therefore **owns the sink**: `DspAudioSink` implements `AudioSink`, runs the native
+engine in float, resamples to the rate the device mixes at, and hands `DefaultAudioSink` — built
+with float output and *no* processors — a float buffer to buffer and play. The hard parts (the
+AudioTrack, its buffer, timestamps, drain, gapless) stay Media3's.
+
+Verified in the emulator: the mixer reports `00000005` (**PCM_FLOAT**) at **48000 Hz** for a 44.1
+and a 96 kHz track, `engine at 48000 Hz, resampling from …` in the log, position advancing, skips
+clean.
+
 ## Android Auto / Automotive
 
 CabinEQ is a media source in the car: **For you**, **Recently played** and **My TorBox** are

@@ -169,6 +169,23 @@ class Settings(context: Context) {
         get() = prefs.getBoolean("loudness_match", true)
         set(v) = prefs.edit().putBoolean("loudness_match", v).apply()
 
+    /**
+     * Play the current song from its download as it arrives (resumes after signal drops, keeps
+     * the song for next time) instead of the platform's own stream reader. A switch so the old
+     * path is one tap away if a file or a phone misbehaves with it.
+     */
+    var progressivePlayback: Boolean
+        get() = prefs.getBoolean("progressive_playback", true)
+        set(v) = prefs.edit().putBoolean("progressive_playback", v).apply()
+
+    /**
+     * Play through Media3 (ExoPlayer) instead of the app's own decode loop. Off by default while
+     * the new engine is being proven in the car; the DSP engine is the same either way.
+     */
+    var media3Player: Boolean
+        get() = prefs.getBoolean("media3_player", false)
+        set(v) = prefs.edit().putBoolean("media3_player", v).apply()
+
     /** Prefetch only on Wi-Fi/Ethernet. Off by default: the user decides. */
     var cacheWifiOnly: Boolean
         get() = prefs.getBoolean(KEY_CACHE_WIFI_ONLY, false)

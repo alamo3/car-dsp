@@ -32,8 +32,11 @@ class LyricsScreen(carContext: CarContext) : Screen(carContext) {
     private val io = Executors.newSingleThreadExecutor { r -> Thread(r, "CabinEQ-Lyrics").apply { isDaemon = true } }
 
     @Volatile private var sheet: Lyrics.Sheet? = null
-    @Volatile private var started = false
+    /** Media id of the song [sheet] (or the lookup in flight) belongs to; a different song reloads. */
+    @Volatile private var loadedFor: String? = null
     @Volatile private var done = false
+    /** Lets a slow lookup for a song that has since changed be dropped. */
+    private var loadToken = 0
 
     private var shownIndex = Int.MIN_VALUE
     /** The listener's own correction (set on the phone's lyrics page). */
@@ -52,7 +55,9 @@ class LyricsScreen(carContext: CarContext) : Screen(carContext) {
             val top = runCatching { screenManager.top === this@LyricsScreen }.getOrDefault(false)
             if (top) {
                 val idx = currentIndex()
-                if (idx != shownIndex) {
+                // A new song: redraw so onGetTemplate sees it and fetches that song's lyrics.
+                val songChanged = FilePlayer.peek()?.currentTrack?.mediaId.let { it != null && it != loadedFor }
+                if (idx != shownIndex || songChanged) {
                     shownIndex = idx
                     runCatching { invalidate() }
                 }
@@ -69,9 +74,9 @@ class LyricsScreen(carContext: CarContext) : Screen(carContext) {
     }
 
     override fun onGetTemplate(): Template {
-        load()
         val player = FilePlayer.peek()
         val track = player?.currentTrack
+        if (track != null) load(track.mediaId)
         if (player == null || track == null) {
             return MessageTemplate.Builder("Nothing playing.")
                 .setTitle("Lyrics")
@@ -138,17 +143,30 @@ class LyricsScreen(carContext: CarContext) : Screen(carContext) {
         return s.indexAt(p.audiblePositionMs + Lyrics.LEAD_MS + CAR_REFRESH_LEAD_MS + offsetMs)
     }
 
-    /** One lookup per screen; the cache in [Lyrics] makes a repeat open instant. */
-    private fun load() {
-        if (started) return
-        started = true
+    /**
+     * One lookup per song: the screen stays open across songs, so a new song drops the old
+     * lyrics at once (never the previous song's words under the new title) and fetches its own.
+     * The cache in [Lyrics] makes a song heard before instant.
+     */
+    private fun load(mediaId: String) {
+        if (loadedFor == mediaId) return
+        loadedFor = mediaId
+        sheet = null
+        done = false
+        shownIndex = Int.MIN_VALUE
+        val token = ++loadToken
         val app: Context = carContext.applicationContext
         io.execute {
             val p = FilePlayer.peek()
             // A song played before paints at once; only a first-time lookup waits on the network.
-            sheet = p?.let { Lyrics.cachedForPlayer(app, it) } ?: p?.let { Lyrics.forPlayer(app, it) }
-            done = true
-            main.post { runCatching { invalidate() } }
+            val found = p?.let { Lyrics.cachedForPlayer(app, it) } ?: p?.let { Lyrics.forPlayer(app, it) }
+            main.post {
+                // The song moved on while this was running: that lookup is for another song.
+                if (token != loadToken) return@post
+                sheet = found
+                done = true
+                runCatching { invalidate() }
+            }
         }
     }
 }
