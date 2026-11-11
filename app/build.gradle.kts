@@ -40,13 +40,19 @@ val signingKeyPassword: String? =
 val hasSigningKey = signingKeystorePath != null && signingPassword != null &&
     File(signingKeystorePath).exists()
 
-// Phones (Galaxy Z Fold 6 and everything current) are arm64. Emulators are x86_64, so pass
-// -PcabinAbis=x86_64 to build a test APK for one; releases keep the default.
-val cabinAbis: List<String> = (project.findProperty("cabinAbis") as String?)
+// Phones (Galaxy Z Fold 6 and everything current) are arm64; emulators are x86_64. A debug build
+// carries both, so Run works on either: Android picks the device's own ABI. Without it, an
+// arm64-only APK installs on an x86_64 emulator and runs under binary translation, where the
+// native DSP is far too slow and playback stalls for reasons that have nothing to do with the app.
+// Releases stay arm64-only (smaller, and the only thing a phone needs). -PcabinAbis=a,b overrides
+// both.
+val cabinAbisOverride: List<String>? = (project.findProperty("cabinAbis") as String?)
     ?.split(',')
     ?.map { it.trim() }
     ?.filter { it.isNotEmpty() }
-    ?: listOf("arm64-v8a")
+    ?.takeIf { it.isNotEmpty() }
+val releaseAbis: List<String> = cabinAbisOverride ?: listOf("arm64-v8a")
+val debugAbis: List<String> = cabinAbisOverride ?: listOf("arm64-v8a", "x86_64")
 
 // -PcabinAppIdSuffix=.aaTest installs a test build next to a release build instead of replacing
 // it (Android Auto lists media apps by package, so both show up).
@@ -71,10 +77,6 @@ android {
         targetSdk = 36
         versionCode = cabinVersionCode
         versionName = cabinVersionName
-
-        ndk {
-            abiFilters += cabinAbis
-        }
     }
 
     externalNativeBuild {
@@ -98,10 +100,12 @@ android {
         release {
             isMinifyEnabled = false
             signingConfigs.findByName("cabineq")?.let { signingConfig = it }
+            ndk { abiFilters += releaseAbis }
         }
         debug {
             // Same key as CI: a dev build installs over the release build, not beside it.
             signingConfigs.findByName("cabineq")?.let { signingConfig = it }
+            ndk { abiFilters += debugAbis }
         }
     }
 

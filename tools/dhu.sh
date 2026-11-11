@@ -26,7 +26,20 @@ case "$geometry" in
   *) echo "unknown geometry $geometry (1080p|720p)"; exit 2 ;;
 esac
 
-# DHU talks to the phone over adb's local transport; point it at the right device.
+# Two transports:
+#  * --server: AA's developer "head unit server" listens on the phone's port 5277; forward it and
+#    point DHU at the local end. No USB accessory negotiation, works over plain adb.
+#  * default: AOA/USB accessory mode, which needs a real USB connection.
+if [ "${1:-}" = "--server" ]; then
+  shift
+  serial="${1:-}"
+  adb_cmd=("$ANDROID_HOME/platform-tools/adb")
+  if [ -n "$serial" ]; then adb_cmd+=(-s "$serial"); fi
+  "${adb_cmd[@]}" forward tcp:5277 tcp:5277
+  echo "forwarded 5277 — DHU will connect to AA's head unit server"
+  exec "$DHU" --config="$cfg" --adb=127.0.0.1:5277 -i touch
+fi
+
 args=(--config="$cfg" --usb)
 if [ -n "$serial" ]; then args+=("--adb=$ANDROID_HOME/platform-tools/adb" "-s" "$serial"); fi
 
