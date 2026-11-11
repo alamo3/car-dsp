@@ -42,6 +42,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import dev.alamo3.cabineq.FilePlayer
 import dev.alamo3.cabineq.MediaCache
 import dev.alamo3.cabineq.Taste
+import dev.alamo3.cabineq.BuildConfig
 import dev.alamo3.cabineq.Track
 import dev.alamo3.cabineq.TrackResolver
 import dev.alamo3.cabineq.addon.AddonNotReady
@@ -60,6 +61,12 @@ import java.util.concurrent.Executors
  * posted to that thread and is handled in order; Media3 does the fetching, buffering, decoding
  * and the hand-over between songs. What the rest of the app reads (state, position, the current
  * song) is published through [FilePlayer.Bridge].
+ *
+ * Everything that touches the player runs on the main thread: the command methods post, and the
+ * mutable fields of this class are main-thread state (the shared maps say so). A command that
+ * arrives before the player can take it is not dropped — it waits in [Intents] and
+ * [applyIntents] carries it out. The queue is mirrored in [keys], changed only by the four
+ * functions that also change the player's playlist, and compared against it in debug builds.
  *
  * What stays ours:
  *  - the DSP: [DspAudioProcessor] runs the same native engine on the decoded audio;
@@ -106,10 +113,10 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     private var gaveUp = false
 
     /**
-     * A skip that arrived while the queue was still being put together (a look-up on the pool).
-     * Dropping it is what made "next" right after picking a song do nothing at all.
+     * Commands that arrived before the player could take them: a start still reading the disk
+     * cache, or no player built yet. Nothing is dropped; see [Intents].
      */
-    private var pendingSkip: Int? = null
+    private val intents = Intents()
 
     // ---- shared with the loader threads ----------------------------------------------------
     private val tracksByKey = ConcurrentHashMap<String, Track>()
@@ -169,6 +176,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
 
     /** Main thread: resets what belongs to the old queue and starts the new one. */
     private fun begin(tracks: List<Track>, queueKeys: List<String>, local: List<File?>?, index: Int, startAtMs: Long) {
+        onMain()
         val p = ensurePlayer()
         lastTrack = null          // FilePlayer.play already reported what this replaces
         keys.clear()
@@ -180,7 +188,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         failures = 0
         radioAsks = 0
         gaveUp = false
-        pendingSkip = null       // this start is the song that was asked for
+        intents.start(index, startAtMs)   // the items exist only when load() runs
         stopWaitingForNetwork()
         bridge.error(null)
         // Dropped if the queue is replaced while the files are being looked up.
@@ -206,16 +214,22 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         index: Int,
         startAtMs: Long,
     ) {
+        onMain()
         val items = tracks.mapIndexed { i, t -> item(queueKeys[i], t, local[i]) }
-        // A skip tapped before the queue existed wins: start where the listener asked for.
-        val wanted = pendingSkip?.coerceIn(0, items.lastIndex)
-        pendingSkip = null
-        p.setMediaItems(items, wanted ?: index.coerceIn(0, items.lastIndex), if (wanted != null) 0L else startAtMs)
+        // Anything asked for while the queue was being built is folded in here: a skip tapped
+        // before there were items starts the queue on that song, a pause keeps it paused.
+        val ready = intents.onQueueReady()
+        val at = (ready?.index ?: index).coerceIn(0, items.lastIndex)
+        val position = ready?.positionMs ?: startAtMs
+        p.setMediaItems(items, at, position)
         p.repeatMode = repeatMode(owner.repeat)
         p.prepare()
-        p.play()
-        Log.i(TAG, "start: ${items.size} songs from ${wanted ?: index} at ${if (wanted != null) 0 else startAtMs}ms")
+        if (ready?.play == false) p.pause() else p.play()
+        Log.i(TAG, "queue: ${items.size} songs, starting at $at from ${position}ms" +
+            if (ready?.play == false) ", paused" else "")
+        checkQueue("load")
         startTicking()
+        applyIntents()           // commands that landed while the items were being built
     }
 
     /**
@@ -229,38 +243,82 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         }
     }
 
-    fun pause() = main.post { player?.pause() }
+    fun pause() = main.post { intents.setPlaying(false); applyIntents() }
 
-    fun resume() = main.post {
-        val p = player ?: return@post
-        if (p.playbackState == Player.STATE_IDLE) p.prepare()
-        p.play()
-    }
+    fun resume() = main.post { intents.setPlaying(true); applyIntents() }
 
     fun skipTo(index: Int) = main.post {
-        val p = player
-        if (p == null || index !in 0 until p.mediaItemCount) {
-            // The queue is not there yet (a start still reading the disk cache). Remember the tap
-            // and load() starts there, instead of the tap vanishing.
-            if (index >= 0) pendingSkip = index
-            Log.i(TAG, "skip to $index before the queue exists: starting there when it does")
-            return@post
-        }
-        Log.i(TAG, "skip to $index")
-        reportLeaving(skipped = true)
-        stopWaitingForNetwork()
-        p.seekToDefaultPosition(index)
-        if (p.playbackState == Player.STATE_IDLE) p.prepare()
-        p.play()
+        if (index < 0) return@post
+        intents.skipTo(index)
+        applyIntents()
     }
 
-    fun seekTo(ms: Long) = main.post { player?.seekTo(ms) }
+    fun seekTo(ms: Long) = main.post { intents.seekTo(ms); applyIntents() }
+
+    /**
+     * Carries out whatever is waiting, as far as the player can take it. Anything it cannot take
+     * yet stays in [Intents] — that is the point — and the next call (after a load, a command, a
+     * song change) tries again.
+     */
+    private fun applyIntents() {
+        onMain()
+        val p = player
+        if (p == null || p.mediaItemCount == 0) {
+            if (!intents.isEmpty) Log.i(TAG, "held until the queue exists: ${intents.describe()}")
+            return
+        }
+        intents.takeSkip()?.let { raw ->
+            val index = raw.coerceIn(0, p.mediaItemCount - 1)
+            Log.i(TAG, "skip to $index")
+            reportLeaving(skipped = true)
+            stopWaitingForNetwork()
+            p.seekToDefaultPosition(index)
+            if (p.playbackState == Player.STATE_IDLE) p.prepare()
+            p.play()
+        }
+        intents.takeSeek()?.let { ms ->
+            Log.i(TAG, "seek to $ms ms")
+            p.seekTo(ms)
+        }
+        intents.takePlaying()?.let { play ->
+            Log.i(TAG, if (play) "play" else "pause")
+            if (play) {
+                if (p.playbackState == Player.STATE_IDLE) p.prepare()
+                p.play()
+            } else {
+                p.pause()
+            }
+        }
+    }
+
+    /** Everything that touches the player runs here; a caller on another thread posts first. */
+    private fun onMain() {
+        if (BuildConfig.DEBUG) check(Looper.myLooper() == Looper.getMainLooper()) {
+            "player state touched off the main thread"
+        }
+    }
+
+    /**
+     * The player's playlist and [keys] are two copies of one queue. Every change goes through one
+     * of the four functions below, which update both; this catches the day one is changed alone.
+     */
+    private fun checkQueue(where: String) {
+        if (!BuildConfig.DEBUG) return
+        val count = player?.mediaItemCount ?: return
+        check(keys.size == count) { "queue mirror out of step after $where: ${keys.size} keys, $count items" }
+    }
 
     fun repeat(mode: FilePlayer.Repeat) = main.post { player?.repeatMode = repeatMode(mode) }
 
     /** Queue edits, in the order [FilePlayer] made them. */
     fun added(tracks: List<Track>, newKeys: List<String>) = main.post {
-        val p = player ?: return@post
+        val p = player
+        if (p == null || p.mediaItemCount == 0) {
+            // Nothing is loaded (the queue is still being built, or was stopped). The next start
+            // reads FilePlayer's own list, which already has these; say so rather than desync.
+            Log.i(TAG, "queue edit before the queue exists: ${tracks.size} songs wait for the next start")
+            return@post
+        }
         val first = p.mediaItemCount
         keys.addAll(newKeys)
         p.addMediaItems(tracks.mapIndexed { i, t ->
@@ -274,24 +332,33 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             p.seekToDefaultPosition(first)
             p.play()
         }
+        checkQueue("added")
         checkAhead()
     }
 
     fun removed(index: Int) = main.post {
-        val p = player ?: return@post
-        if (index !in 0 until p.mediaItemCount) return@post
+        val p = player
+        if (p == null || index !in 0 until p.mediaItemCount) {
+            Log.i(TAG, "remove of $index ignored: the queue is not in the player")
+            return@post
+        }
         val gone = keys.removeAt(index)
         tracksByKey.remove(gone)
         if (deferred.remove(gone) != null) publishWaiting()
         cancelPrefetch(gone)
         p.removeMediaItem(index)
+        checkQueue("removed")
     }
 
     fun moved(from: Int, to: Int) = main.post {
-        val p = player ?: return@post
-        if (from !in 0 until p.mediaItemCount || to !in 0 until p.mediaItemCount) return@post
+        val p = player
+        if (p == null || from !in 0 until p.mediaItemCount || to !in 0 until p.mediaItemCount) {
+            Log.i(TAG, "move $from -> $to ignored: the queue is not in the player")
+            return@post
+        }
         keys.add(to, keys.removeAt(from))
         p.moveMediaItem(from, to)
+        checkQueue("moved")
     }
 
     /** The output rate may have moved (new route, or the setting): let the DSP re-plan. */
@@ -332,6 +399,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
 
     /** Stops and releases. The other engine, or nothing, plays next. */
     fun shutdown() = main.post {
+        onMain()
         ticking = false
         // Only this engine's own timers: a start() posted right after must still run.
         main.removeCallbacks(ticker)
@@ -348,7 +416,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         cancelAllPrefetch()
         tracksByKey.clear()
         deferred.clear()
-        pendingSkip = null
+        intents.clear()
         publishWaiting()
         links.clear()
         advancing = false
@@ -670,6 +738,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     }
 
     private fun onSongChanged() {
+        onMain()
         val p = player ?: return
         val index = p.currentMediaItemIndex
         val track = currentTrack()
