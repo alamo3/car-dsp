@@ -25,7 +25,12 @@ import java.util.Locale
  *   GET /stream/{id}       → 200 { url, format, quality, sampleRate, bitDepth, … }
  *                            503 + Retry-After { notice: { title, message, progress } } = not ready yet
  */
-class EclipseAddon(link: String) {
+/**
+ * @param readTimeoutMs how long one request may wait for Nebula's answer. Background work (radio
+ *   matching) passes a short one: a slow answer there should give way to the next candidate, not
+ *   hold everything up for half a minute.
+ */
+class EclipseAddon(link: String, private val readTimeoutMs: Int = 30_000) {
 
     /** Base URL without trailing "/manifest.json" or "/". */
     val baseUrl: String = normalize(link)
@@ -363,8 +368,8 @@ class EclipseAddon(link: String) {
         val url = baseUrl + path
         val safe = "addon " + path.substringBefore('?')   // never log the base: it carries the key
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 15_000
-            readTimeout = 30_000
+            connectTimeout = minOf(15_000, readTimeoutMs)
+            readTimeout = readTimeoutMs
             instanceFollowRedirects = true
             setRequestProperty("Accept", "application/json")
             setRequestProperty("User-Agent", "CabinEQ")

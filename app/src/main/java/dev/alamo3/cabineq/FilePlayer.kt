@@ -464,6 +464,8 @@ class FilePlayer private constructor(private val context: Context) {
         } else null
         radioSeed = seed
         persistPool.execute { runCatching { settings.radioSeed = seed } }
+        // Start getting the radio ready now, in the background, not when the queue runs low.
+        seed?.let { Radio.prepare(context, it) }
         DLog.i(TAG, "play \"${title ?: ""}\": ${tracks.size} songs from #$startIndex, radio ${
             when {
                 radio != null -> "started from \"${radio.title}\" (${radio.artist})"
@@ -748,10 +750,9 @@ class FilePlayer private constructor(private val context: Context) {
             if (force) DLog.i(TAG, "Radio: not asked, repeat is $repeat")
             return
         }
-        // Keep several songs queued ahead, not one or two: a lookup can take half a minute when
-        // the artist's related songs are not cached yet, and skipping through two songs is
-        // faster than that. With a deeper queue a skip lands on a song that is already there,
-        // and TorBox's look-ahead (four songs) always has radio picks to start caching.
+        // Keep a deep queue: plenty of listeners skip a lot, and a skip should land on a song that
+        // is already there. Picks are cheap once the background matcher (Radio.prepare) has
+        // songs ready, so this costs little; TorBox is still only asked about the next four.
         if (!force && queue.lastIndex - currentIndex >= RADIO_AHEAD) return
         if (!force && state != State.PLAYING && state != State.LOADING) return
         radioBusy = true
@@ -1902,7 +1903,7 @@ class FilePlayer private constructor(private val context: Context) {
 
     companion object {
         /** Songs the radio keeps queued ahead of the one playing. */
-        private const val RADIO_AHEAD = 5
+        private const val RADIO_AHEAD = 20
         private const val ERROR_SHOWN_MS = 20_000L
         /** Ramp-in length at every (re)start; long enough to hide a step, short enough to forget. */
         private const val FADE_IN_MS = 15

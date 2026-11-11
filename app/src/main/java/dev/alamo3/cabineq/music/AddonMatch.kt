@@ -79,7 +79,22 @@ object AddonMatch {
             ?.first
 
     /** Searches the addon for [track]; blocking (up to three requests). */
-    fun find(addon: EclipseAddon, track: Track): EclipseAddon.Track? {
+    /** What a match attempt came to: a copy that plays, a real miss, or no answer at all. */
+    sealed class Outcome {
+        class Found(val track: EclipseAddon.Track) : Outcome()
+        object NotFound : Outcome()
+        /** Every search failed (timeout, network): says nothing about whether Nebula has it. */
+        class Failed(val error: Throwable) : Outcome()
+    }
+
+    fun find(addon: EclipseAddon, track: Track): EclipseAddon.Track? =
+        (match(addon, track) as? Outcome.Found)?.track
+
+    /**
+     * Like [find], but tells a miss apart from a failure, so a song is only written off when Nebula
+     * actually answered without it — a timeout must not mark a song as missing for good.
+     */
+    fun match(addon: EclipseAddon, track: Track): Outcome {
         val dur = (track.durationMs / 1000).toInt().takeIf { it > 0 }
         val artist = track.artist?.split(',')?.first()?.trim()?.takeIf { it.isNotBlank() }
         val title = SongKey.plainTitle(track.title)
@@ -90,15 +105,26 @@ object AddonMatch {
             title,
         ).distinct()
         val seen = LinkedHashMap<String, EclipseAddon.Track>()
+        var answered = false
+        var error: Throwable? = null
         for (q in queries) {
-            val results = runCatching { addon.search(q, 20, deep = false) }.getOrNull() ?: continue
-            best(track.title, artist, dur, results.tracks)?.let { return it }
+            val results = try {
+                addon.search(q, 20, deep = false)
+            } catch (e: Exception) {
+                error = e
+                // A timeout will not be quicker on the next phrasing: stop here.
+                if (e is java.net.SocketTimeoutException) break
+                continue
+            }
+            answered = true
+            best(track.title, artist, dur, results.tracks)?.let { return Outcome.Found(it) }
             results.tracks.forEach { seen.putIfAbsent(it.id, it) }
         }
+        if (!answered) return Outcome.Failed(error ?: java.io.IOException("no answer"))
         // Say what the source did offer: a miss here is a matching rule to fix, and this is
         // what shows which (titles and artists only — nothing private).
         DLog.i("CabinEQ/Match", "no match for \"${track.title}\" by ${artist ?: "?"} (${dur ?: "?"}s) among " +
             seen.values.take(6).joinToString("; ") { "${it.title} — ${it.artist} (${it.durationSec ?: "?"}s)" }.ifEmpty { "no results" })
-        return null
+        return Outcome.NotFound
     }
 }

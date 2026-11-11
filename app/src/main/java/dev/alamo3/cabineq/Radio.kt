@@ -5,17 +5,29 @@ import android.os.SystemClock
 import dev.alamo3.cabineq.addon.EclipseAddon
 import dev.alamo3.cabineq.music.AddonMatch
 import dev.alamo3.cabineq.music.Discover
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * "Keep going from this song, one track at a time" — towards music you haven't heard.
  *
- * Candidates come from four places:
+ * Candidates come from Deezer's public catalogue (fast, no key), fetched in parallel:
  *
  *  A. the seed artist's top tracks — continuity with what is playing,
- *  B. playlists that match the seed artist — the other artists in them (same scene),
- *  C. Deezer: the seed artist's radio and the top songs of similar artists,
- *  D. Deezer: artists similar to your own favourites, so discovery follows your taste and not
- *     only the current song.
+ *  C. the seed artist's Deezer radio and the top songs of similar artists,
+ *  D. artists similar to your own favourites, so discovery follows your taste and not only the
+ *     current song.
+ *
+ * Nebula is used for one thing only: finding the playable copy of a chosen song. That lookup is
+ * the slow part (Nebula asks Tidal, which can take seconds or time out), so it is done ahead of
+ * time: while a radio is on, [prepare] keeps the best-ranked candidates matched in the
+ * background, a few a minute, and a pick takes an already-matched song without any request.
+ * Pools for several artists, and every match, are kept on disk, so a restart starts warm.
  *
  * Ranking is discovery-first: a song you have never heard beats one you have, an artist you
  * have no history with gets a lift, anything played in the last three days is out, and familiar
@@ -23,23 +35,42 @@ import dev.alamo3.cabineq.music.Discover
  * artist affinity, likes, skips and dislikes all count. Songs from Deezer are only an index; each
  * pick is matched to the same recording on Nebula before it is queued.
  *
- * Exactly one track is returned at a time; [FilePlayer] asks again when the queue drains.
+ * Exactly one track is returned at a time; [FilePlayer] chains calls to keep a deep queue.
  */
 object Radio {
     private const val TAG = "CabinEQ/Radio"
-    private const val CACHE_TTL_MS = 10 * 60_000L
+    /** How long an artist's candidate pool is reused before it is fetched again. */
+    private const val CACHE_TTL_MS = 6 * 3600_000L
+    /** Artists whose pools are kept (in memory and on disk). */
+    private const val POOLS_KEPT = 8
+    /** Matched songs the background matcher keeps ready among the best-ranked candidates. */
+    private const val READY_TARGET = 30
+    /** A pick prefers a ready song among this many of the best-ranked ones. */
+    private const val READY_WINDOW = 15
+    /** Pause between background matches, and after Nebula fails to answer. */
+    private const val MATCH_GAP_MS = 2_500L
+    private const val MATCH_BACKOFF_MS = 30_000L
+    /** Nebula's answer time for radio matching; past it the next candidate is tried. */
+    private const val MATCH_TIMEOUT_MS = 12_000
+    /** A song Nebula did not have is not looked for again for a week. */
+    private const val UNMATCHED_TTL_MS = 7L * 24 * 3600_000
     /** A song played this recently is not offered again, liked or not. */
     private const val RECENT_MS = 3L * 24 * 3600 * 1000
     /** Nebula lookups per pick before giving up on discovered songs for this round. */
     private const val MAX_MATCH_TRIES = 4
 
-    /** Discovered songs the addon doesn't have (per process): not offered again. */
-    private val unmatched = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    /** Discovered songs Nebula answered without (key -> when): not offered again for a while. */
+    private val unmatched = ConcurrentHashMap<String, Long>()
+    /** Discovered songs matched to Nebula (key -> the playable copy): picked without a request. */
+    private val matched = ConcurrentHashMap<String, Track>()
 
     private class Candidate(val track: Track, val source: String)
     private class Pool(val artist: String, val at: Long, val candidates: List<Candidate>)
 
-    @Volatile private var pool: Pool? = null
+    /** Pools by artist (lowercase), least recently used first. Guarded by [buildLock]. */
+    private val pools = object : LinkedHashMap<String, Pool>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pool>?) = size > POOLS_KEPT
+    }
 
     /** Why each recent pick was made, by song: what the player shows under "Why this song". */
     private val reasons = object : LinkedHashMap<String, String>(64, 0.75f, true) {
@@ -91,31 +122,40 @@ object Radio {
         }
         val ranked = rank(context, candidates, exclude, sessionArtists, currentArtist, artist)
         DLog.i(TAG, "next: $artist, ${candidates.size} related, ${ranked.size} left after excluding ${exclude.size} queued")
-        // Discovered songs need a Nebula match before they can play. Try the best few; a song
-        // the addon doesn't have is remembered and skipped from then on.
-        val link = Settings(context).addonLink
+        // Keep the background matcher on this artist: it is what makes the next pick instant.
+        prepare(context, seed)
+        // 1. A song already matched (in the background, or earlier) among the best few: no
+        //    request at all. Slightly lower-ranked but ready beats best-ranked but unknown.
         var picked: Pair<Candidate, Float>? = null
         var track: Track? = null
+        for (c in ranked.take(READY_WINDOW)) {
+            val ready = readyCopy(c.first.track) ?: continue
+            picked = c; track = ready; break
+        }
+        // 2. Nothing ready yet (a radio just started): match live, the best few, with a short
+        //    timeout. Only a real miss writes a song off; a timeout just moves on.
+        val link = Settings(context).addonLink
         var tries = 0
-        for (c in ranked) {
-            if (c.first.track.sourceId != null || c.first.track.streamUrl != null) {
-                picked = c; track = c.first.track; break
-            }
-            if (link.isBlank() || tries >= MAX_MATCH_TRIES) continue
+        if (picked == null) for (c in ranked) {
+            readyCopy(c.first.track)?.let { picked = c; track = it }
+            if (picked != null) break
+            if (link.isBlank() || tries >= MAX_MATCH_TRIES) break
             val k = key(c.first.track)
-            if (k in unmatched) continue
+            if (isUnmatched(k)) continue
             tries++
-            val found = runCatching { AddonMatch.find(EclipseAddon(link), c.first.track) }.getOrNull()
-            if (found == null) {
-                unmatched.add(k)
-                DLog.i(TAG, "not on Nebula: ${c.first.track.title} (${c.first.track.artist})")
-                continue
+            when (val r = AddonMatch.match(EclipseAddon(link, MATCH_TIMEOUT_MS), c.first.track)) {
+                is AddonMatch.Outcome.Found -> {
+                    track = remember(c.first.track, r.track)
+                    picked = c
+                }
+                AddonMatch.Outcome.NotFound -> {
+                    unmatched[k] = System.currentTimeMillis()
+                    DLog.i(TAG, "not on Nebula: ${c.first.track.title} (${c.first.track.artist})")
+                }
+                is AddonMatch.Outcome.Failed ->
+                    DLog.i(TAG, "Nebula did not answer for ${c.first.track.title}: ${r.error.javaClass.simpleName}")
             }
-            // The addon's copy plays; keep the discovered cover if the addon has none.
-            val resolved = found.toTrack()
-            track = resolved.copy(artworkUrl = resolved.artworkUrl ?: c.first.track.artworkUrl)
-            picked = c
-            break
+            if (picked != null) break
         }
         val best = picked ?: run {
             DLog.i(TAG, "next: none of the top picks are on Nebula ($tries tried)")
@@ -167,7 +207,7 @@ object Radio {
             for ((candidate, _) in ranked) {
                 if (out.size >= count) break
                 if (candidate.track in out) continue
-                if (key(candidate.track) in unmatched) continue
+                if (isUnmatched(key(candidate.track))) continue
                 val a = primaryArtist(candidate.track.artist)?.lowercase().orEmpty()
                 if ((perArtist[a] ?: 0) >= cap) continue
                 perArtist[a] = (perArtist[a] ?: 0) + 1
@@ -242,73 +282,240 @@ object Radio {
         runCatching { poolFor(context, seedArtist) }
     }
 
+    // ---------------------------------------------------------------- ready songs
+
+    private fun isUnmatched(k: String): Boolean {
+        val at = unmatched[k] ?: return false
+        if (System.currentTimeMillis() - at < UNMATCHED_TTL_MS) return true
+        unmatched.remove(k)
+        return false
+    }
+
+    /** The playable copy of [t] if there is one without a request: its own, or a match. */
+    private fun readyCopy(t: Track): Track? {
+        if (t.sourceId != null || t.streamUrl != null) return t
+        return matched[key(t)]
+    }
+
+    /** Stores a match; the addon's copy plays, the discovered cover is kept if it has none. */
+    private fun remember(discovered: Track, found: EclipseAddon.Track): Track {
+        val resolved = found.toTrack()
+        val copy = resolved.copy(artworkUrl = resolved.artworkUrl ?: discovered.artworkUrl)
+        matched[key(discovered)] = copy
+        return copy
+    }
+
+    @Volatile private var preparing: String? = null
+    @Volatile private var matcherRunning = false
+    private val matcher = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "CabinEQ-RadioPrep").apply { isDaemon = true; priority = Thread.MIN_PRIORITY }
+    }
+
+    /**
+     * Gets the radio for [seed] ready in the background: the pool built (in parallel, from
+     * Deezer) and the best-ranked candidates matched on Nebula, a few a minute, until
+     * [READY_TARGET] are ready. Returns at once; safe to call as often as wanted. Stops by itself
+     * when the radio is off.
+     */
+    fun prepare(context: Context, seed: Track?) {
+        val artist = primaryArtist(seed?.artist)
+            ?: Taste.profile(context).topArtists(1).firstOrNull()?.let { primaryArtist(it.first) }
+            ?: return
+        preparing = artist
+        if (matcherRunning) return
+        matcherRunning = true
+        val app = context.applicationContext
+        matcher.execute {
+            try { runMatcher(app) } catch (e: Exception) {
+                DLog.w(TAG, "background matching stopped", e)
+            } finally { matcherRunning = false }
+        }
+    }
+
+    private fun runMatcher(context: Context) {
+        loadCache(context)
+        var sinceSave = 0
+        while (true) {
+            val artist = preparing ?: break
+            // Only while a radio is on: nothing is fetched for a queue that will just end.
+            if (FilePlayer.peek()?.radioActive != true) break
+            val link = Settings(context).addonLink.takeIf { it.isNotBlank() } ?: break
+            val pool = poolFor(context, artist) ?: break
+            val queue = FilePlayer.peek()?.queue.orEmpty()
+            val exclude = queue.flatMap { identity(it) }.toHashSet()
+            val top = rank(context, pool, exclude, emptySet(), null, artist)
+                .take(READY_TARGET + READY_WINDOW).map { it.first.track }
+            val ready = top.count { readyCopy(it) != null }
+            val next = top.firstOrNull { readyCopy(it) == null && !isUnmatched(key(it)) }
+            if (ready >= READY_TARGET || next == null) {
+                if (sinceSave > 0) { saveCache(context); sinceSave = 0 }
+                Thread.sleep(MATCH_BACKOFF_MS)        // enough ready: look again as the queue moves
+                continue
+            }
+            when (val r = AddonMatch.match(EclipseAddon(link, MATCH_TIMEOUT_MS), next)) {
+                is AddonMatch.Outcome.Found -> { remember(next, r.track); sinceSave++ }
+                AddonMatch.Outcome.NotFound -> { unmatched[key(next)] = System.currentTimeMillis(); sinceSave++ }
+                is AddonMatch.Outcome.Failed -> {
+                    // Nebula is struggling: back off rather than add to its load.
+                    DLog.i(TAG, "background match: Nebula did not answer (${r.error.javaClass.simpleName}); pausing")
+                    Thread.sleep(MATCH_BACKOFF_MS)
+                    continue
+                }
+            }
+            if (sinceSave >= 5) { saveCache(context); sinceSave = 0 }
+            Thread.sleep(MATCH_GAP_MS)
+        }
+        saveCache(context)
+    }
+
+    // ---------------------------------------------------------------- disk cache
+
+    @Volatile private var loaded = false
+
+    private fun cacheFile(context: Context) = File(context.filesDir, "radio-cache.json")
+
+    private fun loadCache(context: Context) {
+        if (loaded) return
+        synchronized(buildLock) {
+            if (loaded) return
+            loaded = true
+            runCatching {
+                val o = JSONObject(cacheFile(context).readText())
+                val now = System.currentTimeMillis()
+                o.optJSONArray("pools")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        val p = arr.optJSONObject(i) ?: continue
+                        // Wall-clock age on disk, converted to this boot's clock for the TTL check.
+                        val age = now - p.optLong("savedAt")
+                        if (age !in 0 until CACHE_TTL_MS) continue
+                        val cands = p.optJSONArray("candidates") ?: continue
+                        val list = (0 until cands.length()).mapNotNull { j ->
+                            val c = cands.optJSONObject(j) ?: return@mapNotNull null
+                            val t = c.optJSONObject("track")?.let(Track::fromJson) ?: return@mapNotNull null
+                            Candidate(t, c.optString("source", "similar"))
+                        }
+                        val artist = p.optString("artist")
+                        if (list.isNotEmpty() && artist.isNotBlank()) {
+                            pools[artist.lowercase()] = Pool(artist, SystemClock.elapsedRealtime() - age, list)
+                        }
+                    }
+                }
+                o.optJSONObject("matched")?.let { m ->
+                    m.keys().forEach { k -> m.optJSONObject(k)?.let(Track::fromJson)?.let { matched[k] = it } }
+                }
+                o.optJSONObject("unmatched")?.let { u ->
+                    u.keys().forEach { k -> val at = u.optLong(k); if (now - at < UNMATCHED_TTL_MS) unmatched[k] = at }
+                }
+                DLog.i(TAG, "cache: ${pools.size} pools, ${matched.size} matched, ${unmatched.size} not on Nebula")
+            }
+        }
+    }
+
+    private fun saveCache(context: Context) {
+        runCatching {
+            val now = System.currentTimeMillis()
+            val clock = SystemClock.elapsedRealtime()
+            val o = JSONObject()
+            val arr = JSONArray()
+            synchronized(buildLock) {
+                pools.values.forEach { p ->
+                    arr.put(JSONObject()
+                        .put("artist", p.artist)
+                        .put("savedAt", now - (clock - p.at))
+                        .put("candidates", JSONArray().apply {
+                            p.candidates.forEach { c -> put(JSONObject().put("source", c.source).put("track", c.track.toJson())) }
+                        }))
+                }
+            }
+            o.put("pools", arr)
+            // The newest matches only: a few thousand would be pointless weight.
+            o.put("matched", JSONObject().apply { matched.entries.toList().takeLast(2000).forEach { (k, t) -> put(k, t.toJson()) } })
+            o.put("unmatched", JSONObject().apply { unmatched.forEach { (k, at) -> put(k, at) } })
+            val f = cacheFile(context)
+            val tmp = File(f.parentFile, f.name + ".tmp")
+            tmp.writeText(o.toString())
+            tmp.renameTo(f)
+        }.onFailure { DLog.w(TAG, "could not save the radio cache", it) }
+    }
+
     // ---------------------------------------------------------------- pool
 
     private val buildLock = Any()
 
-    private fun poolFor(context: Context, artist: String): List<Candidate>? = synchronized(buildLock) {
-        val now = SystemClock.elapsedRealtime()
-        pool?.let {
-            if (it.artist.equals(artist, true) && now - it.at < CACHE_TTL_MS) return it.candidates
+    private val builders = Executors.newFixedThreadPool(4) { r ->
+        Thread(r, "CabinEQ-RadioPool").apply { isDaemon = true }
+    }
+
+    private fun poolFor(context: Context, artist: String): List<Candidate>? {
+        loadCache(context)
+        synchronized(buildLock) {
+            val now = SystemClock.elapsedRealtime()
+            pools[artist.lowercase()]?.let { if (now - it.at < CACHE_TTL_MS) return it.candidates }
+            val started = now
+            val built = buildPool(context, artist) ?: return null
+            pools[artist.lowercase()] = Pool(artist, now, built)
+            DLog.i(TAG, "pool for $artist built in ${SystemClock.elapsedRealtime() - started} ms")
+            saveCache(context)
+            return built
         }
-        val link = Settings(context).addonLink
-        if (link.isBlank()) return null
-        val addon = EclipseAddon(link)
-        val results = runCatching { addon.search(artist, 10) }.getOrNull() ?: return null
-        val detail = results.artists.firstOrNull { it.name.equals(artist, ignoreCase = true) }
-            ?.let { runCatching { addon.artist(it.id) }.getOrNull() }
+    }
 
-        val out = ArrayList<Candidate>(160)
-        fun add(from: List<EclipseAddon.Track>, source: String) {
-            from.forEach { out += Candidate(it.toTrack(), source) }
-        }
-        fun addFound(from: List<Track>, source: String) {
-            from.forEach { out += Candidate(it, source) }
-        }
-
-        // A. the seed's own best-known songs (no album deep-dives: that's recycling).
-        add(detail?.topTracks.orEmpty(), "artist")
-        add(results.tracks.filter { it.artist.contains(artist, ignoreCase = true) }, "artist")
-        val sameArtistCount = out.size
-
-        // B. playlists that match the seed: keep the *other* artists in them (a playlist that is
-        // entirely the seed artist contributes nothing here, which is the point).
-        val scene = results.playlists.take(3).flatMap { pl ->
-            runCatching { addon.playlist(pl.id).tracks }.getOrDefault(emptyList())
-        }.filterNot { it.artist.contains(artist, ignoreCase = true) }
-        add(scene, "scene")
-
-        // C. Deezer around the seed: its radio, and the top songs of similar artists.
+    /**
+     * Deezer around [artist], all requests at once: the whole build takes about as long as its
+     * slowest request (a second or two), not the sum of two dozen. Nebula is only used when
+     * Deezer does not know the artist at all.
+     */
+    private fun buildPool(context: Context, artist: String): List<Candidate>? {
         val seedId = runCatching { Discover.artistId(artist) }.getOrNull()
-        if (seedId != null) {
-            addFound(runCatching { Discover.radio(seedId) }.getOrDefault(emptyList()), "similar")
-            val similar = runCatching { Discover.related(seedId, 10) }.getOrDefault(emptyList())
-            addFound(Discover.topOf(similar.take(8), 4), "similar")
-        }
+        if (seedId == null) return nebulaPool(context, artist)
 
-        // D. Deezer around your own favourites: discovery that follows your taste.
         val profile = Taste.profile(context)
         val seedKey = primaryArtist(artist)?.lowercase()
         val tasteArtists = profile.topArtists(6)
             .mapNotNull { primaryArtist(it.first) }
             .filter { it.lowercase() != seedKey }
             .take(2)
-        tasteArtists.forEach { name ->
-            val id = runCatching { Discover.artistId(name) }.getOrNull() ?: return@forEach
-            val similar = runCatching { Discover.related(id, 6) }.getOrDefault(emptyList())
-                .filter { s -> out.none { primaryArtist(it.track.artist)?.equals(s.name, true) == true } }
-            addFound(Discover.topOf(similar.take(4), 3), "taste")
-        }
 
+        val parts = ArrayList<Callable<List<Candidate>>>()
+        // A. the seed's own best-known songs.
+        parts += Callable { Discover.top(seedId, 20).map { Candidate(it, "artist") } }
+        // C. Deezer around the seed: its radio, and the top songs of similar artists.
+        parts += Callable { Discover.radio(seedId).map { Candidate(it, "similar") } }
+        parts += Callable {
+            Discover.topOf(Discover.related(seedId, 10).take(8), 4).map { Candidate(it, "similar") }
+        }
+        // D. Deezer around your own favourites: discovery that follows your taste.
+        tasteArtists.forEach { name ->
+            parts += Callable {
+                val id = Discover.artistId(name) ?: return@Callable emptyList<Candidate>()
+                Discover.topOf(Discover.related(id, 6).take(4), 3).map { Candidate(it, "taste") }
+            }
+        }
+        val futures = parts.map { builders.submit(it) }
+        val out = futures.flatMap { f -> runCatching { f.get(20, TimeUnit.SECONDS) }.getOrDefault(emptyList()) }
         val distinct = out.distinctBy { key(it.track) }
-        if (distinct.isEmpty()) return null
+        if (distinct.isEmpty()) return nebulaPool(context, artist)
         DLog.i(
             TAG,
-            "pool for $artist: ${distinct.size} songs — same artist=$sameArtistCount, " +
-                "other artists=${distinct.size - sameArtistCount}, taste seeds=$tasteArtists"
+            "pool for $artist: ${distinct.size} songs — same artist=${distinct.count { it.source == "artist" }}, " +
+                "other artists=${distinct.count { it.source != "artist" }}, taste seeds=$tasteArtists"
         )
-        pool = Pool(artist, now, distinct)
         return distinct
+    }
+
+    /** The old way, for an artist Deezer does not know: Nebula's search and artist page. */
+    private fun nebulaPool(context: Context, artist: String): List<Candidate>? {
+        val link = Settings(context).addonLink
+        if (link.isBlank()) return null
+        val addon = EclipseAddon(link, MATCH_TIMEOUT_MS)
+        val results = runCatching { addon.search(artist, 10) }.getOrNull() ?: return null
+        val detail = results.artists.firstOrNull { it.name.equals(artist, ignoreCase = true) }
+            ?.let { runCatching { addon.artist(it.id) }.getOrNull() }
+        val out = (detail?.topTracks.orEmpty() + results.tracks.filter { it.artist.contains(artist, ignoreCase = true) })
+            .map { Candidate(it.toTrack(), "artist") }
+            .distinctBy { key(it.track) }
+        DLog.i(TAG, "pool for $artist (Nebula, not on Deezer): ${out.size} songs")
+        return out.ifEmpty { null }
     }
 
     /** "Daft Punk, Julian Casablancas" / "X feat. Y" -> "Daft Punk" (search needs the primary). */
