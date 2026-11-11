@@ -92,6 +92,7 @@ class FilePlayer private constructor(private val context: Context) {
     /** What the source claims about quality ("lossless"), appended to the decoder's line. */
     @Volatile private var declaredQuality: String? = null
     @Volatile var lastError: String? = null
+        private set
     @Volatile private var lastErrorAt = 0L
 
     /**
@@ -106,7 +107,7 @@ class FilePlayer private constructor(private val context: Context) {
             val fresh = SystemClock.elapsedRealtime() - lastErrorAt < ERROR_SHOWN_MS
             return if (state == State.ERROR || fresh) "⚠ $error" else null
         }
-        private set
+
     /** Tags and cover embedded in the current file (read in the background; null until known). */
     class FileInfo(val art: Bitmap?, val title: String?, val artist: String?, val album: String?)
 
