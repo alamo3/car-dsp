@@ -2342,13 +2342,13 @@ class MusicActivity : Activity() {
         }
 
         page.addView(sectionTitle("Playback"))
-        page.addView(Ui.pill(this, "Player engine: ${if (settings.media3Player) "Media3 (new)" else "built-in"}", filled = false) {
+        page.addView(Ui.pill(this, "Player engine: ${if (settings.media3Player) "Media3" else "built-in"}", filled = false) {
             settings.media3Player = !settings.media3Player
             renderSettings()
         }, wrapLp(top = 4))
         page.addView(Ui.text(this,
             "Media3 is Google's player: it does the fetching, buffering and the hand-over between songs, and your EQ and limiter run on its audio exactly as before. " +
-                "It is new here and still being proven in the car. Loudness matching is not available with it yet. Applies from the next song you start.",
+                "Loudness matching is not available with it yet: use the built-in engine if you depend on it. Applies from the next song you start.",
             12f, Ui.TEXT_2, lines = 6).apply { setPadding(0, dp(8), 0, dp(12)) })
         page.addView(Ui.pill(this, "Play while downloading: ${if (settings.progressivePlayback) "on" else "off"}", filled = false) {
             settings.progressivePlayback = !settings.progressivePlayback
@@ -2365,7 +2365,7 @@ class MusicActivity : Activity() {
         page.addView(Ui.text(this,
             "One volume setting per song, so a quiet track and a loud one play at the same level. " +
                 "It does not compress: the quiet and loud parts inside a song stay as they were made. " +
-                "A song is measured the first time it plays; albums keep their own balance. Applies from the next song.",
+                "A song is measured the first time it plays; albums keep their own balance. Built-in engine only. Applies from the next song.",
             12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, 0) })
 
         // What the recommender has learned, in plain words, with a way to wipe it.

@@ -179,12 +179,14 @@ class Settings(context: Context) {
         set(v) = prefs.edit().putBoolean("progressive_playback", v).apply()
 
     /**
-     * Play through Media3 (ExoPlayer) instead of the app's own decode loop. Off by default while
-     * the new engine is being proven in the car; the DSP engine is the same either way.
+     * Play through Media3 (ExoPlayer) instead of the app's own decode loop. On unless it has been
+     * turned off: it does the fetching, buffering and the hand-over between songs, and the DSP
+     * engine is the same either way. An explicit "off" is kept, so the built-in path stays one
+     * tap away for a file or a phone that misbehaves with it.
      */
     var media3Player: Boolean
-        get() = prefs.getBoolean("media3_player", false)
-        set(v) = prefs.edit().putBoolean("media3_player", v).apply()
+        get() = prefs.getBoolean(KEY_MEDIA3, MEDIA3_DEFAULT)
+        set(v) = prefs.edit().putBoolean(KEY_MEDIA3, v).apply()
 
     /** Prefetch only on Wi-Fi/Ethernet. Off by default: the user decides. */
     var cacheWifiOnly: Boolean
@@ -376,6 +378,9 @@ class Settings(context: Context) {
         const val KEY_MAX_VOLUME_SPEAKER = "max_volume_speaker"
         const val KEY_PRE_CAR_VOLUME = "pre_car_volume"
         const val KEY_MATCH_DEVICE_RATE = "match_device_rate"
+        const val KEY_MEDIA3 = "media3_player"
+        /** Media3 is the player unless it was deliberately switched off. */
+        const val MEDIA3_DEFAULT = true
         const val KEY_CACHE_ENABLED = "cache_enabled"
         const val KEY_CACHE_WIFI_ONLY = "cache_wifi_only"
         const val KEY_CACHE_MAX_MB = "cache_max_mb"
