@@ -786,6 +786,12 @@ class FilePlayer private constructor(private val context: Context) {
                 }
                 return@execute
             }
+            // Last line of defence against a loop: never queue a song that is already in the queue.
+            if (Radio.identity(next).any { it in exclude }) {
+                DLog.w(TAG, "Radio: \"${next.title}\" is already queued; not adding it again")
+                if (followNewTrack) { followNewTrack = false; setNote(null) }
+                return@execute
+            }
             DLog.i(TAG, "Radio: ${if (found == null) "library fallback" else "pick"} after ${took}ms")
             DLog.i(TAG, "Radio: queuing \"${next.title}\" — ${next.artist}")
             enqueue(listOf(next))

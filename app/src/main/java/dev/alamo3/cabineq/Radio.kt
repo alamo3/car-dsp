@@ -62,7 +62,11 @@ object Radio {
     /** Discovered songs Nebula answered without (key -> when): not offered again for a while. */
     private val unmatched = ConcurrentHashMap<String, Long>()
     /** Discovered songs matched to Nebula (key -> the playable copy): picked without a request. */
-    private val matched = ConcurrentHashMap<String, Track>()
+    private val matched: MutableMap<String, Track> = java.util.Collections.synchronizedMap(
+        object : LinkedHashMap<String, Track>(256, 0.75f, false) {
+            // Oldest matches go first once there are 2000: the newest are the useful ones.
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Track>?) = size > 2000
+        })
 
     private class Candidate(val track: Track, val source: String)
     private class Pool(val artist: String, val at: Long, val candidates: List<Candidate>)
@@ -145,8 +149,9 @@ object Radio {
             tries++
             when (val r = AddonMatch.match(EclipseAddon(link, MATCH_TIMEOUT_MS), c.first.track)) {
                 is AddonMatch.Outcome.Found -> {
-                    track = remember(c.first.track, r.track)
-                    picked = c
+                    val copy = remember(c.first.track, r.track)
+                    // Matched to a song that is already queued under another name: not again.
+                    if (identity(copy).none { it in exclude }) { track = copy; picked = c }
                 }
                 AddonMatch.Outcome.NotFound -> {
                     unmatched[k] = System.currentTimeMillis()
@@ -235,7 +240,10 @@ object Radio {
         val seedRun = sessionKeys.count { it == seedKey }
         val jitter = java.util.Random()
         return candidates
-            .filter { c -> identity(c.track).none { it in exclude } }
+            // Excluded by what will actually be queued too: a Deezer entry and its Nebula copy can
+            // carry different keys (an ISRC, "feat." in the title or artist), and checking only the
+            // Deezer one let the same matched song be queued again and again.
+            .filter { c -> (identity(c.track) + readyIdentity(c.track)).none { it in exclude } }
             .filter { !profile.isDisliked(it.track) && !profile.skippedRecently(it.track) }
             // Played in the last three days: not again yet, however much you like it.
             .filter { now - profile.lastPlayedAt(it.track) > RECENT_MS }
@@ -290,6 +298,8 @@ object Radio {
         unmatched.remove(k)
         return false
     }
+
+    private fun readyIdentity(t: Track): List<String> = matched[key(t)]?.let { identity(it) }.orEmpty()
 
     /** The playable copy of [t] if there is one without a request: its own, or a match. */
     private fun readyCopy(t: Track): Track? {
@@ -429,7 +439,8 @@ object Radio {
             }
             o.put("pools", arr)
             // The newest matches only: a few thousand would be pointless weight.
-            o.put("matched", JSONObject().apply { matched.entries.toList().takeLast(2000).forEach { (k, t) -> put(k, t.toJson()) } })
+            val matches = synchronized(matched) { matched.entries.map { it.key to it.value } }
+            o.put("matched", JSONObject().apply { matches.forEach { (k, t) -> put(k, t.toJson()) } })
             o.put("unmatched", JSONObject().apply { unmatched.forEach { (k, at) -> put(k, at) } })
             val f = cacheFile(context)
             val tmp = File(f.parentFile, f.name + ".tmp")
