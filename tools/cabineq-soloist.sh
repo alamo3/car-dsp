@@ -153,7 +153,48 @@ children=()
 cleanup() {
   for p in "${children[@]}"; do kill "$p" 2>/dev/null; done
   pkill -x socat 2>/dev/null
-  pulseaudio --kill 2>/dev/null
+  # A wedged PulseAudio may not act on SIGTERM: give it a second, then force it.
+  pkill -x pulseaudio 2>/dev/null; sleep 1; pkill -9 -x pulseaudio 2>/dev/null
+}
+
+# Is the server answering, not just present: a PulseAudio whose main loop is wedged still shows up
+# in the process list, but refuses every client.
+pulse_ok() { timeout 3 pactl info >/dev/null 2>&1; }
+
+pulse_log_tail() { echo "--- pulseaudio log (last 15 lines)"; tail -n 15 /tmp/cabineq-pulse.log 2>/dev/null; echo "---"; }
+
+# PulseAudio as proot can run it. Under proot, shared memory (posix shm and memfd) between server
+# and clients breaks in ways that wedge the server, realtime scheduling is refused (and a missed
+# RT deadline is answered with SIGXCPU), and a client that finds no server autospawns a second
+# daemon with the wrong config. All of that off; every client goes to the one socket.
+write_pulse_conf() {
+  mkdir -p /root/.config/pulse
+  rm -f /root/.config/pulse/default.pa     # earlier scripts' tunnel config: never auto-loaded again
+  cat > /root/.config/pulse/daemon.conf <<CONF
+exit-idle-time = -1
+enable-shm = no
+enable-memfd = no
+realtime-scheduling = no
+high-priority = no
+rlimit-rttime = -1
+flat-volumes = no
+default-sample-format = s16le
+default-sample-rate = 44100
+avoid-resampling = yes
+CONF
+  cat > /root/.config/pulse/client.conf <<CONF
+autospawn = no
+enable-shm = no
+enable-memfd = no
+default-server = unix:$RUN/pulse/native
+CONF
+  # The only sink: a pipe, paced by whoever drains it. No suspend-on-idle (the module is not
+  # loaded), so a paused Spotify still yields a steady stream of silence at the reader's pace.
+  cat > /root/.config/pulse/cabineq.pa <<CONF
+load-module module-native-protocol-unix socket=$RUN/pulse/native auth-anonymous=1
+load-module module-pipe-sink file=$FIFO sink_name=CabinEQ format=s16le rate=44100 channels=2 use_system_clock_for_timing=no
+set-default-sink CabinEQ
+CONF
 }
 
 case "$MODE" in
@@ -173,36 +214,30 @@ case "$MODE" in
     install_deps && fetch_soloist || exit 1
     trap cleanup EXIT
     pkill -x pipewire 2>/dev/null; pkill -x wireplumber 2>/dev/null
-    pulseaudio --kill 2>/dev/null; pkill -x socat 2>/dev/null; sleep 1
-    mkdir -p "$RUN/pulse" /root/.config/pulse && chmod 700 "$RUN"
-    rm -f "$RUN/pulse/native" "$FIFO"
+    pkill -x pulseaudio 2>/dev/null; pkill -x socat 2>/dev/null; sleep 1
+    mkdir -p "$RUN/pulse" && chmod 700 "$RUN"
+    rm -rf "$RUN/pulse"/* "$FIFO"
+    write_pulse_conf
 
-    # The only sink: a pipe, paced by whoever drains it. No suspend-on-idle (the module is not
-    # loaded), so a paused Spotify still yields a steady stream of silence at the reader's pace.
-    cat > /root/.config/pulse/default.pa <<EOF
-load-module module-native-protocol-unix socket=$RUN/pulse/native auth-anonymous=1
-load-module module-pipe-sink file=$FIFO sink_name=CabinEQ format=s16le rate=44100 channels=2 use_system_clock_for_timing=no
-set-default-sink CabinEQ
-EOF
-    pulseaudio --exit-idle-time=-1 --log-target=stderr >/tmp/cabineq-pulse.log 2>&1 &
+    # Not daemonised (it lives and dies with this session), no default script (-n), only ours.
+    pulseaudio --daemonize=no --use-pid-file=no --system=no -n -F /root/.config/pulse/cabineq.pa \
+      --exit-idle-time=-1 --disable-shm=yes --realtime=no --high-priority=no \
+      --log-target=stderr --log-time=yes --log-level=info >/tmp/cabineq-pulse.log 2>&1 &
     children+=($!)
     up=""
     for _ in $(seq 1 40); do pactl list short sinks 2>/dev/null | grep -q CabinEQ && { up=1; break; }; sleep 0.5; done
     if [ -z "$up" ]; then
-      say "PulseAudio did not come up:"; grep -E '^E:' /tmp/cabineq-pulse.log | tail -5; exit 1
+      say "PulseAudio did not come up"; pulse_log_tail; exit 1
     fi
     pactl set-sink-volume CabinEQ 100% 2>/dev/null
     say "pipe sink ready ($FIFO)"
 
-    # One client at a time; a new socat (fresh FIFO reader) for each. Small socket buffers keep
-    # the backlog — and so the delay between a tap in Spotify and the sound — short.
-    (
-      while true; do
-        socat -u OPEN:"$FIFO",rdonly TCP-LISTEN:"$PORT",bind=127.0.0.1,reuseaddr,sndbuf=32768 2>/dev/null
-        sleep 0.3
-      done
-    ) &
-    children+=($!)
+    # One listener that never goes away (fork: each client gets its own FIFO reader, so a
+    # reconnecting app is never refused). -U: data flows from the FIFO to the client. A small send
+    # buffer keeps the backlog — and so the delay between a tap in Spotify and the sound — short.
+    socat -U TCP-LISTEN:"$PORT",bind=127.0.0.1,reuseaddr,fork,sndbuf=32768 OPEN:"$FIFO",rdonly 2>/dev/null &
+    socat_pid=$!
+    children+=($socat_pid)
     say "serving PCM on 127.0.0.1:$PORT"
 
     clear_stale
@@ -212,9 +247,19 @@ EOF
     sp=$!
     children+=($sp)
 
-    # The session lives exactly as long as all three pieces do.
+    # The session lives exactly as long as all three pieces do — and PulseAudio counts as alive
+    # only while it answers. Two missed answers in a row (10 s) and the session is replaced.
+    misses=0
     while true; do
       sleep 5
+      if pulse_ok; then misses=0; else
+        misses=$((misses + 1))
+        if [ $misses -ge 2 ]; then
+          say "PulseAudio stopped answering (process $(pgrep -x pulseaudio >/dev/null && echo present || echo gone))"
+          pulse_log_tail; exit 1
+        fi
+      fi
+      kill -0 "$socat_pid" 2>/dev/null || { say "socat (the PCM server) exited"; exit 1; }
       if ! kill -0 "$sp" 2>/dev/null; then
         wait "$sp"; code=$?
         if [ "$code" = 10 ]; then
@@ -226,7 +271,6 @@ EOF
         fi
         exit 1
       fi
-      pgrep -x pulseaudio >/dev/null || { say "PulseAudio died:"; grep -E '^E:' /tmp/cabineq-pulse.log | tail -3; exit 1; }
     done
     ;;
 esac
@@ -258,7 +302,7 @@ case "$MODE" in
       if [ $(( $(date +%s) - t0 )) -lt 60 ]; then fails=$((fails + 1)); else fails=0; fi
       wait_s=$(( fails < 5 ? 3 : 30 ))
       say "session ended; restarting in ${wait_s}s"
-      pkill -x soloist 2>/dev/null; pkill -x socat 2>/dev/null; pkill -x pulseaudio 2>/dev/null
+      pkill -x soloist 2>/dev/null; pkill -x socat 2>/dev/null; pkill -9 -x pulseaudio 2>/dev/null
       sleep "$wait_s"
     done
     ;;
