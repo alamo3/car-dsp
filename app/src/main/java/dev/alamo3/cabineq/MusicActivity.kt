@@ -87,6 +87,8 @@ class MusicActivity : Activity() {
 
     // Lyrics page (the car has its own screen; both share Lyrics.kt and its disk cache).
     private var lyricsOpen = false
+    /** Media id the open lyrics page was drawn for; a different song redraws it. */
+    private var lyricsFor: String? = null
     private var lyricsBlock: LinearLayout? = null
     private var lyricViews = ArrayList<TextView>()
     private var lyricSheet: Lyrics.Sheet? = null
@@ -526,6 +528,8 @@ class MusicActivity : Activity() {
         if (recent.isNotEmpty()) {
             page.addView(sectionTitle("Recently played"))
             page.addView(trackCarousel(recent) { i -> play(recent, i, "Recently played") })
+            // What was played last is what gets tapped next: have its links ready, so it starts at once.
+            TrackResolver.warm(applicationContext, recent.take(3))
         }
 
         // The same content the car's home screen shows: more from the artist you play most,
@@ -707,6 +711,7 @@ class MusicActivity : Activity() {
                 })
                 upcoming.forEachIndexed { n, (index, entry) ->
                     box.addView(queueRow(entry.track,
+                        waiting = entry.waiting,
                         onPlay = { transport { p.skipTo(index) } },
                         onUp = if (n > 0) ({ p.moveUpcoming(entry.key, index - 1) }) else null,
                         onDown = if (n < upcoming.lastIndex) ({ p.moveUpcoming(entry.key, index + 1) }) else null,
@@ -731,7 +736,7 @@ class MusicActivity : Activity() {
         queueRefresh = { draw() }
     }
 
-    private fun queueRow(t: Track, onPlay: () -> Unit, onUp: (() -> Unit)?, onDown: (() -> Unit)?, onRemove: () -> Unit): View {
+    private fun queueRow(t: Track, waiting: Boolean = false, onPlay: () -> Unit, onUp: (() -> Unit)?, onDown: (() -> Unit)?, onRemove: () -> Unit): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -745,6 +750,8 @@ class MusicActivity : Activity() {
         Ui.selectable(texts)
         texts.addView(Ui.text(this, t.title, 16f))
         if (!t.artist.isNullOrBlank()) texts.addView(Ui.text(this, t.artist, 13f, Ui.TEXT_2))
+        // Moved down because the source is still caching it: say so, or it looks lost.
+        if (waiting) texts.addView(Ui.text(this, "⏳ Still being prepared — other songs go first", 12f, Ui.TEXT_2))
         row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         // Large, separate targets: moving a song is a tap, not a drag.
         fun button(label: String, action: (() -> Unit)?) {
@@ -1465,7 +1472,11 @@ class MusicActivity : Activity() {
             fullNote.setTextColor(if (p.note != null) Ui.TEXT_2 else Ui.ERROR)
             fullNote.visibility = if (note == null) View.GONE else View.VISIBLE
         }
-        if (lyricsOpen) updateLyricsHighlight()
+        if (lyricsOpen) {
+            // The page stays open across songs: follow the player to the new song's lyrics.
+            val nowId = p.currentTrack?.mediaId
+            if (nowId != null && nowId != lyricsFor) renderLyrics() else updateLyricsHighlight()
+        }
     }
 
     private fun showFull(show: Boolean) {
@@ -1492,6 +1503,7 @@ class MusicActivity : Activity() {
         page.addView(Ui.text(this, "Lyrics", 24f, bold = true).apply { setPadding(0, dp(4), 0, dp(4)) })
         val p = player
         val t = p.currentTrack
+        lyricsFor = t?.mediaId
         if (t == null) {
             page.addView(Ui.text(this, "Nothing playing.", 15f, Ui.TEXT_2).apply { setPadding(0, dp(12), 0, 0) })
             return
