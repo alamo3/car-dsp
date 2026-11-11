@@ -212,19 +212,43 @@ object SoloistInput {
     // ---------------------------------------------------------------- the socket reader
 
     private fun connectAndRead(port: Int) {
-        val sock = Socket()
-        // Published before connecting, so stop() can close it and abort a connect that hangs.
-        socket = sock
         val buf = ByteArray(16 * 1024)
+        // The source lives in Termux and is restarted independently of this app, so a dropped
+        // connection is normal: reconnect, and start from the live edge rather than whatever the
+        // buffer held before (that audio is seconds old and would be played out of order).
+        while (running) {
+            val sock = Socket()
+            // Published before connecting, so stop() can close it and abort a connect that hangs.
+            socket = sock
+            try {
+                sock.connect(InetSocketAddress("127.0.0.1", port), 3000)
+                sock.tcpNoDelay = true
+                synchronized(lock) { head = 0; count = 0 }
+                status = "connected, waiting for audio"
+                DLog.i(
+                    TAG,
+                    "connected to 127.0.0.1:$port, engine at $sampleRate Hz from ${RATE} Hz, " +
+                        "track buffer ${track?.bufferSizeInFrames ?: 0} frames",
+                )
+                readLoop(sock, buf)
+            } catch (e: Exception) {
+                if (running) {
+                    lastError = e.message ?: e.javaClass.simpleName
+                    status = "cannot connect: $lastError"
+                    DLog.w(TAG, "cannot connect: $lastError")
+                }
+            } finally {
+                runCatching { sock.close() }
+                socket = null
+            }
+            if (!running) break
+            status = "reconnecting…"
+            try { Thread.sleep(2000) } catch (e: InterruptedException) { break }
+        }
+    }
+
+    private fun readLoop(sock: Socket, buf: ByteArray) {
         try {
-            sock.connect(InetSocketAddress("127.0.0.1", port), 3000)
-            sock.tcpNoDelay = true
-            status = "connected, waiting for audio"
-            DLog.i(
-                TAG,
-                "connected to 127.0.0.1:$port, engine at $sampleRate Hz from ${RATE} Hz, " +
-                    "track buffer ${track?.bufferSizeInFrames ?: 0} frames",
-            )
             val input = sock.getInputStream()
             while (running) {
                 val n = input.read(buf)
@@ -236,13 +260,7 @@ object SoloistInput {
                 put(buf, n - n % (CHANNELS * 2))   // whole frames only
             }
         } catch (e: Exception) {
-            if (running) {
-                lastError = e.message ?: e.javaClass.simpleName
-                status = "cannot connect: $lastError"
-                DLog.w(TAG, "cannot connect: $lastError")
-            }
-        } finally {
-            runCatching { sock.close() }
+            if (running) DLog.w(TAG, "stream ended: ${e.message ?: e.javaClass.simpleName}")
         }
     }
 
