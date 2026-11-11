@@ -1,6 +1,7 @@
 package dev.alamo3.cabineq.music
 
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
  * Decoded PCM of any encoding and channel count → the interleaved stereo float the DSP engine
@@ -29,6 +30,11 @@ object Pcm {
      * the buffer's position.
      */
     fun toStereoFloat(buf: ByteBuffer, encoding: Int, channels: Int, frames: Int, out: FloatArray) {
+        // Decoded PCM is little-endian, whatever the buffer claims to be. MediaCodec hands out
+        // buffers whose byte order is the JVM's default (big-endian) on some devices, and reading
+        // one of those as little-endian gives samples far above full scale — heard as distortion,
+        // and invisible to any check that trusts the buffer's own order.
+        buf.order(ByteOrder.LITTLE_ENDIAN)
         val bps = bytesPerSample(encoding)
         val base = buf.position()
         for (i in 0 until frames) {
@@ -144,6 +150,7 @@ object Pcm {
     }
 
     private fun measure(buf: ByteBuffer, encoding: Int, channels: Int, frames: Int): Stats {
+        buf.order(ByteOrder.LITTLE_ENDIAN)
         val bps = bytesPerSample(encoding)
         val base = buf.position()
         val pairs = minOf(channels, 2)

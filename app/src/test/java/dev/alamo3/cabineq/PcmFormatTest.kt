@@ -95,6 +95,21 @@ class PcmFormatTest {
     }
 
     @Test
+    fun aBufferThatClaimsBigEndianIsStillReadAsLittleEndian() {
+        // MediaCodec buffers carry the JVM's default byte order on some devices. Trusting it
+        // reads every sample backwards — loud garbage, and the distortion that took a while to
+        // place — so the reader sets the order itself. Both word sizes are checked.
+        for ((buffer, encoding) in listOf(int16() to Pcm.ENCODING_16BIT, float() to Pcm.ENCODING_FLOAT)) {
+            buffer.order(ByteOrder.BIG_ENDIAN)
+            val out = FloatArray(frames * 2)
+            Pcm.toStereoFloat(buffer, encoding, 2, frames, out)
+            var peak = 0.0
+            for (i in 0 until frames * 2) peak = maxOf(peak, Math.abs(out[i].toDouble()))
+            assertEquals("a 0.5 sine marked big-endian, read as ${Pcm.name(encoding)}", 0.5, peak, 0.01)
+        }
+    }
+
+    @Test
     fun everyWordSizeConvertsToTheSameLevel() {
         val out = FloatArray(frames * 2)
         for ((buffer, encoding) in listOf(
