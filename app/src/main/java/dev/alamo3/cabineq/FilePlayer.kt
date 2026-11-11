@@ -57,6 +57,13 @@ class FilePlayer private constructor(private val context: Context) {
         private set
     /** Stable per-entry ids for the queue, aligned with [queue]; used by the Jam session. */
     @Volatile private var queueKeys: List<String> = emptyList()
+    /**
+     * Entries moved down the queue because their source is still caching them (see
+     * [dev.alamo3.cabineq.player.ExoEngine]): the lists say so, so a song that jumps to the end
+     * does not look like it was lost.
+     */
+    @Volatile var waitingKeys: Set<String> = emptySet()
+        private set
     @Volatile var positionMs = 0L
         private set
     /** When the decode loop last moved the play head; used to detect a dead output sink. */
@@ -315,6 +322,14 @@ class FilePlayer private constructor(private val context: Context) {
     /** True while the Media3 engine, not the worker below, is the one playing the queue. */
     @Volatile private var exoActive = false
 
+    /**
+     * Builds the Media3 engine before the first tap when it is the one in use: opening its disk
+     * cache and creating the player took a few hundred ms of the first song's start.
+     */
+    private fun warmUp() {
+        if (settings.media3Player) exoEngine().warmUp()
+    }
+
     private fun exoEngine(): dev.alamo3.cabineq.player.ExoEngine =
         exo ?: synchronized(this) {
             exo ?: dev.alamo3.cabineq.player.ExoEngine(this, Bridge()).also { exo = it }
@@ -367,6 +382,11 @@ class FilePlayer private constructor(private val context: Context) {
             scheduleSave()
         }
         fun askRadio() = extendRadioIfNeeded(force = true)
+        fun waiting(keys: Set<String>) {
+            if (keys == waitingKeys) return
+            waitingKeys = keys
+            version++
+        }
         fun targetRate(sourceRate: Int): Int = this@FilePlayer.targetRate(sourceRate)
         fun pushEq(handle: Long, rate: Int, bluetooth: Boolean): Boolean = pushEqLocked(handle, rate, bluetooth)
         fun seedEq() = seedEqFromSettings()
@@ -405,8 +425,11 @@ class FilePlayer private constructor(private val context: Context) {
             // keys, or every guest's "up next" would refer to a track that no longer exists.
         }
         queueTitle = title
-        radioSeed = radio
-        persistPool.execute { runCatching { settings.radioSeed = radio } }
+        // Whatever is played, the music carries on after its last song: an album or playlist ends
+        // into a radio seeded from its last track (when the source knows it), never into silence.
+        val seed = radio ?: tracks.lastOrNull()?.takeIf { it.sourceId != null }
+        radioSeed = seed
+        persistPool.execute { runCatching { settings.radioSeed = seed } }
         lastError = null
         userPaused = false
         focusPaused = false
@@ -424,6 +447,13 @@ class FilePlayer private constructor(private val context: Context) {
         if (settings.media3Player) {
             // The Media3 engine takes it from here: it owns fetching, buffering, decoding and
             // the hand-over between songs. The worker stays retired (stopWorker above).
+            // Show the tapped song at once: the engine reports the index itself, but only after it
+            // has started, and until then the lists, the notification and the car would still show
+            // the previous song while this one loads.
+            currentIndex = startIndex.coerceIn(0, tracks.lastIndex)
+            currentInfo = null
+            note = null
+            version++
             exoActive = true
             exoEngine().start(startIndex.coerceIn(0, tracks.lastIndex), startAtMs.coerceAtLeast(0))
             return
@@ -570,12 +600,16 @@ class FilePlayer private constructor(private val context: Context) {
     // ---------------------------------------------------------------- queue editing
 
     /** A queue entry with its stable key (the Jam session addresses entries by key). */
-    class QueuedTrack(val key: String, val track: Track)
+    class QueuedTrack(val key: String, val track: Track, val waiting: Boolean = false)
 
     fun queuedTracks(): List<QueuedTrack> = synchronized(eqLock) {
         val q = queue
         val keys = queueKeys
-        q.mapIndexed { i, t -> QueuedTrack(keys.getOrElse(i) { "" }, t) }
+        val waiting = waitingKeys
+        q.mapIndexed { i, t ->
+            val key = keys.getOrElse(i) { "" }
+            QueuedTrack(key, t, key in waiting)
+        }
     }
 
     private fun newKey(): String =
@@ -670,6 +704,7 @@ class FilePlayer private constructor(private val context: Context) {
             val session = queued.takeLast(5).mapNotNull { it.track.artist?.trim()?.lowercase() }.toSet()
             val currentArtist = queued.getOrNull(currentIndex)?.track?.artist
             val next = runCatching { Radio.next(context, seed, exclude, session, currentArtist) }.getOrNull()
+                ?: localFallback(exclude, queued.getOrNull(currentIndex)?.track)
             radioBusy = false
             if (next == null || gen != generation || radioSeed !== seed) {
                 followNewTrack = false
@@ -688,6 +723,28 @@ class FilePlayer private constructor(private val context: Context) {
             }
             extendRadioIfNeeded()   // top up to two ahead
         }
+    }
+
+    /**
+     * The radio found nothing (offline, or its pool is used up): something of the listener's own
+     * instead, so the music never just stops. Songs not queued yet first; if all are, any other.
+     */
+    private fun localFallback(exclude: Set<String>, current: Track?): Track? {
+        val pool = runCatching {
+            (Library.liked(context) + MediaBrowse.recentTracks(context)).distinctBy { it.mediaId }
+        }.getOrDefault(emptyList())
+        val fresh = pool.filter { t -> Radio.identity(t).none { it in exclude } }
+        val others = pool.filter { it.mediaId != current?.mediaId }
+        val pick = if (MediaCache.isOnline(context)) {
+            fresh.ifEmpty { others }
+        } else {
+            // No connection: only what is on the phone can play, so choose from that first.
+            val onPhone = others.filter { MediaCache.fileFor(context, it) != null || dev.alamo3.cabineq.player.ExoEngine.cachedWhole(context, it) }
+            val freshIds = fresh.map { it.mediaId }.toSet()
+            onPhone.filter { it.mediaId in freshIds }.ifEmpty { onPhone }.ifEmpty { fresh.ifEmpty { others } }
+        }.randomOrNull()
+        if (pick != null) Log.i(TAG, "Radio: nothing new, falling back to \"${pick.title}\" from your library")
+        return pick
     }
 
     fun stop() {
@@ -1812,7 +1869,10 @@ class FilePlayer private constructor(private val context: Context) {
 
         fun get(context: Context): FilePlayer =
             instance ?: synchronized(this) {
-                instance ?: FilePlayer(context.applicationContext).also { instance = it }
+                instance ?: FilePlayer(context.applicationContext).also {
+                    instance = it
+                    it.warmUp()
+                }
             }
 
         /** The instance if one was ever created (doesn't create one). */

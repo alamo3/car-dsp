@@ -59,6 +59,15 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     private var outFloat = FloatArray(0)
     private var outBytes: ByteBuffer = ByteBuffer.allocateDirect(0)
 
+    /**
+     * Processed audio the delegate has not taken in full yet (its AudioTrack was full). The sink
+     * contract is that a refused buffer is offered again until it is consumed; our input was
+     * already converted into this, so the re-offer finishes writing this instead. [outBytes]
+     * must not be reused while it is set.
+     */
+    private var pending: ByteBuffer? = null
+    private var pendingUs = 0L
+
     private var listener: AudioSink.Listener? = null
 
     // ---------------------------------------------------------------- configuration
@@ -91,12 +100,29 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         val target = bridge.targetRate(inRate)
         rate = target
         outputRate = target
+        // ExoPlayer calls this for every stream's output format, gapless or not. Rebuilding the
+        // resampler for an identical format costs the join: the previous song's filter history
+        // is thrown away and the fade-in ducks the first 15 ms of the next one. Only a real
+        // change of stream (or a fresh engine) is worth preparing for.
+        val sameStream = handle != 0L && engineRate == target && streamRate == inRate &&
+            streamChannels == inChannels && streamEncoding == inEncoding
+        streamRate = inRate
+        streamChannels = inChannels
+        streamEncoding = inEncoding
         delegate.configure(sinkFormat(format), specifiedBufferSize, outputChannels)
-        synchronized(bridge.dspLock) { ensureEngineLocked() }
+        synchronized(bridge.dspLock) { ensureEngineLocked(reset = !sameStream) }
     }
 
-    /** Creates (or re-creates) the engine at [rate] and pushes the current EQ into it. */
-    private fun ensureEngineLocked() {
+    /** Input format of the stream the engine was last prepared for; a new song usually repeats it. */
+    private var streamRate = 0
+    private var streamChannels = 0
+    private var streamEncoding = 0
+
+    /**
+     * [reset] is false when the stream continues in the same format: the engine is then left
+     * running, so a gapless join stays gapless.
+     */
+    private fun ensureEngineLocked(reset: Boolean) {
         if (rate <= 0) return
         if (handle == 0L || engineRate != rate) {
             if (handle != 0L) NativeDsp.destroy(handle)
@@ -110,10 +136,14 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
             Log.i(TAG, if (inRate == rate) "engine at $rate Hz" else "engine at $rate Hz, resampling from $inRate Hz")
         }
         if (handle == 0L) return
-        NativeDsp.setInputRate(handle, 0)          // drop history: a configure is a new stream
-        NativeDsp.setInputRate(handle, inRate)
+        if (reset) {
+            NativeDsp.setInputRate(handle, 0)      // drop history: a new stream, or a moved rate
+            NativeDsp.setInputRate(handle, inRate)
+        } else {
+            NativeDsp.setInputRate(handle, inRate) // a no-op unless the rate actually moved
+        }
         applyEqLocked()
-        NativeDsp.fadeIn(handle, rate * FADE_IN_MS / 1000)
+        if (reset) NativeDsp.fadeIn(handle, rate * FADE_IN_MS / 1000)
     }
 
     private var engineRate = 0
@@ -163,6 +193,13 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     // ---------------------------------------------------------------- audio through the DSP
 
     override fun handleBuffer(buffer: ByteBuffer, presentationTimeUs: Long, encodedAudioBytes: Int): Boolean {
+        // Last call's output is still waiting to go in: finish that first. The input behind it was
+        // taken then, so once the delegate has it all this call is done too.
+        pending?.let { p ->
+            if (!delegate.handleBuffer(p, pendingUs, 0)) return false
+            pending = null
+            return true
+        }
         if (!buffer.hasRemaining()) return true
         val frameBytes = Pcm.bytesPerSample(inEncoding) * inChannels
         val frames = buffer.remaining() / frameBytes
@@ -183,7 +220,11 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         buffer.position(buffer.limit())
         // Nothing came out (the resampler is filling, or the engine failed): consumed, no write.
         if (out == null) return true
-        return delegate.handleBuffer(out, presentationTimeUs, 0)
+        if (delegate.handleBuffer(out, presentationTimeUs, 0)) return true
+        // Refused in part: keep it, and answer "not handled" so the same input is offered again.
+        pending = out
+        pendingUs = presentationTimeUs
+        return false
     }
 
     /** Engine output as a direct float buffer the delegate can copy from. */
@@ -212,17 +253,15 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     }
 
     override fun handleDiscontinuity() {
-        synchronized(bridge.dspLock) {
-            if (handle != 0L) {
-                NativeDsp.setInputRate(handle, 0)
-                NativeDsp.setInputRate(handle, inRate)
-                NativeDsp.fadeIn(handle, rate * FADE_IN_MS / 1000)
-            }
-        }
+        // ExoPlayer says this on every stream change, gapless or not (MediaCodecAudioRenderer
+        // .onProcessedStreamChange). Tearing the resampler down and fading in here is what made
+        // every join duck; a format change arrives through configure(), a seek through flush().
+        pending = null
         delegate.handleDiscontinuity()
     }
 
     override fun flush() {
+        pending = null
         synchronized(bridge.dspLock) {
             if (handle != 0L) {
                 NativeDsp.setInputRate(handle, 0)
@@ -234,6 +273,7 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     }
 
     override fun reset() {
+        pending = null
         synchronized(bridge.dspLock) {
             if (handle != 0L) NativeDsp.destroy(handle)
             handle = 0L
@@ -245,6 +285,7 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     }
 
     override fun release() {
+        pending = null
         synchronized(bridge.dspLock) {
             if (handle != 0L) NativeDsp.destroy(handle)
             handle = 0L
@@ -259,8 +300,8 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     override fun getCurrentPositionUs(sourceEnded: Boolean): Long = delegate.getCurrentPositionUs(sourceEnded)
     override fun play() = delegate.play()
     override fun pause() = delegate.pause()
-    override fun isEnded(): Boolean = delegate.isEnded
-    override fun hasPendingData(): Boolean = delegate.hasPendingData()
+    override fun isEnded(): Boolean = delegate.isEnded && pending == null
+    override fun hasPendingData(): Boolean = pending != null || delegate.hasPendingData()
     override fun setPlaybackParameters(playbackParameters: PlaybackParameters) = delegate.setPlaybackParameters(playbackParameters)
     override fun getPlaybackParameters(): PlaybackParameters = delegate.playbackParameters
     override fun setSkipSilenceEnabled(enabled: Boolean) = delegate.setSkipSilenceEnabled(enabled)

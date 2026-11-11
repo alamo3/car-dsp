@@ -263,7 +263,15 @@ object MediaCache {
         Log.i(TAG, "trimmed cache to ${total / 1024 / 1024} MB (cap ${max / 1024 / 1024} MB)")
     }
 
-    private fun onUnmeteredNetwork(context: Context): Boolean {
+    /** True when the active network can actually reach the internet (not just connected to a router). */
+    internal fun isOnline(context: Context): Boolean {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return true
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    internal fun onUnmeteredNetwork(context: Context): Boolean {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return true
         val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
         // "Wi-Fi only" means "not paying per megabyte": a car hotspot or a phone tethered to

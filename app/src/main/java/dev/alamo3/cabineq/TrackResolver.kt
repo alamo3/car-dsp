@@ -3,7 +3,10 @@ package dev.alamo3.cabineq
 import android.content.Context
 import dev.alamo3.cabineq.addon.EclipseAddon
 import dev.alamo3.cabineq.torbox.TorBoxClient
+import android.os.SystemClock
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 /**
  * Turns a [Track] into a stream URL.
@@ -27,6 +30,41 @@ object TrackResolver {
     /** A playable URL plus what the source claims it is (the addon tells us; TorBox doesn't). */
     class Resolved(val url: String, val quality: String? = null)
 
+    // Links already asked for, by song. TorBox documents its download links as valid for 3 hours
+    // (reports from the field say some die sooner, around half an hour), so a link is reused for
+    // ten minutes: long enough that a song looked up ahead of its turn starts without the ~1 s
+    // look-up, short enough to be well inside either figure. A link that is refused anyway is
+    // dropped by [forget] and fetched again.
+    private class Cached(val url: String, val quality: String?, val at: Long)
+    private val linkCache = ConcurrentHashMap<String, Cached>()
+    private const val LINK_TTL_MS = 10 * 60_000L
+    private val warmPool = Executors.newFixedThreadPool(2) { r ->
+        Thread(r, "CabinEQ-Warm").apply { isDaemon = true }
+    }
+
+    private fun cachedLink(track: Track): Cached? =
+        linkCache[track.mediaId]?.takeIf { SystemClock.elapsedRealtime() - it.at < LINK_TTL_MS }
+
+    /** A link that failed must not be handed out again. */
+    fun forget(track: Track) {
+        linkCache.remove(track.mediaId)
+    }
+
+    /**
+     * Looks the links up in the background, so that tapping one of these songs starts at once.
+     * Meant for songs the listener has already played (their audio is on the source already): a
+     * look-up that finds a song still being prepared is dropped, not waited for.
+     */
+    fun warm(context: Context, tracks: List<Track>) {
+        val app = context.applicationContext
+        for (track in tracks) {
+            if (track.streamUrl != null || cachedLink(track) != null) continue
+            warmPool.execute {
+                runCatching { resolve(app, track, { }, { false }, 15_000L, waitIfPending = false) }
+            }
+        }
+    }
+
     fun resolve(
         context: Context,
         track: Track,
@@ -42,6 +80,7 @@ object TrackResolver {
             Track.Source.ADDON -> {
                 val link = settings.addonLink
                 if (link.isBlank()) throw IllegalStateException("Connect Nebula in Settings to play this")
+                cachedLink(track)?.let { return Resolved(it.url, it.quality) }
                 // A discovered song (Discover) is only a title and artist until now: find the
                 // same recording on the addon right before it plays.
                 val id = track.sourceId
@@ -56,6 +95,7 @@ object TrackResolver {
                     onNotice = { onNote(describe(it)) },
                     waitIfPending = waitIfPending,
                 ).let { Resolved(it.url, it.quality) }
+                    .also { linkCache[track.mediaId] = Cached(it.url, it.quality, SystemClock.elapsedRealtime()) }
             }
             Track.Source.TORBOX -> {
                 if (track.torrentId == 0 || track.fileId == 0) {
