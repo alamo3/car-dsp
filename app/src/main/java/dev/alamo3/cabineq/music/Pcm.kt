@@ -48,6 +48,136 @@ object Pcm {
         else -> x
     }
 
+    /**
+     * What the data in [buf] actually is, when the decoder's word for it cannot be trusted.
+     *
+     * Devices exist whose decoder reports float while producing 16-bit samples (and the other way
+     * round). Read as float, 16-bit samples are garbage — most of it denormal, some of it far
+     * above full scale — and a limiter then holds that down as constant distortion. The
+     * declaration is checked once per stream against the data: a misread of real audio looks like
+     * noise (adjacent samples unrelated), while any correct read of audio looks like audio.
+     */
+    class Reading(val encoding: Int, val switched: Boolean, val note: String)
+
+    /** Below this many frames the statistics mean nothing; the next buffer is tried. */
+    const val PROBE_FRAMES = 128
+
+    fun detect(buf: ByteBuffer, declared: Int, channels: Int): Reading {
+        if (channels <= 0) return Reading(declared, false, "no channel count")
+        val frames = buf.remaining() / (bytesPerSample(declared) * channels)
+        if (frames < PROBE_FRAMES) return Reading(declared, false, "too short to tell")
+        val asDeclared = measure(buf, declared, channels, minOf(frames, 4096))
+        val candidates = interpretations(buf, declared, channels)
+        if (asDeclared.isPlausibleAudio()) {
+            // A wrong word size can still look plausible (float read as 16-bit is bounded and not
+            // denormal). It is only overridden by a reading that is unmistakably audio while the
+            // declared one is not clean.
+            val cleaner = if (asDeclared.roughness > 0.35 && asDeclared.jump > 0.6) {
+                candidates
+                    .filter { it.second.roughness < 0.4 && it.second.roughness < asDeclared.roughness / 2 }
+                    .minByOrNull { it.second.roughness }
+            } else null
+            return cleaner?.let { switched(declared, it) }
+                ?: Reading(declared, false, "as declared (${asDeclared.describe()})")
+        }
+        val pick = candidates.minByOrNull { it.second.roughness }
+            ?: return Reading(declared, false, "as declared; nothing else looked like audio")
+        return switched(declared, pick)
+    }
+
+    private fun switched(declared: Int, pick: Pair<Int, Stats>) = Reading(
+        pick.first, true,
+        "declared ${name(declared)} but the data is ${name(pick.first)} (${pick.second.describe()})",
+    )
+
+    /** Every other word size that looks like audio in this buffer, with what it looks like. */
+    private fun interpretations(buf: ByteBuffer, declared: Int, channels: Int): List<Pair<Int, Stats>> = buildList {
+        // 32-bit integer PCM is not something a decoder outputs, and it reads exactly like float
+        // for the same bytes (both are the same 32-bit words, scaled), so it is not considered.
+        for (candidate in intArrayOf(ENCODING_16BIT, ENCODING_24BIT_PACKED, ENCODING_FLOAT)) {
+            if (candidate == declared) continue
+            val n = buf.remaining() / (bytesPerSample(candidate) * channels)
+            if (n < PROBE_FRAMES) continue
+            val stats = measure(buf, candidate, channels, minOf(n, 4096))
+            if (stats.isAudio()) add(candidate to stats)
+        }
+    }
+
+    fun name(encoding: Int): String = when (encoding) {
+        ENCODING_FLOAT -> "float"
+        ENCODING_16BIT -> "16-bit"
+        ENCODING_24BIT_PACKED -> "24-bit"
+        ENCODING_32BIT -> "32-bit"
+        ENCODING_8BIT -> "8-bit"
+        else -> "encoding $encoding"
+    }
+
+    private class Stats(
+        val peak: Double,
+        val rms: Double,
+        val tiny: Double,
+        /** Adjacent samples within a channel: ~0.05 for music, ~1.2 for unrelated noise. */
+        val roughness: Double,
+        /** Adjacent samples across the interleave: channels of real audio are related. */
+        val jump: Double,
+    ) {
+        fun describe(): String = String.format(
+            java.util.Locale.US, "peak %.1f dBFS, roughness %.2f, jump %.2f",
+            if (peak > 0) 20 * Math.log10(peak) else -120.0, roughness, jump,
+        )
+
+        fun isAudio(): Boolean = peak.isFinite() && peak in 1e-4..2.0 && rms > 1e-5 &&
+            !isMostlyDenormal() && roughness < 0.9 && jump < 1.0
+
+        /** The declared encoding gets a looser rope: genuinely noisy music must not be "fixed". */
+        fun isPlausibleAudio(): Boolean = peak.isFinite() && peak in 1e-4..2.0 && rms > 1e-5 &&
+            !isMostlyDenormal() && roughness < 1.2 && jump < 1.3
+
+        /** Bit patterns reinterpreted as float land almost entirely in the denormal range. */
+        fun isMostlyDenormal(): Boolean = tiny > 0.5
+    }
+
+    private fun measure(buf: ByteBuffer, encoding: Int, channels: Int, frames: Int): Stats {
+        val bps = bytesPerSample(encoding)
+        val base = buf.position()
+        val pairs = minOf(channels, 2)
+        var peak = 0.0
+        var sum = 0.0
+        var count = 0
+        var tiny = 0
+        var delta = 0.0
+        var deltaCount = 0
+        var jump = 0.0
+        var jumpCount = 0
+        var last = Double.NaN
+        var previous = Double.NaN
+        for (i in 0 until frames) {
+            for (c in 0 until pairs) {
+                val x = readSample(buf, base + (i * channels + c) * bps, encoding).toDouble()
+                val a = if (x.isFinite()) Math.abs(x) else Double.MAX_VALUE
+                if (a > peak) peak = a
+                sum += if (x.isFinite()) x * x else 1.0
+                count++
+                if (a > 0.0 && a < 1e-30) tiny++
+                if (c == 0 && last.isFinite() && x.isFinite()) {
+                    delta += Math.abs(x - last)
+                    deltaCount++
+                }
+                if (c == 0) last = x
+                if (previous.isFinite() && x.isFinite()) {
+                    jump += Math.abs(x - previous)
+                    jumpCount++
+                }
+                previous = x
+            }
+        }
+        val rms = if (count > 0) Math.sqrt(sum / count) else 0.0
+        // Adjacent-sample difference relative to level: ~0.05 for music, ~1.2 for unrelated noise.
+        val roughness = if (deltaCount > 0 && rms > 0) (delta / deltaCount) / rms else Double.MAX_VALUE
+        val jumpiness = if (jumpCount > 0 && rms > 0) (jump / jumpCount) / rms else Double.MAX_VALUE
+        return Stats(peak, rms, if (count > 0) tiny.toDouble() / count else 0.0, roughness, jumpiness)
+    }
+
     fun readSample(buf: ByteBuffer, p: Int, encoding: Int): Float = when (encoding) {
         ENCODING_FLOAT -> buf.getFloat(p)
         ENCODING_32BIT -> buf.getInt(p) / 2147483648f

@@ -46,7 +46,11 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
 
     // What the decoder hands us (per configure()).
     private var inRate = 0
+    /** What the decoder says its samples are. */
     private var inEncoding = C.ENCODING_PCM_16BIT
+    /** What they actually are: checked against the data once per stream, see [Pcm.detect]. */
+    private var readEncoding = C.ENCODING_PCM_16BIT
+    private var probed = false
     private var inChannels = 2
 
     // The engine, always at the rate the device mixes at.
@@ -116,8 +120,10 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
         inRate = format.sampleRate
         inEncoding = format.pcmEncoding
         inChannels = format.channelCount
+        readEncoding = inEncoding
+        probed = false
         inputDescription = "${format.sampleMimeType} ${inRate} Hz ${inChannels}ch, " +
-            "pcm ${inEncoding}, ${Pcm.bytesPerSample(inEncoding) * 8}-bit words"
+            "declared ${Pcm.name(inEncoding)}"
         Log.i(TAG, "in: ${inputDescription}")
         val target = bridge.targetRate(inRate)
         rate = target
@@ -223,12 +229,31 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
             return true
         }
         if (!buffer.hasRemaining()) return true
-        val frameBytes = Pcm.bytesPerSample(inEncoding) * inChannels
+        if (inChannels <= 0) {
+            Log.e(TAG, "buffer with $inChannels channels: dropped")
+            buffer.position(buffer.limit())
+            return true
+        }
+        // The decoder's word for its own samples is checked once: a device that declares float
+        // while sending 16-bit makes every word garbage, and a limiter turns that into the
+        // "extremely distorted" this engine was reported to play.
+        if (!probed) {
+            val declaredFrames = buffer.remaining() / (Pcm.bytesPerSample(inEncoding) * inChannels)
+            if (declaredFrames >= Pcm.PROBE_FRAMES) {
+                probed = true
+                val reading = Pcm.detect(buffer, inEncoding, inChannels)
+                readEncoding = reading.encoding
+                inputDescription = "declared ${Pcm.name(inEncoding)}, reads as ${Pcm.name(readEncoding)}"
+                if (reading.switched) Log.w(TAG, "sample format: ${reading.note}")
+                else Log.i(TAG, "sample format: ${reading.note}")
+            }
+        }
+        val frameBytes = Pcm.bytesPerSample(readEncoding) * inChannels
         val frames = buffer.remaining() / frameBytes
         var out: ByteBuffer? = null
         if (frames > 0) {
             if (inFloat.size < frames * 2) inFloat = FloatArray(frames * 2)
-            Pcm.toStereoFloat(buffer, inEncoding, inChannels, frames, inFloat)
+            Pcm.toStereoFloat(buffer, readEncoding, inChannels, frames, inFloat)
             var produced = 0
             synchronized(bridge.dspLock) {
                 if (handle != 0L) {
