@@ -9,6 +9,7 @@ import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.Format
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.util.UnstableApi
@@ -68,6 +69,7 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     private var pending: ByteBuffer? = null
     private var pendingUs = 0L
 
+
     private var listener: AudioSink.Listener? = null
 
     // ---------------------------------------------------------------- configuration
@@ -78,15 +80,20 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     }
 
     override fun supportsFormat(format: Format): Boolean =
-        delegate.supportsFormat(sinkFormat(format))
+        // Only decoded PCM may enter the engine. Claiming a compressed format makes Media3 take
+        // the sink at its word and enable bypass: no decoder, and MP3 bytes arrive here to be
+        // read as samples, which is heard as pure distortion.
+        format.sampleMimeType == MimeTypes.AUDIO_RAW && delegate.supportsFormat(sinkFormat(format))
 
     override fun getFormatSupport(format: Format): Int =
-        delegate.getFormatSupport(sinkFormat(format))
+        if (format.sampleMimeType == MimeTypes.AUDIO_RAW) delegate.getFormatSupport(sinkFormat(format))
+        else AudioSink.SINK_FORMAT_UNSUPPORTED
 
     /** What we will actually give the delegate: float, stereo, at the device's rate. */
     private fun sinkFormat(format: Format): Format {
         val target = bridge.targetRate(format.sampleRate)
         return format.buildUpon()
+            .setSampleMimeType(MimeTypes.AUDIO_RAW)
             .setSampleRate(target)
             .setChannelCount(2)
             .setPcmEncoding(C.ENCODING_PCM_FLOAT)
@@ -94,9 +101,14 @@ internal class DspAudioSink(private val bridge: FilePlayer.Bridge) : AudioSink {
     }
 
     override fun configure(format: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        if (format.sampleMimeType != MimeTypes.AUDIO_RAW) {
+            // Should be unreachable (supportsFormat refuses these): say so rather than play noise.
+            Log.e(TAG, "compressed format reached the sink: ${format.sampleMimeType}; it cannot be processed")
+        }
         inRate = format.sampleRate
         inEncoding = format.pcmEncoding
         inChannels = format.channelCount
+        Log.i(TAG, "in: ${format.sampleMimeType} ${inRate} Hz, ${inChannels}ch, encoding $inEncoding")
         val target = bridge.targetRate(inRate)
         rate = target
         outputRate = target

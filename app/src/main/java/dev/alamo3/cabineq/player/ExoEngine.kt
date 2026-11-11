@@ -102,6 +102,12 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     private var endedAt = 0L
     private var gaveUp = false
 
+    /**
+     * A skip that arrived while the queue was still being put together (a look-up on the pool).
+     * Dropping it is what made "next" right after picking a song do nothing at all.
+     */
+    private var pendingSkip: Int? = null
+
     // ---- shared with the loader threads ----------------------------------------------------
     private val tracksByKey = ConcurrentHashMap<String, Track>()
     private class Link(val url: String, val quality: String?, val at: Long)
@@ -171,6 +177,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         failures = 0
         radioAsks = 0
         gaveUp = false
+        pendingSkip = null       // this start is the song that was asked for
         stopWaitingForNetwork()
         bridge.error(null)
         // Dropped if the queue is replaced while the files are being looked up.
@@ -197,11 +204,14 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         startAtMs: Long,
     ) {
         val items = tracks.mapIndexed { i, t -> item(queueKeys[i], t, local[i]) }
-        p.setMediaItems(items, index.coerceIn(0, items.lastIndex), startAtMs)
+        // A skip tapped before the queue existed wins: start where the listener asked for.
+        val wanted = pendingSkip?.coerceIn(0, items.lastIndex)
+        pendingSkip = null
+        p.setMediaItems(items, wanted ?: index.coerceIn(0, items.lastIndex), if (wanted != null) 0L else startAtMs)
         p.repeatMode = repeatMode(owner.repeat)
         p.prepare()
         p.play()
-        Log.i(TAG, "start: ${items.size} songs from $index at ${startAtMs}ms")
+        Log.i(TAG, "start: ${items.size} songs from ${wanted ?: index} at ${if (wanted != null) 0 else startAtMs}ms")
         startTicking()
     }
 
@@ -225,8 +235,15 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     }
 
     fun skipTo(index: Int) = main.post {
-        val p = player ?: return@post
-        if (index !in 0 until p.mediaItemCount) return@post
+        val p = player
+        if (p == null || index !in 0 until p.mediaItemCount) {
+            // The queue is not there yet (a start still reading the disk cache). Remember the tap
+            // and load() starts there, instead of the tap vanishing.
+            if (index >= 0) pendingSkip = index
+            Log.i(TAG, "skip to $index before the queue exists: starting there when it does")
+            return@post
+        }
+        Log.i(TAG, "skip to $index")
         reportLeaving(skipped = true)
         stopWaitingForNetwork()
         p.seekToDefaultPosition(index)
@@ -328,6 +345,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         cancelAllPrefetch()
         tracksByKey.clear()
         deferred.clear()
+        pendingSkip = null
         publishWaiting()
         links.clear()
         advancing = false

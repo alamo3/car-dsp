@@ -550,9 +550,12 @@ class FilePlayer private constructor(private val context: Context) {
 
     fun skipTo(index: Int) {
         if (index !in queue.indices) return
-        if (exoActive && isActive) {
+        val engine = exo
+        // A restored session can be marked active before its engine exists: without the null
+        // check, "next" right after launch found nothing to tell and did nothing at all.
+        if (exoActive && isActive && engine != null) {
             userPaused = false
-            exo?.skipTo(index)
+            engine.skipTo(index)
             return
         }
         if (thread?.isAlive == true) {
