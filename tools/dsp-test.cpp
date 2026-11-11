@@ -2,9 +2,10 @@
 //
 //   g++ -O2 -std=c++17 -I app/src/main/cpp tools/dsp-test.cpp -o /tmp/dt && /tmp/dt
 //
-// Expect: the limiter lands on its threshold without adding discontinuities, the fade-in
-// reaches full scale in 15 ms, the true-peak meter is within ~0.2 dB of the real peak, and
-// the click counter ignores fast high frequencies while catching a one-sample spike.
+// Expect: the limiter lands on its threshold without adding discontinuities, it limits on the
+// inter-sample peak rather than only on samples, the fade-in reaches full scale in 15 ms, the
+// true-peak meter is within ~0.2 dB of the real peak, and the click counter ignores fast high
+// frequencies while catching a one-sample spike.
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -71,6 +72,19 @@ int main() {
     std::printf("true peak: sample peak %.4f (%.2f dB) meter %.4f (%.2f dB)  <- should be ~+3 dB\n",
                 peak(tpo), 20*std::log10(peak(tpo)), (double)m3[3], 20*std::log10(m3[3] + 1e-12));
 
+    // 5) True-peak limiting: the same fs/4 tone at full scale has samples at 0.707 while its true
+    //    peak is 1.0. A sample-peak limiter would pass it at 0 dBFS; the gain law must see the
+    //    peak between the samples.
+    std::vector<float> tpl(frames * 2);
+    for (int i = 0; i < frames; ++i) {
+        const float v = (float)std::sin(2 * M_PI * (fs / 4.0) * i / fs + M_PI / 4);
+        tpl[2*i] = tpl[2*i+1] = v;
+    }
+    float m6[5];
+    auto tplo = run(tpl, 0.7943f, false, m6);
+    std::printf("true-peak limit: sample peak %.3f  true peak %.3f  limiter %.2f dB\n",
+                peak(tplo), (double)m6[3], 20*std::log10(m6[2] + 1e-9));
+
     // 4) Click detector: fast HF is not a click; an injected spike is.
     std::vector<float> hf(frames * 2);
     for (int i = 0; i < frames; ++i) {
@@ -102,6 +116,8 @@ int main() {
     check("fade-in reaches full scale in 15 ms", std::fabs(faded[2*721] - 0.5f) < 1e-3f);
     check("true peak within 0.3 dB of ideal",
           std::fabs(20*std::log10((double)m3[3] / 0.5)) < 0.3);
+    check("limiter holds the true peak below full scale", m6[3] < 1.0f);
+    check("true-peak limiter engages on a full-scale fs/4 tone", m6[2] < 0.98f);
     check("no clicks on a fast tone", m4[4] == 0);
     check("click detector catches a spike", m5[4] >= 1);
     return bad == 0 ? 0 : 1;

@@ -20,7 +20,10 @@ import kotlin.math.sqrt
  */
 object EqDesign {
     private const val PEAK_Q = 1.41
-    private const val LOW_SHELF_HZ = 44.0     // between the 31 and 63 Hz bands
+    // Where the bass shelf turns over. A car door cannot move much below this, and a shelf
+    // cornered at 44 Hz spent most of its lift on 10-40 Hz: inaudible, but still asking the
+    // limiter for headroom. 60 Hz puts the same +6 dB where it is heard.
+    private const val LOW_SHELF_HZ = 60.0
     private const val HIGH_SHELF_HZ = 11300.0 // between the 8k and 16k bands
 
     /** Coefficients for every band, 5 per band: b0, b1, b2, a1, a2. */
@@ -50,6 +53,31 @@ object EqDesign {
             Bands.COUNT - 1 -> highShelf(f(HIGH_SHELF_HZ), a, fs)
             else -> peaking(f(Bands.CENTERS[band].toDouble()), a, PEAK_Q, fs)
         }
+    }
+
+    /** Cutoff of the subsonic filter: below this a car door moves air, not sound. */
+    const val SUB_BASS_HZ = 30.0
+
+    /**
+     * 4th-order Butterworth high-pass (two 2nd-order sections, 24 dB/oct), run before the EQ.
+     *
+     * A bass boost spends headroom: with nothing in front of it, +6 dB at 20 Hz goes into cone
+     * excursion and into the limiter — which then pulls down the whole mix, including the bass
+     * the listener can actually hear. Removing what the car cannot reproduce is what makes the
+     * boost land on the audible part.
+     */
+    fun highPass(fs: Double, hz: Double = SUB_BASS_HZ): DoubleArray {
+        val f = kotlin.math.min(hz, fs * 0.45)
+        val w0 = 2 * PI * f / fs
+        val cw = cos(w0)
+        val n = 1 + cw
+        fun section(q: Double): DoubleArray {
+            val alpha = sin(w0) / (2 * q)
+            val a0 = 1 + alpha
+            return doubleArrayOf(n / 2 / a0, -n / a0, n / 2 / a0, (-2 * cw) / a0, (1 - alpha) / a0)
+        }
+        // Qs of a 4th-order Butterworth: maximally flat, -3 dB at the cutoff.
+        return section(0.5411961001461970) + section(1.3065629648763766)
     }
 
     /**

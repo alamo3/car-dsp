@@ -188,6 +188,15 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_MEDIA3, MEDIA3_DEFAULT)
         set(v) = prefs.edit().putBoolean(KEY_MEDIA3, v).apply()
 
+    /**
+     * 4th-order high-pass at 30 Hz, before the EQ. On by default: a boosted shelf in front of
+     * nothing spends its headroom on frequencies a car door cannot reproduce, and the limiter
+     * then pulls the audible bass down with them.
+     */
+    var subsonicFilter: Boolean
+        get() = prefs.getBoolean(KEY_SUBSONIC, true)
+        set(v) = prefs.edit().putBoolean(KEY_SUBSONIC, v).apply()
+
     /** Prefetch only on Wi-Fi/Ethernet. Off by default: the user decides. */
     var cacheWifiOnly: Boolean
         get() = prefs.getBoolean(KEY_CACHE_WIFI_ONLY, false)
@@ -373,6 +382,7 @@ class Settings(context: Context) {
         const val KEY_RADIO_SEED = "radio_seed"
         const val KEY_REPEAT = "repeat_mode"
         const val KEY_BT_HF_GUARD = "bluetooth_hf_guard"
+        const val KEY_SUBSONIC = "subsonic_filter"
         const val KEY_IMPORTED_PLAYLISTS = "imported_playlists"
         const val KEY_MAX_VOLUME_IN_CAR = "max_volume_in_car"
         const val KEY_MAX_VOLUME_SPEAKER = "max_volume_speaker"

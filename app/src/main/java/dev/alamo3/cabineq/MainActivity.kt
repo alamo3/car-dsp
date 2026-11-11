@@ -228,6 +228,19 @@ class MainActivity : Activity() {
             alpha = 0.7f
             setPadding(0, 0, 0, dp(8))
         })
+        root.addView(switch("Remove subsonic rumble", settings.subsonicFilter) { on ->
+            settings.subsonicFilter = on
+            FilePlayer.peek()?.refreshRouteDependentParams()
+            refreshOutputPath()
+        })
+        root.addView(TextView(this).apply {
+            text = "High-pass at 30 Hz (24 dB/oct) before the EQ. A car door cannot move that low, " +
+                "but a bass boost still spends its headroom there — and the limiter then pulls the " +
+                "bass you can hear down with it. Off: the boost reaches 20 Hz as well."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(8))
+        })
         root.addView(switch("Volume to max in the car", settings.maxVolumeInCar) { on ->
             settings.maxVolumeInCar = on
             CarVolume.sync(this)

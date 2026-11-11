@@ -951,7 +951,10 @@ class EqService : MediaBrowserServiceCompat() {
         private const val MAX_STEP_DB = 0.4f          // per tick -> max 4 dB/s; speed is already smoothed upstream
         private const val MAX_TOTAL_DB = 15f
         private const val HEADROOM_SHARE_FOR_SPEED = 0.5f
-        private const val LIMITER_THRESHOLD_LIN = 0.891f  // -1 dBFS
+        // -2 dBFS. One decibel below the familiar -1 is what pays for true-peak limiting: the
+        // gain law sees an inter-sample estimate, and at the one frequency where that estimate is
+        // weakest (a quarter of the sample rate) it under-reads by about a decibel.
+        private const val LIMITER_THRESHOLD_LIN = 0.7943f
 
         private const val BLOCKED_SILENCE_MS = 2500L
 

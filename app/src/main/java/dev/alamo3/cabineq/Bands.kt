@@ -47,6 +47,9 @@ object Bands {
         maxOf((gains.maxOrNull() ?: 0f).coerceAtLeast(0f), EqDesign.peakResponseDb(gains).toFloat().coerceAtLeast(0f))
 
     fun label(i: Int): String {
+        // Band 0 is a low shelf, not a peaking band at its centre: it lifts everything below its
+        // corner, so naming it after a frequency overstates what the slider does.
+        if (i == 0) return "Bass"
         val f = CENTERS[i]
         return if (f >= 1000f) "${(f / 1000f).let { if (it % 1f == 0f) it.toInt().toString() else it.toString() }} kHz"
         else "${f.toInt()} Hz"

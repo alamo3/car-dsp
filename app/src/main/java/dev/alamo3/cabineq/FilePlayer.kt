@@ -280,7 +280,7 @@ class FilePlayer private constructor(private val context: Context) {
     private val eqLock = Any()
     private var eqBands: FloatArray? = null
     private var eqPreampDb = 0f
-    private var eqLimiterLin = 0.891f
+    private var eqLimiterLin = 0.7943f   // -2 dBFS, see EqService.LIMITER_THRESHOLD_LIN
     private var eqVersion = 0
     @Volatile private var current: Output? = null
     private val meterScratch = FloatArray(5)
@@ -296,8 +296,12 @@ class FilePlayer private constructor(private val context: Context) {
         val user = EqDesign.designAll(bands, rate.toDouble())
         // Cabin correction rides on the same engine, as extra biquads after the user's bands.
         val cabin = cabinCurve()
-        val coeffs = if (cabin == null) user else user + cabin.coeffs(rate.toDouble(), settings.cabinAmount)
-        val bandCount = bands.size + (cabin?.bands?.size ?: 0)
+        val cabinCoeffs = if (cabin == null) DoubleArray(0) else cabin.coeffs(rate.toDouble(), settings.cabinAmount)
+        // Subsonic filter first: what the car cannot reproduce must not be boosted, and must not
+        // reach the limiter either — that headroom is what the audible bass needs.
+        val subsonic = if (settings.subsonicFilter) EqDesign.highPass(rate.toDouble()) else DoubleArray(0)
+        val coeffs = subsonic + user + cabinCoeffs
+        val bandCount = subsonic.size / 5 + bands.size + (cabin?.bands?.size ?: 0)
         val preamp = eqPreampDb + (cabin?.preampFor(settings.cabinAmount) ?: 0.0).toFloat()
         val guard = if (settings.bluetoothHfGuard && bluetooth) EqDesign.lowPass(rate.toDouble(), 15500.0) else null
         NativeDsp.setParams(

@@ -68,7 +68,17 @@ public:
     }
 
     inline void process(float& l, float& r, float threshold) {
-        const float peak = std::max(std::fabs(l), std::fabs(r));
+        // True peak, not just sample peak: between two samples a signal can sit up to ~3 dB
+        // higher (a 12 kHz tone at a 45-degree phase is the classic case). A bass boost and a
+        // limiter at -1 dBFS then leave inter-sample peaks above full scale, which some outputs
+        // clip. The midpoint between the two previous samples is interpolated from the four
+        // samples around it (Catmull-Rom): cheap, and it costs the lookahead nothing.
+        const float midL = (-prev3L_ + 9.0f * prev2L_ + 9.0f * prev1L_ - l) * 0.0625f;
+        const float midR = (-prev3R_ + 9.0f * prev2R_ + 9.0f * prev1R_ - r) * 0.0625f;
+        const float peak = std::max(std::max(std::fabs(l), std::fabs(r)),
+                                    std::max(std::fabs(midL), std::fabs(midR)));
+        prev3L_ = prev2L_; prev2L_ = prev1L_; prev1L_ = l;
+        prev3R_ = prev2R_; prev2R_ = prev1R_; prev1R_ = r;
         const float target = peak > threshold ? threshold / peak : 1.0f;
 
         // A peak entering the delay line leaves it size_ samples later, so there is exactly
@@ -112,6 +122,9 @@ private:
     std::vector<float> bufL_, bufR_;
     int size_ = 1, pos_ = 0;
     float gain_ = 1.0f, release_ = 0.999f, minGain_ = 1.0f;
+    // The last three input samples, for the inter-sample peak estimate.
+    float prev1L_ = 0, prev2L_ = 0, prev3L_ = 0;
+    float prev1R_ = 0, prev2R_ = 0, prev3R_ = 0;
     float target_ = 1.0f;   // gain the current attack ramp is heading for
     float step_ = 0.0f;     // per-sample change of that ramp
     int left_ = 0;          // samples left in that ramp (the lookahead gives us this many)
