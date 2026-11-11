@@ -199,6 +199,15 @@ class Settings(context: Context) {
         set(v) = prefs.edit().putBoolean("float_decoding", v).apply()
 
     /**
+     * When a queue runs out, carry on with radio picks from where it ended, whatever was played
+     * (a playlist, an album, a shelf, a search). On by default. Off: the queue just ends, unless
+     * the user started a radio on purpose ("Start radio from this song").
+     */
+    var endlessPlayback: Boolean
+        get() = prefs.getBoolean("endless_playback", true)
+        set(v) = prefs.edit().putBoolean("endless_playback", v).apply()
+
+    /**
      * 4th-order high-pass at 30 Hz, before the EQ. On by default: a boosted shelf in front of
      * nothing spends its headroom on frequencies a car door cannot reproduce, and the limiter
      * then pulls the audible bass down with them.

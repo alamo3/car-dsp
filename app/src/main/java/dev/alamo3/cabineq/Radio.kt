@@ -79,7 +79,10 @@ object Radio {
         sessionArtists: Set<String> = emptySet(),
         currentArtist: String? = null,
     ): Track? {
-        val artist = primaryArtist(seed.artist) ?: return null
+        // A queue with no artist anywhere (untagged files) goes by what this phone plays most.
+        val artist = primaryArtist(seed.artist)
+            ?: Taste.profile(context).topArtists(1).firstOrNull()?.let { primaryArtist(it.first) }
+            ?: return null
         val candidates = poolFor(context, artist) ?: return null
         val ranked = rank(context, candidates, exclude, sessionArtists, currentArtist, artist)
         // Discovered songs need a Nebula match before they can play. Try the best few; a song

@@ -2358,6 +2358,14 @@ class MusicActivity : Activity() {
             "Media3 engine only. Off: songs are decoded to 16-bit, as the built-in engine does. On: decoders are asked for 32-bit float, so 24-bit files keep their full precision through the EQ. " +
                 "Experimental: if songs turn to noise with it on, this phone's decoders don't honour the request, so turn it off. Applies after the app is restarted.",
             12f, Ui.TEXT_2, lines = 6).apply { setPadding(0, dp(8), 0, dp(12)) })
+        page.addView(Ui.pill(this, "Endless playback: ${if (settings.endlessPlayback) "on" else "off"}", filled = false) {
+            settings.endlessPlayback = !settings.endlessPlayback
+            renderSettings()
+        }, wrapLp(top = 4))
+        page.addView(Ui.text(this,
+            "When the queue runs out, keep going with radio picks based on its last song, whether it was a playlist, an album or a shelf. " +
+                "Off: the music stops at the end of the queue (a radio you start from a song still keeps going). Applies from the next thing you play.",
+            12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, dp(12)) })
         page.addView(Ui.pill(this, "Play while downloading: ${if (settings.progressivePlayback) "on" else "off"}", filled = false) {
             settings.progressivePlayback = !settings.progressivePlayback
             renderSettings()

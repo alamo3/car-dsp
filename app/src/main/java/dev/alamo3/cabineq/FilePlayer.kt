@@ -432,9 +432,14 @@ class FilePlayer private constructor(private val context: Context) {
             // keys, or every guest's "up next" would refer to a track that no longer exists.
         }
         queueTitle = title
-        // Whatever is played, the music carries on after its last song: an album or playlist ends
-        // into a radio seeded from its last track (when the source knows it), never into silence.
-        val seed = radio ?: tracks.lastOrNull()?.takeIf { it.sourceId != null }
+        // Whatever is played, the music carries on after its last song (unless endless playback is
+        // switched off): the queue ends into a radio seeded from its last track that names an
+        // artist, wherever the queue came from — a playlist, an album, a shelf of discovered songs
+        // with no addon id yet, or the user's own TorBox files. A seed with no artist at all still
+        // works: the radio then goes by the listener's top artist, or their library.
+        val seed = radio ?: if (settings.endlessPlayback) {
+            tracks.lastOrNull { !it.artist.isNullOrBlank() } ?: tracks.lastOrNull()
+        } else null
         radioSeed = seed
         persistPool.execute { runCatching { settings.radioSeed = seed } }
         lastError = null
