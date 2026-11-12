@@ -399,11 +399,14 @@ class FilePlayer private constructor(private val context: Context) {
         }
         fun quality(q: String?) {
             declaredQuality = q
+            // The format may already be known (the label often arrives after the first audio).
+            lastFormat?.let { (mime, rate, bits, ch) -> updateFormatInfo(mime, rate, bits, ch) } ?: run { version++ }
         }
         fun format(mime: String, rate: Int, channels: Int) = updateFormatInfo(mime, rate, 0, channels)
         fun clearFormat() {
             formatInfo = null
             declaredQuality = null
+            lastFormat = null
         }
         fun snapshot(): Pair<List<Track>, List<String>> = synchronized(eqLock) { queue to queueKeys }
         fun trackStarted() {
@@ -1895,7 +1898,17 @@ class FilePlayer private constructor(private val context: Context) {
 
     val outputSampleRate: Int? get() = if (exoActive) exo?.sink?.outputRate else liveOutput?.trackRate()
 
+    private data class FormatFacts(val mime: String, val rate: Int, val bits: Int, val channels: Int)
+    @Volatile private var lastFormat: FormatFacts? = null
+
+    /**
+     * Short "where it came from and how good": e.g. "YouTube · OPUS 160 kbps", "FLAC · lossless".
+     * Shown on the car's now-playing line and the phone's player.
+     */
+    val qualityLabel: String? get() = declaredQuality?.takeIf { it.isNotBlank() } ?: sourceCodec
+
     private fun updateFormatInfo(mime: String, rate: Int, bits: Int, channels: Int) {
+        lastFormat = FormatFacts(mime, rate, bits, channels)
         sourceCodec = mimeLabel(mime)
         sourceSampleRate = rate
         sourceBits = bits

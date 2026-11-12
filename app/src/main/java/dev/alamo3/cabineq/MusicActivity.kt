@@ -1455,7 +1455,7 @@ class MusicActivity : Activity() {
             }
             fullDur.text = if (dur > 0) Ui.mmss(dur) else "--:--"
             val info = StringBuilder()
-            p.formatInfo?.let { info.append(it).append(" → CabinEQ DSP") }
+            (p.formatInfo ?: p.qualityLabel)?.let { info.append(it).append(" → CabinEQ DSP") }
             EngineState.playerRoute?.let { if (p.state == FilePlayer.State.PLAYING) info.append(" → ").append(it) }
             p.loudnessGainDb.takeIf { !it.isNaN() && p.isActive }?.let {
                 info.append(String.format(Locale.US, "\nLoudness match %+.1f dB", it))
@@ -2434,6 +2434,11 @@ class MusicActivity : Activity() {
                     .setNegativeButton("Cancel", null)
                     .show()
             }, wrapLp(top = 4))
+            page.addView(Ui.pill(this, "Upgrade on mobile data: ${if (settings.upgradeWifiOnly) "off (Wi-Fi only)" else "on"}", filled = false) {
+                settings.upgradeWifiOnly = !settings.upgradeWifiOnly
+                if (!settings.upgradeWifiOnly) Upgrades.resume(this)
+                renderSettings()
+            }, wrapLp(top = 4))
             val used = Upgrades.usedBytes(this)
             page.addView(Ui.pill(this, "Clear upgraded songs (${Upgrades.count(this)}, ${"%.1f".format(used / 1e9)} GB)", filled = false) {
                 Upgrades.clear(this)
@@ -2441,8 +2446,8 @@ class MusicActivity : Activity() {
             }, wrapLp(top = 4))
         }
         page.addView(Ui.text(this,
-            "A song that plays from YouTube starts fast; on Wi-Fi the app then looks for the same recording in lossless " +
-                "quality on Nebula and keeps it, so the next time it plays in better quality, instantly and offline. " +
+            "A song that plays from YouTube starts fast; the app then looks for the same recording in lossless " +
+                "quality on Nebula and keeps it (about 30–40 MB a song, on Wi-Fi unless mobile data is allowed), so the next time it plays in better quality, instantly and offline. " +
                 "Never switched mid-song.",
             12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, dp(12)) })
         val ytInstalled = YouTubeCompanion.installed(this)

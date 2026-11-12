@@ -367,6 +367,10 @@ object JamHost {
         // Guests in one room search for the same things: a recent answer is reused.
         val cacheKey = query.trim().lowercase()
         val cached = searchCache[cacheKey]?.takeIf { SystemClock.elapsedRealtime() - it.at < SEARCH_CACHE_MS }
+        // YouTube Music next to Nebula, as on the phone's own search screen (when the companion is there).
+        val yt = if (dev.alamo3.cabineq.YouTubeCompanion.usable(app)) {
+            java.util.concurrent.CompletableFuture.supplyAsync { dev.alamo3.cabineq.YouTubeCompanion.search(app, query, 10) }
+        } else null
         val tracks = cached?.tracks ?: runCatching { EclipseAddon(link).search(query).tracks }
             .getOrDefault(emptyList())
             .also {
@@ -375,6 +379,7 @@ object JamHost {
                     searchCache[cacheKey] = Searched(SystemClock.elapsedRealtime(), it)
                 }
             }
+        val youtube = runCatching { yt?.get(9, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull().orEmpty()
         if (latestSearch[guest] != reqId) return           // asked something newer meanwhile
         val items = JSONArray()
         tracks.take(20).forEach { t ->
@@ -389,6 +394,20 @@ object JamHost {
                     .put("id", t.id)
                 // No stream URL: the relay is world-readable, a ticket URL may carry
                 // credentials, and the host only honours ids anyway (see trackFrom).
+            )
+        }
+        // Songs Nebula doesn't have, from YouTube (the guest page sends the item back as it got it).
+        val seen = tracks.map { dev.alamo3.cabineq.music.SongKey.of(it.title, it.artist) }.toHashSet()
+        youtube.filter { dev.alamo3.cabineq.music.SongKey.of(it.title, it.artist) !in seen }.take(10).forEach { s ->
+            items.put(
+                JSONObject()
+                    .put("title", s.title)
+                    .put("artist", s.artist)
+                    .put("album", s.album ?: JSONObject.NULL)
+                    .put("art", s.thumbnail ?: JSONObject.NULL)
+                    .put("dur", s.durationSec * 1000L)
+                    .put("source", "ADDON")
+                    .put("yt", s.videoId)
             )
         }
         // The session may have ended during the search: don't recreate what stop() wiped.
@@ -444,6 +463,8 @@ object JamHost {
         // Deliberately ignore a guest-supplied "url": only ids are honoured, so the phone never
         // downloads something an arbitrary guest chose.
         isrc = o.optString("isrc").take(32).takeIf { it.isNotBlank() },
+        // A YouTube result: only a well-formed video id is honoured (11 URL-safe characters).
+        youtubeId = o.optString("yt").takeIf { Regex("^[A-Za-z0-9_-]{11}$").matches(it) },
     )
 
     // ---------------------------------------------------------------- rest

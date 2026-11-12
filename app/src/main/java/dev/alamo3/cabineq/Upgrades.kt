@@ -18,7 +18,8 @@ import java.util.concurrent.Executors
  * plays it comes from this file: better quality, instant start, offline. Never swapped mid-song:
  * the two versions can be different masters, offset or louder.
  *
- * One download at a time (TorBox slots stay free for playback), on Wi-Fi only, inside a cap the
+ * One download at a time (TorBox slots stay free for playback), on Wi-Fi unless the user allows
+ * mobile data, inside a cap the
  * user sets (5 GB minimum); least recently played songs go first when the cap is reached.
  */
 object Upgrades {
@@ -101,7 +102,7 @@ object Upgrades {
         while (true) {
             val settings = Settings(app)
             if (!settings.upgradeEnabled) return
-            if (!onWifi(app)) { DLog.i(TAG, "${pending.size} waiting for Wi-Fi"); return }
+            if (settings.upgradeWifiOnly && !onWifi(app)) { DLog.i(TAG, "${pending.size} waiting for Wi-Fi"); return }
             val next = synchronized(lock) { pending.entries.firstOrNull() } ?: return
             val (k, track) = next.key to next.value
             val outcome = runCatching { upgrade(app, track) }

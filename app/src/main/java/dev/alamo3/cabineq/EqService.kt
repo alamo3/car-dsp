@@ -832,7 +832,9 @@ class EqService : MediaBrowserServiceCompat() {
             // The car shows this line under the title: while a song waits (or just after one was
             // skipped) it says why, instead of the artist, so a stuck 0:00 is never unexplained.
             .putString(MediaMetadata.METADATA_KEY_ARTIST, player.status
-                ?: track?.artist ?: player.currentInfo?.artist ?: player.formatInfo ?: "CabinEQ")
+                ?: listOfNotNull(track?.artist ?: player.currentInfo?.artist, player.qualityLabel)
+                    .joinToString(" · ").ifBlank { null }
+                ?: "CabinEQ")
             .putString(MediaMetadata.METADATA_KEY_ALBUM, track?.album ?: player.queueTitle ?: "")
             .putLong(MediaMetadata.METADATA_KEY_DURATION, player.durationMs)
         // The car draws its own artwork from a URI it can open itself; the bitmap below is for

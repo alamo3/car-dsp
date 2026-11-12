@@ -502,6 +502,21 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         return built
     }
 
+    /** Quality labels by queue entry, as their links reported them. */
+    private val qualities = ConcurrentHashMap<String, String>()
+
+    /** For a song playing from a file on the phone: which kind of copy it is. */
+    private fun localLabel(p: Player, index: Int): String? {
+        val uri = runCatching { p.getMediaItemAt(index).localConfiguration?.uri }.getOrNull() ?: return null
+        if (uri.scheme != "file") return null
+        val path = uri.path.orEmpty()
+        return when {
+            "/upgrades/" in path -> "Upgraded · lossless"
+            "/downloads" in path -> "Downloaded"
+            else -> "On the phone"
+        }
+    }
+
     private fun item(key: String, track: Track, local: File?): MediaItem {
         tracksByKey[key] = track
         // Already on the phone (a download, or the other engine's cache): play the file.
@@ -775,6 +790,9 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         quietWaitSince = 0L
         owner.setNote(null)
         bridge.clearFormat()
+        // What this song is: the label its link came with (looked up ahead, often before its
+        // turn), or where its file came from when it plays from the phone.
+        currentKey?.let { k -> (qualities[k] ?: localLabel(p, index))?.let { bridge.quality(it) } }
         bridge.info(null)
         bridge.duration(track?.durationMs ?: 0L, exact = false)
         bridge.index(index)
@@ -996,7 +1014,10 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             // e.g. "Couldn't find it on Nebula": a load error, so the player moves on, saying why.
             throw IOException(SourceTrouble.of(e).describe(e), e)
         }
-        link.quality?.let { q -> main.post { if (currentTrack() === track) bridge.quality(q) } }
+        link.quality?.let { q ->
+            qualities[key] = q
+            main.post { if (currentTrack() === track) bridge.quality(q) }
+        }
         val out = spec.withUri(Uri.parse(link.url))
         return if (link.headers.isEmpty()) out else out.withAdditionalHeaders(link.headers)
     }
@@ -1157,6 +1178,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             try {
                 val resolved = TrackResolver.resolve(context, track, { }, { false }, 20_000L, waitIfPending = false)
                 links[key] = Link(resolved.url, resolved.quality, SystemClock.elapsedRealtime(), resolved.headers, resolved.via)
+                resolved.quality?.let { qualities[key] = it }
                 if (bringBack) main.post { bringForward(key, track) } else main.post { prefetchIfNear(key, track) }
             } catch (e: AddonNotReady) {
                 if (!bringBack) main.post { setAside(key, track) }

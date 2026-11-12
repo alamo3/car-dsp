@@ -234,6 +234,11 @@ class Settings(context: Context) {
         get() = prefs.getBoolean("upgrade_enabled", true)
         set(v) = prefs.edit().putBoolean("upgrade_enabled", v).apply()
 
+    /** Upgrades download on Wi-Fi only (default), or on mobile data too. */
+    var upgradeWifiOnly: Boolean
+        get() = prefs.getBoolean("upgrade_wifi_only", true)
+        set(v) = prefs.edit().putBoolean("upgrade_wifi_only", v).apply()
+
     /** Space for upgraded songs, in GB: 5 at least, no upper limit. */
     var upgradeCapGb: Int
         get() = prefs.getInt("upgrade_cap_gb", MIN_UPGRADE_GB).coerceAtLeast(MIN_UPGRADE_GB)
