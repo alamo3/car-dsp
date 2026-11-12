@@ -12,6 +12,8 @@ class CompanionApp : Application() {
             // yt-dlp tracks YouTube's changes in its releases: take the newest once a day.
             val prefs = getSharedPreferences("yt", Context.MODE_PRIVATE)
             if (System.currentTimeMillis() - prefs.getLong("updatedAt", 0) > DAY_MS) runCatching { Yt.update(app) }
+            // And the companion itself, from GitHub (daily, on Wi-Fi).
+            runCatching { SelfUpdate.check(app, manual = false) }
         }, "CabinEQYt-Init").start()
     }
 
