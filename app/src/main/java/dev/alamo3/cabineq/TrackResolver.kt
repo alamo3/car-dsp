@@ -45,12 +45,15 @@ object TrackResolver {
     private class Cached(val url: String, val quality: String?, val at: Long, val headers: Map<String, String> = emptyMap(), val via: String = "TorBox")
     private val linkCache = ConcurrentHashMap<String, Cached>()
     private const val LINK_TTL_MS = 10 * 60_000L
+    /** YouTube's links stay valid about 6 hours: kept for 5, so replays and skips back are instant. */
+    private const val YOUTUBE_TTL_MS = 5 * 3600_000L
+    fun ttlFor(via: String): Long = if (via == "YouTube") YOUTUBE_TTL_MS else LINK_TTL_MS
     private val warmPool = Executors.newFixedThreadPool(2) { r ->
         Thread(r, "CabinEQ-Warm").apply { isDaemon = true }
     }
 
     private fun cachedLink(track: Track): Cached? =
-        linkCache[track.mediaId]?.takeIf { SystemClock.elapsedRealtime() - it.at < LINK_TTL_MS }
+        linkCache[track.mediaId]?.takeIf { SystemClock.elapsedRealtime() - it.at < ttlFor(it.via) }
 
     /** A link that failed must not be handed out again. */
     fun forget(track: Track) {

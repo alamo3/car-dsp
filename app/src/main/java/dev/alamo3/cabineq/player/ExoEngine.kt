@@ -44,7 +44,9 @@ import dev.alamo3.cabineq.MediaCache
 import dev.alamo3.cabineq.Taste
 import dev.alamo3.cabineq.BuildConfig
 import dev.alamo3.cabineq.Track
+import dev.alamo3.cabineq.Settings
 import dev.alamo3.cabineq.TrackResolver
+import dev.alamo3.cabineq.YouTubeCompanion
 import dev.alamo3.cabineq.addon.AddonNotReady
 import java.io.File
 import java.io.IOException
@@ -135,7 +137,9 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
 
     // ---- shared with the loader threads ----------------------------------------------------
     private val tracksByKey = ConcurrentHashMap<String, Track>()
-    private class Link(val url: String, val quality: String?, val at: Long, val headers: Map<String, String> = emptyMap())
+    private class Link(val url: String, val quality: String?, val at: Long, val headers: Map<String, String> = emptyMap(), val via: String = "TorBox") {
+        fun fresh(now: Long = SystemClock.elapsedRealtime()) = now - at < TrackResolver.ttlFor(via)
+    }
     private val links = ConcurrentHashMap<String, Link>()
     /** Songs moved aside while TorBox caches them (queue key → when). */
     private val deferred = ConcurrentHashMap<String, Long>()
@@ -951,7 +955,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         val key = spec.uri.lastPathSegment ?: throw IOException("no queue entry in ${spec.uri.scheme} address")
         val track = tracksByKey[key] ?: throw IOException("that song is no longer in the queue")
         val now = SystemClock.elapsedRealtime()
-        val known = links[key]?.takeIf { now - it.at < LINK_TTL_MS }
+        val known = links[key]?.takeIf { it.fresh(now) }
         val link = known ?: try {
             val asked = SystemClock.elapsedRealtime()
             // The next songs are prepared while this one plays: only the one being played gets
@@ -975,7 +979,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             }
             val got = resolved!!
             note("Connecting to ${got.via}…")
-            Link(got.url, got.quality, SystemClock.elapsedRealtime(), got.headers).also {
+            Link(got.url, got.quality, SystemClock.elapsedRealtime(), got.headers, got.via).also {
                 links[key] = it
                 DLog.i(TAG, "link for \"${track.title}\" in ${it.at - asked} ms")
             }
@@ -1038,7 +1042,10 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         val at = p.currentMediaItemIndex
         // Asking for a song's link is also what makes TorBox start caching it, so the further
         // ahead this looks, the more head start a slow song gets.
-        for (index in at + 1..at + AHEAD_PROBE) {
+        // YouTube has no download slots to protect: with it first, prepare much further ahead, so
+        // even fast skipping lands on songs whose links are already there.
+        val ahead = if (YouTubeCompanion.usable(context) && Settings(context).youtubeSource == Settings.YOUTUBE_FIRST) AHEAD_PROBE_YOUTUBE else AHEAD_PROBE
+        for (index in at + 1..at + ahead) {
             val key = keys.getOrNull(index) ?: continue
             val track = tracksByKey[key] ?: continue
             if (p.getMediaItemAt(index).localConfiguration?.uri?.scheme != SCHEME) continue
@@ -1066,7 +1073,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
      */
     private fun startPrefetch(key: String, track: Track) {
         if (deferred.containsKey(key) || key in prefetched) return
-        val link = links[key]?.takeIf { SystemClock.elapsedRealtime() - it.at < LINK_TTL_MS } ?: return
+        val link = links[key]?.takeIf { it.fresh() } ?: return
         val cache = cache(context) ?: return
         if (!prefetching.add(key)) return
         prefetchPool.execute {
@@ -1138,7 +1145,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
     }
 
     private fun probe(key: String, track: Track, bringBack: Boolean) {
-        val fresh = links[key]?.let { SystemClock.elapsedRealtime() - it.at < LINK_TTL_MS } == true
+        val fresh = links[key]?.fresh() == true
         if (fresh && !bringBack) return
         // Every ask can start a TorBox download: while all its slots are busy, asking again only
         // keeps them busy. Wait it out (the song that is playing still asks; see resolve).
@@ -1147,7 +1154,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         checkPool.execute {
             try {
                 val resolved = TrackResolver.resolve(context, track, { }, { false }, 20_000L, waitIfPending = false)
-                links[key] = Link(resolved.url, resolved.quality, SystemClock.elapsedRealtime(), resolved.headers)
+                links[key] = Link(resolved.url, resolved.quality, SystemClock.elapsedRealtime(), resolved.headers, resolved.via)
                 if (bringBack) main.post { bringForward(key, track) } else main.post { prefetchIfNear(key, track) }
             } catch (e: AddonNotReady) {
                 if (!bringBack) main.post { setAside(key, track) }
@@ -1225,7 +1232,6 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
          * How long a resolved link is reused. TorBox documents 3 hours (some report less, around
          * half an hour), so ten minutes is well inside; a link refused anyway is retried fresh.
          */
-        private const val LINK_TTL_MS = 10 * 60_000L
         /** Responses that mean "this link is no longer good", as opposed to "this song is bad". */
         private val REFUSED_LINK_CODES = setOf(400, 401, 403, 410)
         private const val DEFERRED_RECHECK_MS = 10_000L
@@ -1235,6 +1241,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         private const val QUIET_WAIT_MS = 4_000L
         /** How many songs ahead get their link looked up (which is what starts TorBox caching them). */
         private const val AHEAD_PROBE = 4
+        private const val AHEAD_PROBE_YOUTUBE = 10
         /** How many songs ahead are downloaded whole, ready before their turn. */
         private const val AHEAD_PREFETCH = 3
         /** How much of the next song is prepared and buffered while the current one plays. */

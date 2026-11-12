@@ -2091,6 +2091,9 @@ class MusicActivity : Activity() {
             }
         })
         songs.take(5).forEach { s -> page.addView(songRow(row(s), showArt = true) { playIt(s) }) }
+        // The song you're about to tap is usually one of the first two: get their links now, so
+        // the tap plays at once instead of waiting on yt-dlp.
+        TrackResolver.warm(this, songs.take(2).map { it.toTrack() })
     }
 
     private fun renderSongList(title: String, a: EclipseAddon, songs: List<EclipseAddon.Track>, queueTitle: String) {
