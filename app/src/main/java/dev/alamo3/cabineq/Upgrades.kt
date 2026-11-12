@@ -85,7 +85,25 @@ object Upgrades {
     fun resume(context: Context) {
         val app = context.applicationContext
         load(app)
+        listen(app)
         kick(app)
+    }
+
+    @Volatile private var listening = false
+
+    /** Carries on by itself when Wi-Fi (or any network, if mobile data is allowed) comes back. */
+    private fun listen(app: Context) {
+        if (listening) return
+        listening = true
+        val cm = app.getSystemService(ConnectivityManager::class.java) ?: return
+        runCatching {
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onCapabilitiesChanged(network: android.net.Network, caps: NetworkCapabilities) {
+                    val ok = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) || !Settings(app).upgradeWifiOnly
+                    if (ok && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) kick(app)
+                }
+            })
+        }
     }
 
     private fun kick(app: Context) {
@@ -149,8 +167,11 @@ object Upgrades {
     /** Better than YouTube's Opus/AAC: lossless (FLAC, ALAC, WAV) or a high bitrate. */
     private fun isBetter(s: EclipseAddon.Stream): Boolean {
         val text = listOfNotNull(s.format, s.codec, s.quality).joinToString(" ").lowercase()
+        if (listOf("mp3", "aac", "opus", "ogg", "vorbis", "m4a").any { it in text }) return false
+        // Only an explicit lossless label counts (or 24-bit, which no lossy format reports): a bare
+        // "16-bit / 44.1 kHz" can describe an MP3's decoded output.
         if (listOf("flac", "alac", "wav", "lossless", "hi-res", "hires").any { it in text }) return true
-        return (s.bitDepth ?: 0) >= 16 && (s.sampleRate ?: 0) >= 44_100 && "mp3" !in text && "aac" !in text && "opus" !in text
+        return (s.bitDepth ?: 0) >= 24
     }
 
     /** Over the cap: the least recently played upgrades go first. */

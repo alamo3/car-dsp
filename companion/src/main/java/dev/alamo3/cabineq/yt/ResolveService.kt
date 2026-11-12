@@ -45,6 +45,7 @@ class ResolveService : Service() {
         packageManager.getPackagesForUid(uid)?.any { it == CABINEQ || it.startsWith("$CABINEQ.") } == true
 
     private fun work(what: Int, data: Bundle, replyTo: Messenger?) {
+        lastRequestAt = System.currentTimeMillis()
         val title = data.getString("title").orEmpty()
         val artist = data.getString("artist")
         if (what == 2) { Yt.forget(this, title, artist); return }
@@ -102,6 +103,8 @@ class ResolveService : Service() {
     override fun onBind(intent: Intent?): IBinder = messenger.binder
 
     companion object {
+        /** When CabinEQ last asked for something: an update must not cut off a song it is loading. */
+        @Volatile var lastRequestAt = 0L
         private const val TAG = "CabinEQYt/Service"
         private const val CABINEQ = "dev.alamo3.cabineq"
     }

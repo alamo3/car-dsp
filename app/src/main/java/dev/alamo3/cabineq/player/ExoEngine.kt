@@ -205,6 +205,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         queue.loaded(queueKeys)
         cancelAllPrefetch()
         tracksByKey.clear()
+        qualities.clear()
         deferred.clear()
         publishWaiting()
         failures = 0

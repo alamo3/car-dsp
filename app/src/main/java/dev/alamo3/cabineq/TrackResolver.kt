@@ -105,23 +105,7 @@ object TrackResolver {
                 if (youtube && settings.youtubeSource == Settings.YOUTUBE_FIRST) {
                     fromYouTube(context, track, onNote)?.let { return it }
                 }
-                if (youtube) {
-                    // YouTube as the fallback: never wait on TorBox caching when YouTube can play
-                    // it now, and use it whenever Nebula has no copy or does not answer.
-                    try {
-                        return fromNebula(context, link, track, onNote, isCancelled, maxWaitMs, waitIfPending = false)
-                    } catch (e: Exception) {
-                        if (e is InterruptedException || isCancelled()) throw e
-                        val trouble = dev.alamo3.cabineq.player.SourceTrouble.of(e)
-                        DLog.i("CabinEQ/Resolve", "\"${track.title}\": Nebula ${trouble.describe(e)}; trying YouTube")
-                        fromYouTube(context, track, onNote)?.let { return it }
-                        // YouTube has nothing either: back to Nebula's own way (wait if caching).
-                        if (e is dev.alamo3.cabineq.addon.AddonNotReady && waitIfPending) {
-                            return fromNebula(context, link, track, onNote, isCancelled, maxWaitMs, waitIfPending = true)
-                        }
-                        throw e
-                    }
-                }
+                if (youtube) return race(context, link, track, onNote, isCancelled, maxWaitMs, waitIfPending)
                 fromNebula(context, link, track, onNote, isCancelled, maxWaitMs, waitIfPending)
             }
             Track.Source.TORBOX -> {
@@ -132,6 +116,64 @@ object TrackResolver {
                 if (key.isBlank()) throw IllegalStateException("Add your TorBox API key in Settings")
                 Resolved(TorBoxClient(key).requestDownloadUrl(track.torrentId, track.fileId))
             }
+        }
+    }
+
+    private val racers = Executors.newCachedThreadPool { r -> Thread(r, "CabinEQ-Race").apply { isDaemon = true } }
+    /** Nebula's head start: a cached song answers well inside it and plays in its own quality. */
+    private const val HEAD_START_MS = 2_000L
+
+    /**
+     * Nebula first, YouTube in parallel: Nebula gets [HEAD_START_MS]; if it has no link by then
+     * (no match yet, no source, slow, or TorBox still caching), YouTube starts too and whichever
+     * is ready first plays — Nebula's if both are. Before this, YouTube only started after
+     * Nebula gave up, which with Nebula timing out could be 30 s of silence.
+     */
+    private fun race(
+        context: Context,
+        link: String,
+        track: Track,
+        onNote: (String?) -> Unit,
+        isCancelled: () -> Boolean,
+        maxWaitMs: Long,
+        waitIfPending: Boolean,
+    ): Resolved {
+        val nebula = racers.submit<Resolved> { fromNebula(context, link, track, onNote, isCancelled, maxWaitMs, waitIfPending = false) }
+        var youtube: java.util.concurrent.Future<Resolved?>? = null
+        val started = SystemClock.elapsedRealtime()
+        var nebulaError: Throwable? = null
+        try {
+            while (true) {
+                if (isCancelled() || Thread.currentThread().isInterrupted) throw InterruptedException("cancelled")
+                if (nebulaError == null && nebula.isDone) {
+                    try { return nebula.get() } catch (e: java.util.concurrent.ExecutionException) {
+                        nebulaError = e.cause ?: e
+                        DLog.i("CabinEQ/Resolve", "\"${track.title}\": Nebula ${dev.alamo3.cabineq.player.SourceTrouble.of(nebulaError!!).describe(nebulaError)}")
+                    }
+                }
+                if (youtube == null && (nebulaError != null || SystemClock.elapsedRealtime() - started >= HEAD_START_MS)) {
+                    youtube = racers.submit<Resolved?> { fromYouTube(context, track, onNote) }
+                }
+                youtube?.takeIf { it.isDone }?.let { f ->
+                    val got = runCatching { f.get() }.getOrNull()
+                    // Nebula's answer may have landed at the same moment: its copy is the better one.
+                    if (nebulaError == null && nebula.isDone) runCatching { return nebula.get() }
+                    if (got != null) return got
+                    if (nebulaError != null) {
+                        // Neither: Nebula's own way, waiting for TorBox to cache if that was the problem.
+                        if (nebulaError is dev.alamo3.cabineq.addon.AddonNotReady && waitIfPending) {
+                            return fromNebula(context, link, track, onNote, isCancelled, maxWaitMs, waitIfPending = true)
+                        }
+                        throw nebulaError!!
+                    }
+                    // YouTube had nothing: Nebula is all that is left, keep waiting on it.
+                    try { return nebula.get() } catch (e: java.util.concurrent.ExecutionException) { throw e.cause ?: e }
+                }
+                Thread.sleep(50)
+            }
+        } finally {
+            nebula.cancel(true)
+            youtube?.cancel(true)
         }
     }
 

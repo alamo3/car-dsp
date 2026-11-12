@@ -18,7 +18,8 @@ import java.net.URL
 object YtmSearch {
     private const val TAG = "CabinEQYt/Ytm"
     private const val URL_SEARCH = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
-    private const val CLIENT_VERSION = "1.20251101.01.00"
+    /** The website's client version; refreshed from music.youtube.com if YouTube refuses this one. */
+    @Volatile private var clientVersion = "1.20251101.01.00"
     /** Filters, as the website sends them: official songs, and videos (remixes, live, uploads). */
     const val SONGS = "EgWKAQIIAWoMEA4QChADEAQQCRAF"
     const val VIDEOS = "EgWKAQIQAWoMEA4QChADEAQQCRAF"
@@ -35,10 +36,32 @@ object YtmSearch {
     )
 
     fun search(query: String, limit: Int = 20, filter: String = SONGS): List<Song> {
+        val first = request(query, limit, filter)
+        if (first != null) return first
+        // Refused: most likely an old client version. Read the current one off the website, once.
+        if (!refreshVersion()) return emptyList()
+        return request(query, limit, filter) ?: emptyList()
+    }
+
+    private fun refreshVersion(): Boolean = runCatching {
+        val conn = (URL("https://music.youtube.com/").openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8_000; readTimeout = 10_000
+            setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+        }
+        val html = try { conn.inputStream.bufferedReader().use { it.readText() } } finally { conn.disconnect() }
+        val v = Regex("\"INNERTUBE_CLIENT_VERSION\":\"([0-9.]+)\"").find(html)?.groupValues?.get(1) ?: return false
+        if (v == clientVersion) return false
+        Log.i(TAG, "client version $clientVersion -> $v")
+        clientVersion = v
+        true
+    }.getOrDefault(false)
+
+    /** One search; null when YouTube refused it (as opposed to an empty answer). */
+    private fun request(query: String, limit: Int, filter: String): List<Song>? {
         val body = JSONObject()
             .put("context", JSONObject().put("client", JSONObject()
                 .put("clientName", "WEB_REMIX")
-                .put("clientVersion", CLIENT_VERSION)
+                .put("clientVersion", clientVersion)
                 .put("hl", "en")
                 .put("gl", "US")))
             .put("query", query)
@@ -53,13 +76,13 @@ object YtmSearch {
             setRequestProperty("Referer", "https://music.youtube.com/")
             setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36")
             setRequestProperty("X-YouTube-Client-Name", "67")
-            setRequestProperty("X-YouTube-Client-Version", CLIENT_VERSION)
+            setRequestProperty("X-YouTube-Client-Version", clientVersion)
         }
         try {
             conn.outputStream.use { it.write(body.toString().toByteArray()) }
             if (conn.responseCode !in 200..299) {
                 Log.w(TAG, "search -> HTTP ${conn.responseCode}")
-                return emptyList()
+                return null
             }
             val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
             val out = ArrayList<Song>()

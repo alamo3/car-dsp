@@ -294,7 +294,7 @@ class FilePlayer private constructor(private val context: Context) {
     /** Queue entries the radio added (only these are ever revised; the listener's own never are). */
     private val radioKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     /** Early skips per artist in this session: two in a row and the radio drops that artist. */
-    private val earlySkips = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val earlySkips = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Long>>()
     private val radioPool = Executors.newSingleThreadExecutor { r ->
         Thread(r, "CabinEQ-Radio").apply { isDaemon = true }
     }
@@ -761,7 +761,11 @@ class FilePlayer private constructor(private val context: Context) {
         when (kind) {
             Taste.Kind.SKIP -> {
                 if (value >= EARLY_SKIP) return
-                val n = earlySkips.merge(artist, 1, Int::plus) ?: 1
+                // Counted within two hours: a skip this morning is not a verdict for tonight.
+                val now = System.currentTimeMillis()
+                val n = earlySkips.compute(artist) { _, old ->
+                    if (old == null || now - old.second > EARLY_SKIP_MEMORY_MS) 1 to now else (old.first + 1) to now
+                }!!.first
                 if (mine.isEmpty()) return
                 if (n >= 2) {
                     mine.forEach { removeUpcoming(it); radioKeys.remove(it) }
@@ -1975,6 +1979,7 @@ class FilePlayer private constructor(private val context: Context) {
         private const val RADIO_KEEP = 3
         /** A skip before this share of the song counts as "not this". */
         private const val EARLY_SKIP = 0.25f
+        private const val EARLY_SKIP_MEMORY_MS = 2 * 3600_000L
         private const val ERROR_SHOWN_MS = 20_000L
         /** Ramp-in length at every (re)start; long enough to hide a step, short enough to forget. */
         private const val FADE_IN_MS = 15

@@ -30,6 +30,7 @@ object SelfUpdate {
     private const val LATEST = "https://api.github.com/repos/alamo3/car-dsp/releases/latest"
     private const val CHANNEL = "updates"
     const val ACTION_STATUS = "dev.alamo3.cabineq.yt.UPDATE_STATUS"
+    private const val IN_USE_MS = 15 * 60_000L
 
     @Volatile var lastResult: String? = null
         private set
@@ -41,8 +42,11 @@ object SelfUpdate {
             if (System.currentTimeMillis() - prefs.getLong("appCheckedAt", 0) < CompanionApp.DAY_MS) return "checked today"
             val cm = context.getSystemService(ConnectivityManager::class.java)
             if (cm?.isActiveNetworkMetered != false) return "waiting for Wi-Fi"
+            // CabinEQ asked for a song in the last 15 minutes: music is probably playing, and
+            // installing restarts this app mid-request. Later.
+            if (System.currentTimeMillis() - ResolveService.lastRequestAt < IN_USE_MS) return "waiting until music stops"
         }
-        prefs.edit().putLong("appCheckedAt", System.currentTimeMillis()).apply()
+        if (!manual) prefs.edit().putLong("appCheckedAt", System.currentTimeMillis()).apply()
         val result = runCatching { checkNow(context) }.getOrElse { "app update failed: ${it.message}" }
         lastResult = result
         Log.i(TAG, result)
@@ -60,13 +64,19 @@ object SelfUpdate {
             JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
         } finally { conn.disconnect() }
         val tag = json.getString("tag_name")
-        val code = Regex("(\\d+)$").find(tag)?.groupValues?.get(1)?.toLongOrNull() ?: return "unreadable release tag $tag"
-        val installed = context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
-        if (code <= installed) return "app is up to date ($tag)"
         val assets = json.getJSONArray("assets")
-        val url = (0 until assets.length()).map { assets.getJSONObject(it) }
+        val asset = (0 until assets.length()).map { assets.getJSONObject(it) }
             .firstOrNull { it.getString("name").let { n -> n.endsWith(".apk") && "youtube" in n } }
-            ?.getString("browser_download_url") ?: return "$tag has no companion APK"
+            ?: return "$tag has no companion APK"
+        // The companion numbers its own builds (cabineq-youtube-c<code>.apk), so an unchanged
+        // companion in a new CabinEQ release is not downloaded again.
+        val name = asset.getString("name")
+        val code = Regex("-c(\\d+)\\.apk$").find(name)?.groupValues?.get(1)?.toLongOrNull()
+            ?: Regex("(\\d+)$").find(tag)?.groupValues?.get(1)?.toLongOrNull()
+            ?: return "unreadable version in $name"
+        val installed = context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
+        if (code <= installed) return "app is up to date (build $installed)"
+        val url = asset.getString("browser_download_url")
         val apk = download(context, url)
         install(context, apk)
         return "installing $tag"

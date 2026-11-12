@@ -9,7 +9,10 @@ plugins {
 // wants one. A separate app so CabinEQ itself (which goes to Google Play) carries no downloader;
 // this one is only ever installed from GitHub releases. Same version numbers and the same signing
 // key as CabinEQ.
-val cabinVersionCode = (project.findProperty("cabinVersionCode") as String?)?.toInt() ?: 1
+// Its own build number (CI: 1000 + commits that touched companion/), so a CabinEQ release that
+// did not change it does not make phones download it again.
+val cabinVersionCode = (project.findProperty("companionVersionCode") as String?)?.toInt()
+    ?: (project.findProperty("cabinVersionCode") as String?)?.toInt() ?: 1
 val cabinVersionName = (project.findProperty("cabinVersionName") as String?) ?: "0.1.0-dev"
 
 val localProps = Properties().apply {

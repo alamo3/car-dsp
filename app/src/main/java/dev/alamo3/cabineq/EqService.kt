@@ -280,6 +280,17 @@ class EqService : MediaBrowserServiceCompat() {
         )
     }
 
+    private class VoiceSpec(val tracks: List<Track>, val index: Int, val title: String, val radio: Track?)
+
+    /** The first YouTube Music result for a spoken request, as a one-song queue with a radio. */
+    private fun voiceFromYouTube(request: dev.alamo3.cabineq.music.VoiceRequest): VoiceSpec? {
+        val q = dev.alamo3.cabineq.music.VoiceRequest.clean(request.query).ifBlank { return null }
+        val song = runCatching { YouTubeCompanion.search(this, q, 5) }.getOrNull()?.firstOrNull() ?: return null
+        DLog.i(TAG, "voice request answered from YouTube: ${song.title}")
+        val t = song.toTrack()
+        return VoiceSpec(listOf(t), 0, "Voice: $q", t)
+    }
+
     private fun playFromSearchQuery(query: String) {
         if (query.isBlank()) return
         playFromVoice(dev.alamo3.cabineq.music.VoiceRequest(query))
@@ -294,7 +305,13 @@ class EqService : MediaBrowserServiceCompat() {
         startForegroundSafely()
         mediaSession?.isActive = true
         Thread({
-            val spec = runCatching { MediaBrowse.voicePlayback(this, request) }.getOrNull()
+            // A named song with YouTube first: YouTube's best match straight away.
+            val ytFirst = request.title != null && YouTubeCompanion.usable(this) &&
+                Settings(this).youtubeSource == Settings.YOUTUBE_FIRST
+            val spec = (if (ytFirst) voiceFromYouTube(request) else null)
+                ?: runCatching { MediaBrowse.voicePlayback(this, request) }.getOrNull()?.let { VoiceSpec(it.tracks, it.index, it.title ?: "Voice", it.radio) }
+                // Nothing on Nebula for it: YouTube has nearly everything.
+                ?: (if (!ytFirst && !request.isOpenEnded && YouTubeCompanion.usable(this)) voiceFromYouTube(request) else null)
             if (spec == null) {
                 DLog.w(TAG, "Nothing to play for the voice request")
                 // Say so where the car shows it, instead of silently doing nothing.
