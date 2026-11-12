@@ -264,8 +264,15 @@ object Taste {
 
     fun importedPlaylists(context: Context): List<String> = Settings(context).importedPlaylists()
 
+    /**
+     * Told about every signal as it is recorded (skips, likes, dislikes, songs played through):
+     * the player uses it to revise the radio's own upcoming picks.
+     */
+    @Volatile var onSignal: ((Kind, Track, Float) -> Unit)? = null
+
     private fun record(context: Context, track: Track, kind: Kind, value: Float) {
         if (track.title.isBlank()) return
+        runCatching { onSignal?.invoke(kind, track, value) }
         val s = store(context)
         synchronized(s) {
             s.events.add(

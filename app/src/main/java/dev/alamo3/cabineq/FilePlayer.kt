@@ -265,6 +265,7 @@ class FilePlayer private constructor(private val context: Context) {
 
     init {
         Diag.init(context)
+        Taste.onSignal = { kind, track, value -> radioPool.execute { runCatching { reviseRadio(kind, track, value) } } }
         repeat = runCatching { Repeat.valueOf(settings.repeatMode) }.getOrDefault(Repeat.OFF)
         restoreQueue()
         // The mix rate follows the route (speaker 48k, a USB DAC maybe 96k, BT often 44.1),
@@ -290,6 +291,10 @@ class FilePlayer private constructor(private val context: Context) {
      */
     @Volatile private var radioSeed: Track? = null
     @Volatile private var radioBusy = false
+    /** Queue entries the radio added (only these are ever revised; the listener's own never are). */
+    private val radioKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    /** Early skips per artist in this session: two in a row and the radio drops that artist. */
+    private val earlySkips = java.util.concurrent.ConcurrentHashMap<String, Int>()
     private val radioPool = Executors.newSingleThreadExecutor { r ->
         Thread(r, "CabinEQ-Radio").apply { isDaemon = true }
     }
@@ -740,6 +745,49 @@ class FilePlayer private constructor(private val context: Context) {
     }
 
     /**
+     * The radio revises its own upcoming picks when the listener says something: an early skip
+     * pushes that artist's picks back (a second one removes them), a dislike removes them, a like
+     * or a song played through brings one forward. The next [RADIO_KEEP] songs stay put (their
+     * audio is already being prepared), and songs the listener queued are never touched. Whatever
+     * was removed is refilled by the radio, which already counts the new signal.
+     */
+    private fun reviseRadio(kind: Taste.Kind, track: Track, value: Float) {
+        if (radioSeed == null) return
+        val artist = Taste.artistKey(track.artist) ?: return
+        val (keys, tracks, from) = synchronized(eqLock) { Triple(queueKeys, queue, currentIndex + 1 + RADIO_KEEP) }
+        val mine = (from until keys.size)
+            .filter { keys[it] in radioKeys && Taste.artistKey(tracks[it].artist) == artist }
+            .map { keys[it] }
+        when (kind) {
+            Taste.Kind.SKIP -> {
+                if (value >= EARLY_SKIP) return
+                val n = earlySkips.merge(artist, 1, Int::plus) ?: 1
+                if (mine.isEmpty()) return
+                if (n >= 2) {
+                    mine.forEach { removeUpcoming(it); radioKeys.remove(it) }
+                    DLog.i(TAG, "Radio: dropped ${mine.size} upcoming by ${track.artist} after $n early skips")
+                } else {
+                    mine.forEach { moveUpcoming(it, Int.MAX_VALUE) }
+                    DLog.i(TAG, "Radio: moved ${mine.size} upcoming by ${track.artist} back after an early skip")
+                }
+            }
+            Taste.Kind.DISLIKE -> {
+                if (mine.isEmpty()) return
+                mine.forEach { removeUpcoming(it); radioKeys.remove(it) }
+                DLog.i(TAG, "Radio: dropped ${mine.size} upcoming by ${track.artist} after a dislike")
+            }
+            Taste.Kind.LIKE, Taste.Kind.COMPLETE -> {
+                earlySkips.remove(artist)
+                val first = mine.firstOrNull() ?: return
+                moveUpcoming(first, currentIndex + 1 + RADIO_KEEP)
+                DLog.i(TAG, "Radio: brought \"${tracks[keys.indexOf(first)].title}\" forward after a ${kind.name.lowercase()}")
+            }
+            else -> return
+        }
+        extendRadioIfNeeded()     // refill what was removed
+    }
+
+    /**
      * Keeps exactly one track ahead: when the song that just started is the last one queued,
      * fetch the artist's next track in the background and append it. Never blocks playback.
      */
@@ -797,7 +845,7 @@ class FilePlayer private constructor(private val context: Context) {
             }
             DLog.i(TAG, "Radio: ${if (found == null) "library fallback" else "pick"} after ${took}ms")
             DLog.i(TAG, "Radio: queuing \"${next.title}\" — ${next.artist}")
-            enqueue(listOf(next))
+            radioKeys.addAll(enqueue(listOf(next)))
             if (!exoActive) MediaCache.prefetch(context, next)
             if (followNewTrack) {
                 // The user pressed "next" at the end of the queue: jump to what just arrived.
@@ -1923,6 +1971,10 @@ class FilePlayer private constructor(private val context: Context) {
     companion object {
         /** Songs the radio keeps queued ahead of the one playing. */
         private const val RADIO_AHEAD = 20
+        /** Upcoming songs the radio never revises: their audio is already being prepared. */
+        private const val RADIO_KEEP = 3
+        /** A skip before this share of the song counts as "not this". */
+        private const val EARLY_SKIP = 0.25f
         private const val ERROR_SHOWN_MS = 20_000L
         /** Ramp-in length at every (re)start; long enough to hide a step, short enough to forget. */
         private const val FADE_IN_MS = 15
