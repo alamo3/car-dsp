@@ -118,7 +118,7 @@ object SmartSearch {
         val playlists = all.flatMap { it.playlists }.distinctBy { it.id }
 
         // 4: what is this query asking for?
-        val lead = SearchRank.lead(q, tracks, albums, artists, artistHits)
+        val lead = SearchRank.lead(q, tracks, albums, artists, artistHits, trackHits.firstOrNull()?.artist)
         if (lead == SearchRank.Lead.ARTIST) {
             val artist = artists.first()
             val theirs = { t: EclipseAddon.Track -> SongKey.artist(t.artist) == SongKey.artist(artist.name) }

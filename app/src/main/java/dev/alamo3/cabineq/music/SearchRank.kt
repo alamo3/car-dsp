@@ -246,6 +246,8 @@ object SearchRank {
         albums: List<EclipseAddon.Album>,
         artists: List<EclipseAddon.Artist>,
         artistHits: List<String>,
+        /** Whose song the index (Deezer's popularity-ordered search) puts first; null if unknown. */
+        topSongArtist: String? = null,
     ): Lead {
         val q = queryWords(query)
         val wantsAlbum = "album" in SongKey.words(query)
@@ -254,8 +256,12 @@ object SearchRank {
         val songNamedLikeThis = tracks.take(3).any { sameWords(SongKey.words(SongKey.plainTitle(it.title)), q) }
         if (!wantsAlbum && topArtist != null && sameName(topArtist.name, query)) {
             // "Hello" is a song first, even if some band is called Hello — unless the index
-            // itself reads the query as an artist.
-            val indexAgrees = artistHits.firstOrNull()?.let { sameName(it, query) } == true
+            // itself reads the query as an artist. The artist search always finds a band
+            // named like the query ("Wild Ones"), so when it is known, the most popular song
+            // decides: theirs means the artist was meant, someone else's (Flo Rida) the song.
+            val indexAgrees = if (topSongArtist != null)
+                topSongArtist.split(',').any { sameName(it.trim(), topArtist.name) }
+            else artistHits.firstOrNull()?.let { sameName(it, query) } == true
             if (!songNamedLikeThis || indexAgrees) return Lead.ARTIST
         }
         val topAlbum = albums.firstOrNull()
