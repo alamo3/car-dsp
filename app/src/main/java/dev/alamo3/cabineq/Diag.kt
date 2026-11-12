@@ -172,7 +172,10 @@ object Diag {
             }
             if (batch.isEmpty()) return
             val body = JSONObject()
-            batch.forEach { e ->
+            // The database refuses events more than two weeks old (a phone offline that long):
+            // left in, they would get the whole batch refused.
+            val oldest = System.currentTimeMillis() - 13 * 24 * 3600_000L
+            batch.filter { it.optLong("at") >= oldest }.forEach { e ->
                 // Scrubbed again: a line logged before the secrets were known is caught here.
                 val copy = JSONObject(e.toString()).apply { remove("k"); put("m", scrub(optString("m"))) }
                 body.put(e.getString("k"), copy)

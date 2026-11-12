@@ -1685,8 +1685,57 @@ class MusicActivity : Activity() {
             .onFailure { showMessage("No file picker available", isError = true) }
     }
 
+    private var linkStatusView: TextView? = null
+
+    /** Saves the Nebula link and TorBox key to a file the listener picks (e.g. a password manager's folder). */
+    private fun exportKeys() {
+        if (settings.addonLink.isBlank() && settings.torboxApiKey.isBlank()) { toast("Nothing to back up yet"); return }
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+            putExtra(Intent.EXTRA_TITLE, "cabineq-keys.json")
+        }
+        runCatching { startActivityForResult(intent, REQ_EXPORT_KEYS) }
+            .onFailure { toast("No file picker available") }
+    }
+
+    private fun pickKeysFile() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        runCatching { startActivityForResult(intent, REQ_RESTORE_KEYS) }
+            .onFailure { toast("No file picker available") }
+    }
+
+    private fun writeKeys(uri: android.net.Uri) {
+        val json = org.json.JSONObject()
+            .put("cabineqKeys", 1)
+            .put("addonLink", settings.addonLink)
+            .put("torboxApiKey", settings.torboxApiKey)
+        val ok = runCatching {
+            contentResolver.openOutputStream(uri, "wt")?.use { it.write(json.toString(2).toByteArray()) } != null
+        }.getOrDefault(false)
+        toast(if (ok) "Saved. It holds your TorBox key: keep it private." else "Couldn't write that file")
+    }
+
+    private fun restoreKeys(uri: android.net.Uri) {
+        val text = readImportFile(uri)
+        val json = text?.let { runCatching { org.json.JSONObject(it) }.getOrNull() }
+        if (json == null || !json.has("cabineqKeys")) { toast("That isn't a CabinEQ backup"); return }
+        json.optString("torboxApiKey").takeIf { it.isNotBlank() }?.let { settings.torboxApiKey = it }
+        val link = json.optString("addonLink")
+        val status = linkStatusView
+        if (link.isNotBlank() && status != null) saveAddon(link, status) else if (link.isNotBlank()) settings.addonLink = link
+        toast("Restored")
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode == RESULT_OK && data?.data != null) when (requestCode) {
+            REQ_EXPORT_KEYS -> { writeKeys(data.data!!); return }
+            REQ_RESTORE_KEYS -> { restoreKeys(data.data!!); return }
+        }
         if (requestCode != REQ_IMPORT_FILE || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
         val name = runCatching { uri.lastPathSegment ?: "Imported playlist" }.getOrDefault("Imported playlist")
@@ -2352,6 +2401,13 @@ class MusicActivity : Activity() {
             saveAddon(linkInput.text.toString().trim(), linkStatus)
         }.apply { (layoutParams as? ViewGroup.MarginLayoutParams)?.topMargin = dp(8) }, wrapLp(top = 8))
         page.addView(linkStatus)
+        linkStatusView = linkStatus
+        // The link and key exist only on this phone (never in a cloud backup); losing the app's
+        // data would otherwise mean finding them again.
+        val keysRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        keysRow.addView(Ui.pill(this, "Back up link & key", filled = false) { exportKeys() })
+        keysRow.addView(Ui.pill(this, "Restore", filled = false) { pickKeysFile() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
+        page.addView(keysRow, wrapLp(top = 12))
 
         // TorBox
         page.addView(sectionTitle("TorBox"))
@@ -2809,6 +2865,8 @@ class MusicActivity : Activity() {
 
         /** SAF request for the playlist file picker. */
         const val REQ_IMPORT_FILE = 4101
+        const val REQ_EXPORT_KEYS = 4102
+        const val REQ_RESTORE_KEYS = 4103
 
 
         private const val REQ_NOTIFICATIONS = 11

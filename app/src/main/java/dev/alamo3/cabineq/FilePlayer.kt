@@ -758,35 +758,27 @@ class FilePlayer private constructor(private val context: Context) {
         val mine = (from until keys.size)
             .filter { keys[it] in radioKeys && Taste.artistKey(tracks[it].artist) == artist }
             .map { keys[it] }
-        when (kind) {
-            Taste.Kind.SKIP -> {
-                if (value >= EARLY_SKIP) return
-                // Counted within two hours: a skip this morning is not a verdict for tonight.
-                val now = System.currentTimeMillis()
-                val n = earlySkips.compute(artist) { _, old ->
-                    if (old == null || now - old.second > EARLY_SKIP_MEMORY_MS) 1 to now else (old.first + 1) to now
-                }!!.first
-                if (mine.isEmpty()) return
-                if (n >= 2) {
-                    mine.forEach { removeUpcoming(it); radioKeys.remove(it) }
-                    DLog.i(TAG, "Radio: dropped ${mine.size} upcoming by ${track.artist} after $n early skips")
-                } else {
-                    mine.forEach { moveUpcoming(it, Int.MAX_VALUE) }
-                    DLog.i(TAG, "Radio: moved ${mine.size} upcoming by ${track.artist} back after an early skip")
-                }
+        val skips = if (kind == Taste.Kind.SKIP && value < RadioRevision.EARLY_SKIP) {
+            earlySkips.compute(artist) { _, old -> RadioRevision.countSkip(old, System.currentTimeMillis()) }!!.first
+        } else {
+            if (kind == Taste.Kind.LIKE || kind == Taste.Kind.COMPLETE) earlySkips.remove(artist)
+            0
+        }
+        when (val action = RadioRevision.plan(kind, value, mine, skips)) {
+            is RadioRevision.Action.None -> return
+            is RadioRevision.Action.Drop -> {
+                action.keys.forEach { removeUpcoming(it); radioKeys.remove(it) }
+                DLog.i(TAG, "Radio: dropped ${action.keys.size} upcoming by ${track.artist} after " +
+                    if (kind == Taste.Kind.DISLIKE) "a dislike" else "$skips early skips")
             }
-            Taste.Kind.DISLIKE -> {
-                if (mine.isEmpty()) return
-                mine.forEach { removeUpcoming(it); radioKeys.remove(it) }
-                DLog.i(TAG, "Radio: dropped ${mine.size} upcoming by ${track.artist} after a dislike")
+            is RadioRevision.Action.MoveBack -> {
+                action.keys.forEach { moveUpcoming(it, Int.MAX_VALUE) }
+                DLog.i(TAG, "Radio: moved ${action.keys.size} upcoming by ${track.artist} back after an early skip")
             }
-            Taste.Kind.LIKE, Taste.Kind.COMPLETE -> {
-                earlySkips.remove(artist)
-                val first = mine.firstOrNull() ?: return
-                moveUpcoming(first, currentIndex + 1 + RADIO_KEEP)
-                DLog.i(TAG, "Radio: brought \"${tracks[keys.indexOf(first)].title}\" forward after a ${kind.name.lowercase()}")
+            is RadioRevision.Action.BringForward -> {
+                moveUpcoming(action.key, currentIndex + 1 + RADIO_KEEP)
+                DLog.i(TAG, "Radio: brought \"${tracks[keys.indexOf(action.key)].title}\" forward after a ${kind.name.lowercase()}")
             }
-            else -> return
         }
         extendRadioIfNeeded()     // refill what was removed
     }
@@ -1978,8 +1970,6 @@ class FilePlayer private constructor(private val context: Context) {
         /** Upcoming songs the radio never revises: their audio is already being prepared. */
         private const val RADIO_KEEP = 3
         /** A skip before this share of the song counts as "not this". */
-        private const val EARLY_SKIP = 0.25f
-        private const val EARLY_SKIP_MEMORY_MS = 2 * 3600_000L
         private const val ERROR_SHOWN_MS = 20_000L
         /** Ramp-in length at every (re)start; long enough to hide a step, short enough to forget. */
         private const val FADE_IN_MS = 15

@@ -69,25 +69,25 @@
     },
     "diag": {
       "$id": {
-        ".validate": "$id.length >= 16 && $id.length <= 64",
+        ".validate": "$id.length >= 16 && $id.length <= 64 && $id.matches(/^[A-Za-z0-9_-]+$/)",
         ".read": true,
         "meta": {
           ".write": true,
-          ".validate": "!newData.exists() || newData.hasChildren(['version', 'updatedAt'])",
+          ".validate": "!newData.exists() || (newData.hasChildren(['version', 'updatedAt']) && newData.child('updatedAt').isNumber() && newData.child('updatedAt').val() <= now + 300000)",
           "$f": {
-            ".validate": "$f.length <= 20 && ((newData.isString() && newData.val().length <= 100) || newData.isNumber() || newData.isBoolean())"
+            ".validate": "$f.matches(/^(version|device|android|engine|endless|progressive|floatDecoding|updatedAt)$/) && ((newData.isString() && newData.val().length <= 100) || newData.isNumber() || newData.isBoolean())"
           }
         },
         "events": {
           ".write": "!newData.exists()",
           "$e": {
             ".write": "!data.exists() || !newData.exists()",
-            ".validate": "!newData.exists() || ($e.length <= 20 && newData.hasChildren(['at', 'l', 't', 'm']))",
+            ".validate": "!newData.exists() || ($e.matches(/^[0-9]{13}-[0-9]{3}$/) && newData.hasChildren(['at', 'l', 't', 'm']))",
             "at": {
-              ".validate": "newData.isNumber()"
+              ".validate": "newData.isNumber() && newData.val() <= now + 300000 && newData.val() >= now - 1209600000"
             },
             "l": {
-              ".validate": "newData.isString() && newData.val().length <= 1"
+              ".validate": "newData.isString() && newData.val().matches(/^[DIWE]$/)"
             },
             "t": {
               ".validate": "newData.isString() && newData.val().length <= 40"
