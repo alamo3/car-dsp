@@ -19,3 +19,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "CabinEQ"
 include(":app")
+include(":companion")

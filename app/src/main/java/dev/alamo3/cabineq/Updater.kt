@@ -64,7 +64,8 @@ object Updater {
             val assets = json.getJSONArray("assets")
             for (i in 0 until assets.length()) {
                 val a = assets.getJSONObject(i)
-                if (a.getString("name").endsWith(".apk")) {
+                // The release also carries the YouTube companion's APK: not CabinEQ's update.
+                if (a.getString("name").endsWith(".apk") && !a.getString("name").contains("youtube")) {
                     return Release(tag, code, a.getString("browser_download_url"), a.optLong("size", -1))
                 }
             }

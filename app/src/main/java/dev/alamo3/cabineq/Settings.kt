@@ -221,6 +221,14 @@ class Settings(context: Context) {
         get() = prefs.getString("diagnostics_id", "") ?: ""
         set(v) = prefs.edit().putString("diagnostics_id", v).apply()
 
+    /**
+     * YouTube through the companion app: off, only when Nebula can't play a song (the default), or
+     * first, with Nebula as the fallback. Has no effect while the companion isn't installed.
+     */
+    var youtubeSource: Int
+        get() = prefs.getInt("youtube_source", YOUTUBE_FALLBACK)
+        set(v) = prefs.edit().putInt("youtube_source", v).apply()
+
     var endlessPlayback: Boolean
         get() = prefs.getBoolean("endless_playback", true)
         set(v) = prefs.edit().putBoolean("endless_playback", v).apply()
@@ -397,6 +405,9 @@ class Settings(context: Context) {
     }
 
     companion object {
+        const val YOUTUBE_OFF = 0
+        const val YOUTUBE_FALLBACK = 1
+        const val YOUTUBE_FIRST = 2
         const val PREFS_NAME = "cabin_eq"
         /** Excluded from backup in res/xml/backup_rules.xml and data_extraction_rules.xml. */
         const val SECRETS_NAME = "cabin_eq_secrets"

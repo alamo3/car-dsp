@@ -28,7 +28,7 @@ jobs:
 
       # Before any APK exists: a broken matcher, ranker or API client stops the release.
       - name: Unit tests
-        run: ./gradlew --no-daemon testDebugUnitTest
+        run: ./gradlew --no-daemon :app:testDebugUnitTest
 
       - name: Decode signing key
         if: env.HAS_SIGNING == 'true'
@@ -47,6 +47,7 @@ jobs:
             -PcabinVersionCode=$VERSION_CODE -PcabinVersionName=$VERSION_NAME
           mkdir -p out
           cp app/build/outputs/apk/release/app-release.apk "out/cabineq-v$VERSION_NAME.apk"
+          cp companion/build/outputs/apk/release/companion-release.apk "out/cabineq-youtube-v$VERSION_NAME.apk"
 
       # Google Play takes an app bundle, not an APK. Same key: it becomes the Play upload key.
       - name: Build signed release bundle (Google Play)
@@ -54,7 +55,7 @@ jobs:
         env:
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
         run: |
-          ./gradlew --no-daemon bundleRelease \
+          ./gradlew --no-daemon :app:bundleRelease \
             -PcabinVersionCode=$VERSION_CODE -PcabinVersionName=$VERSION_NAME
           cp app/build/outputs/bundle/release/app-release.aab "out/cabineq-v$VERSION_NAME.aab"
 
@@ -85,13 +86,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v$VERSION_NAME" out/cabineq-v$VERSION_NAME.apk \
+          gh release create "v$VERSION_NAME" out/cabineq-v$VERSION_NAME.apk out/cabineq-youtube-v$VERSION_NAME.apk \
             --target "$GITHUB_SHA" \
             --title "CabinEQ $VERSION_NAME" \
             --generate-notes
 
       - name: Lint
-        run: ./gradlew --no-daemon lintDebug
+        run: ./gradlew --no-daemon :app:lintDebug
 
       # Pushes to main also go to Google Play's internal testing track, so the phone and the car
       # get the same build through the store. Needs the PLAY_SERVICE_ACCOUNT_JSON secret; without

@@ -2365,6 +2365,25 @@ class MusicActivity : Activity() {
             "Media3 engine only. Off: songs are decoded to 16-bit, as the built-in engine does. On: decoders are asked for 32-bit float, so 24-bit files keep their full precision through the EQ. " +
                 "Experimental: if songs turn to noise with it on, this phone's decoders don't honour the request, so turn it off. Applies after the app is restarted.",
             12f, Ui.TEXT_2, lines = 6).apply { setPadding(0, dp(8), 0, dp(12)) })
+        val ytInstalled = YouTubeCompanion.installed(this)
+        val ytMode = when (settings.youtubeSource) {
+            Settings.YOUTUBE_OFF -> "off"
+            Settings.YOUTUBE_FIRST -> "first, Nebula as fallback"
+            else -> "when Nebula can't play a song"
+        }
+        page.addView(Ui.pill(this, "YouTube: $ytMode", filled = false) {
+            settings.youtubeSource = when (settings.youtubeSource) {
+                Settings.YOUTUBE_FALLBACK -> Settings.YOUTUBE_FIRST
+                Settings.YOUTUBE_FIRST -> Settings.YOUTUBE_OFF
+                else -> Settings.YOUTUBE_FALLBACK
+            }
+            renderSettings()
+        }, wrapLp(top = 4))
+        page.addView(Ui.text(this,
+            if (ytInstalled) "The CabinEQ YouTube companion is installed. It finds songs on YouTube (official audio first) " +
+                "and plays them through the same DSP. Fallback: used when Nebula has no copy, doesn't answer, or TorBox is still caching."
+            else "Install the CabinEQ YouTube companion (cabineq-youtube APK on the GitHub releases page) to play songs from YouTube.",
+            12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, dp(12)) })
         page.addView(Ui.pill(this, "Endless playback: ${if (settings.endlessPlayback) "on" else "off"}", filled = false) {
             settings.endlessPlayback = !settings.endlessPlayback
             renderSettings()

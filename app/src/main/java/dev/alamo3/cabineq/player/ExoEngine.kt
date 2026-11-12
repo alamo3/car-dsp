@@ -135,7 +135,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
 
     // ---- shared with the loader threads ----------------------------------------------------
     private val tracksByKey = ConcurrentHashMap<String, Track>()
-    private class Link(val url: String, val quality: String?, val at: Long)
+    private class Link(val url: String, val quality: String?, val at: Long, val headers: Map<String, String> = emptyMap())
     private val links = ConcurrentHashMap<String, Link>()
     /** Songs moved aside while TorBox caches them (queue key → when). */
     private val deferred = ConcurrentHashMap<String, Long>()
@@ -907,7 +907,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             if (tickAt - quietWaitSince > QUIET_WAIT_MS) {
                 owner.setNote(
                     if (!MediaCache.isOnline(context)) "No connection — waiting for it"
-                    else if (links[currentKey ?: ""] != null) "Downloading from TorBox — slow connection"
+                    else if (links[currentKey ?: ""] != null) "Downloading — slow connection"
                     else "Waiting on Nebula…"
                 )
             }
@@ -974,8 +974,8 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                 }
             }
             val got = resolved!!
-            note("Connecting to TorBox…")
-            Link(got.url, got.quality, SystemClock.elapsedRealtime()).also {
+            note("Connecting to ${got.via}…")
+            Link(got.url, got.quality, SystemClock.elapsedRealtime(), got.headers).also {
                 links[key] = it
                 DLog.i(TAG, "link for \"${track.title}\" in ${it.at - asked} ms")
             }
@@ -991,7 +991,8 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             throw IOException(SourceTrouble.of(e).describe(e), e)
         }
         link.quality?.let { q -> main.post { if (currentTrack() === track) bridge.quality(q) } }
-        return spec.withUri(Uri.parse(link.url))
+        val out = spec.withUri(Uri.parse(link.url))
+        return if (link.headers.isEmpty()) out else out.withAdditionalHeaders(link.headers)
     }
 
     /** Local files straight from disk; everything else through the cache and the resolver. */
@@ -1088,7 +1089,8 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                     .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
                     .createDataSource()
                 // The same key the player reads under (see [item]), so what this stores is what it plays.
-                val spec = DataSpec.Builder().setUri(Uri.parse(link.url)).setKey("song:" + track.mediaId).build()
+                val spec = DataSpec.Builder().setUri(Uri.parse(link.url)).setKey("song:" + track.mediaId)
+                    .setHttpRequestHeaders(link.headers).build()
                 val writer = CacheWriter(source, spec, null, null)
                 writers[key] = writer
                 val started = SystemClock.elapsedRealtime()
@@ -1145,7 +1147,7 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         checkPool.execute {
             try {
                 val resolved = TrackResolver.resolve(context, track, { }, { false }, 20_000L, waitIfPending = false)
-                links[key] = Link(resolved.url, resolved.quality, SystemClock.elapsedRealtime())
+                links[key] = Link(resolved.url, resolved.quality, SystemClock.elapsedRealtime(), resolved.headers)
                 if (bringBack) main.post { bringForward(key, track) } else main.post { prefetchIfNear(key, track) }
             } catch (e: AddonNotReady) {
                 if (!bringBack) main.post { setAside(key, track) }

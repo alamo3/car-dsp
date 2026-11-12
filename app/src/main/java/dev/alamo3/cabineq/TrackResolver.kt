@@ -28,14 +28,21 @@ object TrackResolver {
     private val foundOnAddon = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** A playable URL plus what the source claims it is (the addon tells us; TorBox doesn't). */
-    class Resolved(val url: String, val quality: String? = null)
+    class Resolved(
+        val url: String,
+        val quality: String? = null,
+        /** Request headers the link needs (YouTube's links come with some). */
+        val headers: Map<String, String> = emptyMap(),
+        /** Where it came from, for what the player says while connecting. */
+        val via: String = "TorBox",
+    )
 
     // Links already asked for, by song. TorBox documents its download links as valid for 3 hours
     // (reports from the field say some die sooner, around half an hour), so a link is reused for
     // ten minutes: long enough that a song looked up ahead of its turn starts without the ~1 s
     // look-up, short enough to be well inside either figure. A link that is refused anyway is
     // dropped by [forget] and fetched again.
-    private class Cached(val url: String, val quality: String?, val at: Long)
+    private class Cached(val url: String, val quality: String?, val at: Long, val headers: Map<String, String> = emptyMap(), val via: String = "TorBox")
     private val linkCache = ConcurrentHashMap<String, Cached>()
     private const val LINK_TTL_MS = 10 * 60_000L
     private val warmPool = Executors.newFixedThreadPool(2) { r ->
@@ -79,23 +86,35 @@ object TrackResolver {
         return when (track.source) {
             Track.Source.ADDON -> {
                 val link = settings.addonLink
-                if (link.isBlank()) throw IllegalStateException("Connect Nebula in Settings to play this")
-                cachedLink(track)?.let { return Resolved(it.url, it.quality) }
-                // A discovered song (Discover) is only a title and artist until now: find the
-                // same recording on the addon right before it plays.
-                val id = track.sourceId
-                    ?: foundOnAddon[track.mediaId]
-                    ?: dev.alamo3.cabineq.music.AddonMatch.find(EclipseAddon(link), track)?.id
-                        ?.also { foundOnAddon[track.mediaId] = it }
-                    ?: throw IllegalStateException("Couldn't find “${track.title}” on Nebula")
-                EclipseAddon(link).resolveStream(
-                    trackId = id,
-                    maxWaitMs = maxWaitMs,
-                    isCancelled = isCancelled,
-                    onNotice = { onNote(describe(it)) },
-                    waitIfPending = waitIfPending,
-                ).let { Resolved(it.url, it.quality) }
-                    .also { linkCache[track.mediaId] = Cached(it.url, it.quality, SystemClock.elapsedRealtime()) }
+                cachedLink(track)?.let { return Resolved(it.url, it.quality, it.headers, it.via) }
+                val youtube = YouTubeCompanion.usable(context)
+                if (link.isBlank()) {
+                    // No Nebula: YouTube alone, when the companion is there.
+                    if (youtube) fromYouTube(context, track, onNote)?.let { return it }
+                    throw IllegalStateException("Connect Nebula in Settings to play this")
+                }
+                // YouTube first, when chosen: Nebula only if YouTube has nothing.
+                if (youtube && settings.youtubeSource == Settings.YOUTUBE_FIRST) {
+                    fromYouTube(context, track, onNote)?.let { return it }
+                }
+                if (youtube) {
+                    // YouTube as the fallback: never wait on TorBox caching when YouTube can play
+                    // it now, and use it whenever Nebula has no copy or does not answer.
+                    try {
+                        return fromNebula(context, link, track, onNote, isCancelled, maxWaitMs, waitIfPending = false)
+                    } catch (e: Exception) {
+                        if (e is InterruptedException || isCancelled()) throw e
+                        val trouble = dev.alamo3.cabineq.player.SourceTrouble.of(e)
+                        DLog.i("CabinEQ/Resolve", "\"${track.title}\": Nebula ${trouble.describe(e)}; trying YouTube")
+                        fromYouTube(context, track, onNote)?.let { return it }
+                        // YouTube has nothing either: back to Nebula's own way (wait if caching).
+                        if (e is dev.alamo3.cabineq.addon.AddonNotReady && waitIfPending) {
+                            return fromNebula(context, link, track, onNote, isCancelled, maxWaitMs, waitIfPending = true)
+                        }
+                        throw e
+                    }
+                }
+                fromNebula(context, link, track, onNote, isCancelled, maxWaitMs, waitIfPending)
             }
             Track.Source.TORBOX -> {
                 if (track.torrentId == 0 || track.fileId == 0) {
@@ -106,6 +125,45 @@ object TrackResolver {
                 Resolved(TorBoxClient(key).requestDownloadUrl(track.torrentId, track.fileId))
             }
         }
+    }
+
+    /** YouTube through the companion; null when it has no suitable recording or fails. */
+    private fun fromYouTube(context: Context, track: Track, onNote: (String?) -> Unit): Resolved? {
+        onNote("Finding it on YouTube…")
+        return try {
+            val l = YouTubeCompanion.resolve(context, track)
+            Resolved(l.url, l.quality, l.headers, via = "YouTube")
+                .also { linkCache[track.mediaId] = Cached(it.url, it.quality, SystemClock.elapsedRealtime(), it.headers, it.via) }
+        } catch (e: Exception) {
+            DLog.i("CabinEQ/Resolve", "\"${track.title}\": YouTube ${e.message}")
+            null
+        }
+    }
+
+    private fun fromNebula(
+        context: Context,
+        link: String,
+        track: Track,
+        onNote: (String?) -> Unit,
+        isCancelled: () -> Boolean,
+        maxWaitMs: Long,
+        waitIfPending: Boolean,
+    ): Resolved {
+        // A discovered song (Discover) is only a title and artist until now: find the
+        // same recording on the addon right before it plays.
+        val id = track.sourceId
+            ?: foundOnAddon[track.mediaId]
+            ?: dev.alamo3.cabineq.music.AddonMatch.find(EclipseAddon(link), track)?.id
+                ?.also { foundOnAddon[track.mediaId] = it }
+            ?: throw IllegalStateException("Couldn't find “${track.title}” on Nebula")
+        EclipseAddon(link).resolveStream(
+            trackId = id,
+            maxWaitMs = maxWaitMs,
+            isCancelled = isCancelled,
+            onNotice = { onNote(describe(it)) },
+            waitIfPending = waitIfPending,
+        ).let { Resolved(it.url, it.quality) }
+            .also { linkCache[track.mediaId] = Cached(it.url, it.quality, SystemClock.elapsedRealtime()) }
     }
 
     /** e.g. "TorBox: caching this track (42%)" */
