@@ -156,7 +156,7 @@ object TrackResolver {
             ?: dev.alamo3.cabineq.music.AddonMatch.find(EclipseAddon(link), track)?.id
                 ?.also { foundOnAddon[track.mediaId] = it }
             ?: throw IllegalStateException("Couldn't find “${track.title}” on Nebula")
-        EclipseAddon(link).resolveStream(
+        return EclipseAddon(link).resolveStream(
             trackId = id,
             maxWaitMs = maxWaitMs,
             isCancelled = isCancelled,
