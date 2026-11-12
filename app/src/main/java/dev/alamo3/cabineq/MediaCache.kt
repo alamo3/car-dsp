@@ -45,7 +45,7 @@ object MediaCache {
      * or null when it has to be streamed.
      */
     fun fileFor(context: Context, track: Track): File? =
-        Downloads.fileFor(context, track) ?: cacheFileFor(context, track)
+        Downloads.fileFor(context, track) ?: Upgrades.fileFor(context, track) ?: cacheFileFor(context, track)
 
     /** The prefetched copy only (what this cache owns and may evict). */
     fun cacheFileFor(context: Context, track: Track): File? {

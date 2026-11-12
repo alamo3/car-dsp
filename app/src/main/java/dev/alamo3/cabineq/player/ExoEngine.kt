@@ -979,6 +979,8 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             }
             val got = resolved!!
             note("Connecting to ${got.via}…")
+            // Played from YouTube: look for a better copy on Nebula for next time (Wi-Fi only).
+            if (got.via == "YouTube") runCatching { dev.alamo3.cabineq.Upgrades.consider(context, track) }
             Link(got.url, got.quality, SystemClock.elapsedRealtime(), got.headers, got.via).also {
                 links[key] = it
                 DLog.i(TAG, "link for \"${track.title}\" in ${it.at - asked} ms")

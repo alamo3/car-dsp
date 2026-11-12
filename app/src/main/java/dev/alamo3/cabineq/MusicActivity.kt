@@ -168,6 +168,7 @@ class MusicActivity : Activity() {
         handleInstallStatus(intent)
         // A download interrupted by the app closing carries on from where it stopped.
         runCatching { Downloads.resume(this) }
+        runCatching { Upgrades.resume(this) }
         // Copies installed from Google Play get their updates there; others check GitHub quietly.
         if (!Updater.installedFromPlay(this)) checkForUpdate(userInitiated = false)
     }
@@ -2411,6 +2412,39 @@ class MusicActivity : Activity() {
             "Media3 engine only. Off: songs are decoded to 16-bit, as the built-in engine does. On: decoders are asked for 32-bit float, so 24-bit files keep their full precision through the EQ. " +
                 "Experimental: if songs turn to noise with it on, this phone's decoders don't honour the request, so turn it off. Applies after the app is restarted.",
             12f, Ui.TEXT_2, lines = 6).apply { setPadding(0, dp(8), 0, dp(12)) })
+        page.addView(Ui.pill(this, "Upgrade YouTube songs: ${if (settings.upgradeEnabled) "on" else "off"}", filled = false) {
+            settings.upgradeEnabled = !settings.upgradeEnabled
+            renderSettings()
+        }, wrapLp(top = 4))
+        if (settings.upgradeEnabled) {
+            page.addView(Ui.pill(this, "Upgrade space: ${settings.upgradeCapGb} GB", filled = false) {
+                val input = android.widget.EditText(this).apply {
+                    inputType = android.text.InputType.TYPE_CLASS_NUMBER
+                    setText(settings.upgradeCapGb.toString())
+                    setSelection(text.length)
+                }
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("Space for upgraded songs (GB)")
+                    .setMessage("At least ${Settings.MIN_UPGRADE_GB} GB. When it's full, the songs played least recently are removed first.")
+                    .setView(input)
+                    .setPositiveButton("Save") { _, _ ->
+                        input.text.toString().toIntOrNull()?.let { settings.upgradeCapGb = it }
+                        renderSettings()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }, wrapLp(top = 4))
+            val used = Upgrades.usedBytes(this)
+            page.addView(Ui.pill(this, "Clear upgraded songs (${Upgrades.count(this)}, ${"%.1f".format(used / 1e9)} GB)", filled = false) {
+                Upgrades.clear(this)
+                renderSettings()
+            }, wrapLp(top = 4))
+        }
+        page.addView(Ui.text(this,
+            "A song that plays from YouTube starts fast; on Wi-Fi the app then looks for the same recording in lossless " +
+                "quality on Nebula and keeps it, so the next time it plays in better quality, instantly and offline. " +
+                "Never switched mid-song.",
+            12f, Ui.TEXT_2, lines = 5).apply { setPadding(0, dp(8), 0, dp(12)) })
         val ytInstalled = YouTubeCompanion.installed(this)
         val ytMode = when (settings.youtubeSource) {
             Settings.YOUTUBE_OFF -> "off"

@@ -229,6 +229,16 @@ class Settings(context: Context) {
         get() = prefs.getInt("youtube_source", YOUTUBE_FALLBACK)
         set(v) = prefs.edit().putInt("youtube_source", v).apply()
 
+    /** Look for a better (lossless) copy on Nebula of songs that played from YouTube. */
+    var upgradeEnabled: Boolean
+        get() = prefs.getBoolean("upgrade_enabled", true)
+        set(v) = prefs.edit().putBoolean("upgrade_enabled", v).apply()
+
+    /** Space for upgraded songs, in GB: 5 at least, no upper limit. */
+    var upgradeCapGb: Int
+        get() = prefs.getInt("upgrade_cap_gb", MIN_UPGRADE_GB).coerceAtLeast(MIN_UPGRADE_GB)
+        set(v) = prefs.edit().putInt("upgrade_cap_gb", v.coerceAtLeast(MIN_UPGRADE_GB)).apply()
+
     var endlessPlayback: Boolean
         get() = prefs.getBoolean("endless_playback", true)
         set(v) = prefs.edit().putBoolean("endless_playback", v).apply()
@@ -405,6 +415,7 @@ class Settings(context: Context) {
     }
 
     companion object {
+        const val MIN_UPGRADE_GB = 5
         const val YOUTUBE_OFF = 0
         const val YOUTUBE_FALLBACK = 1
         const val YOUTUBE_FIRST = 2
