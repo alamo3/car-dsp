@@ -599,6 +599,13 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
             if (linkRetries < 1 && currentIsRemote(p) && wasLinkRefused(error)) {
                 linkRetries++
                 DLog.i(TAG, "\"$title\": its link was refused (expired?): asking for a fresh one")
+                // Forget the refused link everywhere, or the retry is handed the same one again
+                // (YouTube links are kept for hours, and they die early when the phone's network
+                // changes from Wi-Fi to mobile data).
+                currentKey?.let { k ->
+                    links.remove(k)
+                    tracksByKey[k]?.let { TrackResolver.forget(it) }
+                }
                 p.prepare()
                 return
             }
@@ -607,6 +614,9 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                 onConnectionLost(p, title)
                 return
             }
+            // A YouTube pick that will not play may be the wrong video: let the companion search
+            // again next time instead of returning the same one.
+            currentKey?.let { k -> if (links[k]?.via == "YouTube") tracksByKey[k]?.let { dev.alamo3.cabineq.YouTubeCompanion.forget(context, it) } }
             bridge.error("$title: $why")
             failures++
             if (failures >= MAX_FAILURES || !p.hasNextMediaItem()) {

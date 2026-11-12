@@ -98,7 +98,9 @@ object Yt {
                 ?: run { awaitReady(); search(title, artist, durationSec) }
                 ?: ""
             chosen[key] = id
-            save(context)
+            // "Nothing found" is remembered only until the companion restarts: YouTube gets new
+            // uploads, and a search that failed for a network reason must not stick for good.
+            if (id.isNotEmpty()) save(context)
         }
         awaitReady()
         if (id.isEmpty()) throw NotFound("No matching song on YouTube")
@@ -113,7 +115,7 @@ object Yt {
 
     private fun save(context: Context) {
         val o = JSONObject()
-        chosen.entries.toList().takeLast(5000).forEach { (k, v) -> o.put(k, v) }
+        chosen.entries.filter { it.value.isNotEmpty() }.takeLast(5000).forEach { (k, v) -> o.put(k, v) }
         context.getSharedPreferences("yt", Context.MODE_PRIVATE).edit().putString("chosen", o.toString()).apply()
     }
 

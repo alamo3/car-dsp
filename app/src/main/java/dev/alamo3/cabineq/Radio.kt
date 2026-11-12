@@ -459,16 +459,18 @@ object Radio {
 
     private fun poolFor(context: Context, artist: String): List<Candidate>? {
         loadCache(context)
+        val k = artist.lowercase()
         synchronized(buildLock) {
-            val now = SystemClock.elapsedRealtime()
-            pools[artist.lowercase()]?.let { if (now - it.at < CACHE_TTL_MS) return it.candidates }
-            val started = now
-            val built = buildPool(context, artist) ?: return null
-            pools[artist.lowercase()] = Pool(artist, now, built)
-            DLog.i(TAG, "pool for $artist built in ${SystemClock.elapsedRealtime() - started} ms")
-            saveCache(context)
-            return built
+            pools[k]?.let { if (SystemClock.elapsedRealtime() - it.at < CACHE_TTL_MS) return it.candidates }
         }
+        // Built outside the lock: a build is a few seconds of network, and the lock also guards
+        // reads and saves that must not wait behind it (a radio pick, the background matcher).
+        val started = SystemClock.elapsedRealtime()
+        val built = buildPool(context, artist) ?: return null
+        synchronized(buildLock) { pools[k] = Pool(artist, started, built) }
+        DLog.i(TAG, "pool for $artist built in ${SystemClock.elapsedRealtime() - started} ms")
+        saveCache(context)
+        return built
     }
 
     /**
