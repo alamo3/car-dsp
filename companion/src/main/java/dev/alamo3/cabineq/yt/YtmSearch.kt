@@ -19,8 +19,9 @@ object YtmSearch {
     private const val TAG = "CabinEQYt/Ytm"
     private const val URL_SEARCH = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
     private const val CLIENT_VERSION = "1.20251101.01.00"
-    /** "Songs" filter, as the website sends it. */
-    private const val SONGS = "EgWKAQIIAWoMEA4QChADEAQQCRAF"
+    /** Filters, as the website sends them: official songs, and videos (remixes, live, uploads). */
+    const val SONGS = "EgWKAQIIAWoMEA4QChADEAQQCRAF"
+    const val VIDEOS = "EgWKAQIQAWoMEA4QChADEAQQCRAF"
 
     data class Song(
         val videoId: String,
@@ -29,9 +30,11 @@ object YtmSearch {
         val album: String?,
         val durationSec: Int?,
         val thumbnail: String?,
+        /** Listed by YouTube Music as a song (official audio), not a video upload. */
+        val isSong: Boolean = true,
     )
 
-    fun search(query: String, limit: Int = 20): List<Song> {
+    fun search(query: String, limit: Int = 20, filter: String = SONGS): List<Song> {
         val body = JSONObject()
             .put("context", JSONObject().put("client", JSONObject()
                 .put("clientName", "WEB_REMIX")
@@ -39,7 +42,7 @@ object YtmSearch {
                 .put("hl", "en")
                 .put("gl", "US")))
             .put("query", query)
-            .put("params", SONGS)
+            .put("params", filter)
         val conn = (URL(URL_SEARCH).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 8_000
@@ -60,7 +63,7 @@ object YtmSearch {
             }
             val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
             val out = ArrayList<Song>()
-            collect(json) { item -> parse(item)?.let { if (out.none { s -> s.videoId == it.videoId }) out += it } }
+            collect(json) { item -> parse(item, filter == SONGS)?.let { if (out.none { s -> s.videoId == it.videoId }) out += it } }
             return out.take(limit)
         } finally {
             conn.disconnect()
@@ -78,7 +81,7 @@ object YtmSearch {
         }
     }
 
-    private fun parse(item: JSONObject): Song? {
+    private fun parse(item: JSONObject, isSong: Boolean): Song? {
         val columns = item.optJSONArray("flexColumns") ?: return null
         fun runs(i: Int): JSONArray? = columns.optJSONObject(i)
             ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")
@@ -100,7 +103,7 @@ object YtmSearch {
                 ?.optJSONObject("browseEndpointContextSupportedConfigs")
                 ?.optJSONObject("browseEndpointContextMusicConfig")?.optString("pageType").orEmpty()
             when {
-                page.endsWith("ARTIST") -> artists += text
+                page.endsWith("ARTIST") || page.endsWith("USER_CHANNEL") -> artists += text
                 page.endsWith("ALBUM") -> album = text
                 Regex("^\\d{1,2}(:\\d{2}){1,2}$").matches(text) ->
                     duration = text.split(':').fold(0) { acc, p -> acc * 60 + (p.toIntOrNull() ?: 0) }
@@ -109,12 +112,12 @@ object YtmSearch {
         // Some layouts put the artist without a link: the first plain run before a separator.
         if (artists.isEmpty() && meta != null) {
             meta.optJSONObject(0)?.optString("text")?.trim()
-                ?.takeIf { it.isNotBlank() && it != "Song" && it != "•" }?.let { artists += it }
+                ?.takeIf { it.isNotBlank() && it != "Song" && it != "Video" && it != "•" }?.let { artists += it }
         }
         val thumbs = item.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer")
             ?.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
         val thumb = thumbs?.optJSONObject(thumbs.length() - 1)?.optString("url")
             ?.replace(Regex("=w\\d+-h\\d+"), "=w544-h544")
-        return Song(videoId, title, artists.joinToString(", ").ifBlank { "Unknown artist" }, album, duration, thumb)
+        return Song(videoId, title, artists.joinToString(", ").ifBlank { "Unknown artist" }, album, duration, thumb, isSong)
     }
 }

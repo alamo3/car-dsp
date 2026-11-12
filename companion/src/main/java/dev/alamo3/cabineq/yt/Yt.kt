@@ -22,6 +22,7 @@ import kotlin.math.abs
  */
 object Yt {
     private const val TAG = "CabinEQYt/Yt"
+    private const val CHOSEN_VERSION = 2
 
     class Result(
         val url: String,
@@ -55,6 +56,10 @@ object Yt {
             ready.countDown()
         }
         val prefs = context.getSharedPreferences("yt", Context.MODE_PRIVATE)
+        // Picks made by an older matcher may be wrong (v2 requires the whole title): start over.
+        if (prefs.getInt("chosenVersion", 1) != CHOSEN_VERSION) {
+            prefs.edit().remove("chosen").putInt("chosenVersion", CHOSEN_VERSION).apply()
+        }
         prefs.getString("chosen", null)?.let { s ->
             runCatching { val o = JSONObject(s); o.keys().forEach { k -> chosen[k] = o.getString(k) } }
         }
@@ -114,20 +119,56 @@ object Yt {
 
     // ---------------------------------------------------------------- search
 
-    /** Songs for the search screen, straight from YouTube Music. */
-    fun searchSongs(query: String, limit: Int): List<YtmSearch.Song> = YtmSearch.search(query, limit)
+    /**
+     * YouTube Music's songs AND videos for [query], ranked by how much of the query they contain.
+     * Songs alone miss remixes, bootlegs and uploads that only exist as videos ("clarity
+     * vicetone" is a video), and the songs list happily fills up with anything titled "Clarity".
+     */
+    fun searchAll(query: String, limit: Int): List<YtmSearch.Song> {
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(2)
+        try {
+            val songs = pool.submit<List<YtmSearch.Song>> { runCatching { YtmSearch.search(query, 20, YtmSearch.SONGS) }.getOrDefault(emptyList()) }
+            val videos = pool.submit<List<YtmSearch.Song>> { runCatching { YtmSearch.search(query, 20, YtmSearch.VIDEOS) }.getOrDefault(emptyList()) }
+            val all = (songs.get(12, TimeUnit.SECONDS) + videos.get(12, TimeUnit.SECONDS)).distinctBy { it.videoId }
+            val words = norm(query).split(' ').filter { it.length > 1 }.distinct()
+            fun coverage(s: YtmSearch.Song): Double {
+                if (words.isEmpty()) return 0.0
+                val hay = norm(s.title + " " + s.artist)
+                return words.count { it in hay }.toDouble() / words.size
+            }
+            // Most of the query first; among equals an official song before a video, then YouTube's order.
+            return all.withIndex()
+                .sortedWith(compareByDescending<IndexedValue<YtmSearch.Song>> { coverage(it.value) }
+                    .thenByDescending { if (it.value.isSong) 1 else 0 }
+                    .thenBy { it.index })
+                .map { it.value }
+                .filter { coverage(it) > 0.0 }
+                .take(limit)
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    /** Songs for the search screen. */
+    fun searchSongs(query: String, limit: Int): List<YtmSearch.Song> = searchAll(query, limit)
 
     private fun musicSearch(title: String, artist: String?, durationSec: Int?): String? {
         val query = listOfNotNull(artist?.split(',')?.first()?.trim(), title).joinToString(" ")
-        val songs = YtmSearch.search(query, 10)
-        if (songs.isEmpty()) return null
+        val candidates = searchAll(query, 20)
+        if (candidates.isEmpty()) return null
+        val wanted = norm(title).split(' ').filter { it.length > 1 }
         var best: Pair<String, Double>? = null
-        for (s in songs) {
-            // Listed as a song by YouTube Music: official audio, so it starts with the Topic lift.
-            val sc = score(title, artist, durationSec, s.title, s.artist + " topic", s.durationSec)
-            Log.i(TAG, "music candidate ${s.title} / ${s.artist} -> ${"%.1f".format(sc)}")
+        for (s in candidates) {
+            // Every word of the title must be there: "Clarity (Vicetone Remix)" is not "Clarity".
+            val t = norm(s.title)
+            if (wanted.any { it !in t }) continue
+            // A song listed by YouTube Music is official audio: the Topic lift. Videos get none.
+            val channel = if (s.isSong) s.artist + " topic" else s.artist
+            val sc = score(title, artist, durationSec, s.title, channel, s.durationSec)
+            Log.i(TAG, "music candidate ${s.title} / ${s.artist} (${if (s.isSong) "song" else "video"}) -> ${"%.1f".format(sc)}")
             if (best == null || sc > best.second) best = s.videoId to sc
         }
+        // Nothing with the whole title: let yt-dlp's plain YouTube search have a go.
         return best?.takeIf { it.second >= 1.0 }?.first
     }
 
