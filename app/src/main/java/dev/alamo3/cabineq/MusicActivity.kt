@@ -1971,8 +1971,16 @@ class MusicActivity : Activity() {
         stack.addLast { renderSearchLoading(query) }
         searchPageOnTop = true
         renderSearchLoading(query)
-        background(id, { dev.alamo3.cabineq.music.SmartSearch.search(applicationContext, a, query, typing = fromTyping) }) { r ->
-            val render = { renderSearch(a, query, r) }
+        val app = applicationContext
+        background(id, {
+            // YouTube Music alongside Nebula, at the same time: whichever has the song shows it.
+            val yt = if (YouTubeCompanion.usable(app)) {
+                java.util.concurrent.CompletableFuture.supplyAsync { YouTubeCompanion.search(app, query) }
+            } else null
+            val nebula = dev.alamo3.cabineq.music.SmartSearch.search(app, a, query, typing = fromTyping)
+            nebula to (runCatching { yt?.get(9, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull().orEmpty())
+        }) { (r, yt) ->
+            val render = { renderSearch(a, query, r, yt) }
             stack.removeLast()
             stack.addLast(render)
             searchPageOnTop = true
@@ -1980,10 +1988,15 @@ class MusicActivity : Activity() {
         }
     }
 
-    private fun renderSearch(a: EclipseAddon, query: String, found: dev.alamo3.cabineq.music.SmartSearch.Result) {
+    private fun renderSearch(
+        a: EclipseAddon,
+        query: String,
+        found: dev.alamo3.cabineq.music.SmartSearch.Result,
+        youtube: List<YouTubeCompanion.Song> = emptyList(),
+    ) {
         clearPage()
         val r = found.results
-        if (r.tracks.isEmpty() && r.albums.isEmpty() && r.artists.isEmpty()) {
+        if (r.tracks.isEmpty() && r.albums.isEmpty() && r.artists.isEmpty() && youtube.isEmpty()) {
             page.addView(Ui.text(this, "No results for “$query”.", 15f, Ui.TEXT_2).apply { setPadding(0, dp(16), 0, 0) })
             return
         }
@@ -2039,6 +2052,7 @@ class MusicActivity : Activity() {
                 albums()
             }
         }
+        youtubeSongs(query, youtube)
         if (r.playlists.isNotEmpty()) {
             page.addView(sectionTitle("Playlists"))
             page.addView(playlistCarousel(r.playlists.take(MAX_ALBUMS)) { pl ->
@@ -2048,6 +2062,35 @@ class MusicActivity : Activity() {
         }
         if (lead == dev.alamo3.cabineq.music.SearchRank.Lead.ARTIST) artists(r.artists.drop(1), "Other artists")
         else artists(r.artists, "Artists")
+    }
+
+    /** YouTube Music's songs for the query (through the companion), as their own section. */
+    private fun youtubeSongs(query: String, songs: List<YouTubeCompanion.Song>) {
+        if (songs.isEmpty()) return
+        fun row(s: YouTubeCompanion.Song) = EclipseAddon.Track(
+            id = "yt:" + s.videoId,
+            title = s.title,
+            artist = s.artist,
+            album = s.album,
+            durationSec = s.durationSec.takeIf { it > 0 },
+            format = "YouTube",
+            streamUrl = null,
+            artworkUrl = s.thumbnail,
+        )
+        fun playIt(s: YouTubeCompanion.Song) {
+            settings.addRecentSearch(query)
+            val t = s.toTrack()
+            play(listOf(t), 0, "Search: $query", radio = t)
+        }
+        page.addView(sectionTitle("From YouTube", if (songs.size > 5) "See all" else null) {
+            navigate {
+                clearPage()
+                page.addView(backRow())
+                page.addView(Ui.text(this, "YouTube · $query", 24f, bold = true, lines = 2).apply { setPadding(0, dp(4), 0, dp(12)) })
+                songs.forEach { s -> page.addView(songRow(row(s), showArt = true) { playIt(s) }) }
+            }
+        })
+        songs.take(5).forEach { s -> page.addView(songRow(row(s), showArt = true) { playIt(s) }) }
     }
 
     private fun renderSongList(title: String, a: EclipseAddon, songs: List<EclipseAddon.Track>, queueTitle: String) {

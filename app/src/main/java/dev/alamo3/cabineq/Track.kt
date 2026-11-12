@@ -31,6 +31,8 @@ data class Track(
      * remaster, other sources); this is what lets history, "For you" and dedupe agree on it.
      */
     val isrc: String? = null,
+    /** A YouTube video picked from YouTube search results: played through the companion as is. */
+    val youtubeId: String? = null,
 ) {
     enum class Source { ADDON, TORBOX }
 
@@ -42,7 +44,7 @@ data class Track(
         get() = when (source) {
             // Title and artist: discovered songs have neither id nor URL, and the same title by
             // two artists must not share a cache entry.
-            Source.ADDON -> "a:" + (sourceId ?: streamUrl?.let(::stableHash) ?: stableHash("$title|${artist.orEmpty()}"))
+            Source.ADDON -> "a:" + (sourceId ?: youtubeId?.let { "yt$it" } ?: streamUrl?.let(::stableHash) ?: stableHash("$title|${artist.orEmpty()}"))
             Source.TORBOX -> "t:$torrentId:$fileId"
         }
 
@@ -60,6 +62,7 @@ data class Track(
         if (torrentId != 0) put("tid", torrentId)
         if (fileId != 0) put("fid", fileId)
         isrc?.let { put("isrc", it) }
+        youtubeId?.let { put("yt", it) }
     }
 
     companion object {
@@ -78,6 +81,7 @@ data class Track(
                 torrentId = o.optInt("tid"),
                 fileId = o.optInt("fid"),
                 isrc = o.optStringOrNull("isrc"),
+                youtubeId = o.optStringOrNull("yt"),
             )
         }
 

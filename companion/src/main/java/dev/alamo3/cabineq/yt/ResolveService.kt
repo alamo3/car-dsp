@@ -16,6 +16,9 @@ import java.util.concurrent.Executors
  *
  *  request  what=1 (resolve), data: rid, title, artist?, durationSec (0 = unknown), replyTo set
  *           what=2 (forget a wrong pick), data: title, artist?
+ *           what=3 (search), data: rid, query, limit -> results: list of {videoId, title, artist,
+ *                  album?, durationSec, thumbnail?}
+ *  A resolve may carry videoId: that exact video, no search.
  *  reply    what=1, data: rid, ok=true + url, headers (Bundle), quality, videoId, title, channel, durationSec
  *                         ok=false + error, notFound (Boolean)
  *
@@ -45,11 +48,12 @@ class ResolveService : Service() {
         val title = data.getString("title").orEmpty()
         val artist = data.getString("artist")
         if (what == 2) { Yt.forget(this, title, artist); return }
+        if (what == 3) { searchReply(data, replyTo); return }
         // The request's id, echoed so CabinEQ can match the answer to its question.
         val reply = Bundle().apply { putInt("rid", data.getInt("rid", -1)) }
         try {
             val sec = data.getInt("durationSec", 0).takeIf { it > 0 }
-            val r = Yt.resolve(this, title, artist, sec)
+            val r = Yt.resolve(this, title, artist, sec, data.getString("videoId"))
             reply.putBoolean("ok", true)
             reply.putString("url", r.url)
             reply.putBundle("headers", Bundle().apply { r.headers.forEach { (k, v) -> putString(k, v) } })
@@ -64,6 +68,28 @@ class ResolveService : Service() {
             reply.putBoolean("notFound", e is Yt.NotFound)
             reply.putString("error", e.message?.lineSequence()?.lastOrNull { it.isNotBlank() }?.take(300) ?: e.javaClass.simpleName)
             Log.w(TAG, "\"$title\" failed: ${e.message}")
+        }
+        replyTo?.let { send(it, reply) }
+    }
+
+    private fun searchReply(data: Bundle, replyTo: Messenger?) {
+        val reply = Bundle().apply { putInt("rid", data.getInt("rid", -1)) }
+        try {
+            val songs = Yt.searchSongs(data.getString("query").orEmpty(), data.getInt("limit", 20))
+            reply.putBoolean("ok", true)
+            reply.putParcelableArrayList("results", ArrayList(songs.map { s ->
+                Bundle().apply {
+                    putString("videoId", s.videoId)
+                    putString("title", s.title)
+                    putString("artist", s.artist)
+                    putString("album", s.album)
+                    putInt("durationSec", s.durationSec ?: 0)
+                    putString("thumbnail", s.thumbnail)
+                }
+            }))
+        } catch (e: Exception) {
+            reply.putBoolean("ok", false)
+            reply.putString("error", e.message ?: e.javaClass.simpleName)
         }
         replyTo?.let { send(it, reply) }
     }

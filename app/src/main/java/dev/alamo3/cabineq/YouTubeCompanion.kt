@@ -98,6 +98,7 @@ object YouTubeCompanion {
                 putString("title", track.title)
                 putString("artist", track.artist)
                 putInt("durationSec", (track.durationMs / 1000).toInt())
+                track.youtubeId?.let { putString("videoId", it) }
             }
             replyTo = replyMessenger
         }
@@ -122,6 +123,47 @@ object YouTubeCompanion {
         a.getBundle("headers")?.let { h -> h.keySet().forEach { k -> h.getString(k)?.let { headers[k] = it } } }
         DLog.i(TAG, "\"${track.title}\" -> ${a.getString("videoId")} (${a.getString("channel")}) in ${System.currentTimeMillis() - started} ms")
         return Link(a.getString("url")!!, headers, a.getString("quality") ?: "YouTube", a.getString("videoId").orEmpty())
+    }
+
+    class Song(val videoId: String, val title: String, val artist: String, val album: String?, val durationSec: Int, val thumbnail: String?) {
+        fun toTrack() = Track(
+            title = title,
+            artist = artist,
+            album = album,
+            artworkUrl = thumbnail,
+            durationMs = durationSec * 1000L,
+            source = Track.Source.ADDON,
+            youtubeId = videoId,
+        )
+    }
+
+    /** Songs from YouTube Music for the search screen; empty when the companion can't answer. */
+    fun search(context: Context, query: String, limit: Int = 20, timeoutMs: Long = 8_000L): List<Song> {
+        val target = runCatching { messenger(context) }.getOrNull() ?: return emptyList()
+        val rid = ids.incrementAndGet()
+        val done = CountDownLatch(1)
+        var answer: Bundle? = null
+        pending[rid] = { answer = it; done.countDown() }
+        try {
+            target.send(Message.obtain(null, 3).apply {
+                data = Bundle().apply { putInt("rid", rid); putString("query", query); putInt("limit", limit) }
+                replyTo = replyMessenger
+            })
+            if (!done.await(timeoutMs, TimeUnit.MILLISECONDS)) return emptyList()
+        } catch (e: Exception) {
+            return emptyList()
+        } finally {
+            pending.remove(rid)
+        }
+        val a = answer ?: return emptyList()
+        if (!a.getBoolean("ok")) { DLog.i(TAG, "search failed: ${a.getString("error")}"); return emptyList() }
+        @Suppress("DEPRECATION")
+        val list = a.getParcelableArrayList<Bundle>("results").orEmpty()
+        return list.mapNotNull { b ->
+            val id = b.getString("videoId") ?: return@mapNotNull null
+            Song(id, b.getString("title").orEmpty(), b.getString("artist").orEmpty(), b.getString("album"),
+                b.getInt("durationSec"), b.getString("thumbnail"))
+        }
     }
 
     /** The video picked for [track] was wrong or would not play: the companion searches again next time. */

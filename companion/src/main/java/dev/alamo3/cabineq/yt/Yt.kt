@@ -77,15 +77,25 @@ object Yt {
         return text
     }
 
-    fun resolve(context: Context, title: String, artist: String?, durationSec: Int?): Result {
-        awaitReady()
+    /**
+     * A playable link for a song. With [videoId] (a YouTube result the user tapped) that exact
+     * video; otherwise the best match for title, artist and length.
+     */
+    fun resolve(context: Context, title: String, artist: String?, durationSec: Int?, videoId: String? = null): Result {
+        if (!videoId.isNullOrBlank()) { awaitReady(); return audio(videoId) }
         val key = songKey(title, artist)
         var id = chosen[key]
         if (id == null) {
-            id = search(title, artist, durationSec) ?: ""
+            // YouTube Music's own search first (fast, official audio); yt-dlp's as the fallback.
+            id = runCatching { musicSearch(title, artist, durationSec) }
+                .onFailure { Log.w(TAG, "YouTube Music search failed: ${it.message}") }
+                .getOrNull()
+                ?: run { awaitReady(); search(title, artist, durationSec) }
+                ?: ""
             chosen[key] = id
             save(context)
         }
+        awaitReady()
         if (id.isEmpty()) throw NotFound("No matching song on YouTube")
         return audio(id)
     }
@@ -103,6 +113,23 @@ object Yt {
     }
 
     // ---------------------------------------------------------------- search
+
+    /** Songs for the search screen, straight from YouTube Music. */
+    fun searchSongs(query: String, limit: Int): List<YtmSearch.Song> = YtmSearch.search(query, limit)
+
+    private fun musicSearch(title: String, artist: String?, durationSec: Int?): String? {
+        val query = listOfNotNull(artist?.split(',')?.first()?.trim(), title).joinToString(" ")
+        val songs = YtmSearch.search(query, 10)
+        if (songs.isEmpty()) return null
+        var best: Pair<String, Double>? = null
+        for (s in songs) {
+            // Listed as a song by YouTube Music: official audio, so it starts with the Topic lift.
+            val sc = score(title, artist, durationSec, s.title, s.artist + " topic", s.durationSec)
+            Log.i(TAG, "music candidate ${s.title} / ${s.artist} -> ${"%.1f".format(sc)}")
+            if (best == null || sc > best.second) best = s.videoId to sc
+        }
+        return best?.takeIf { it.second >= 1.0 }?.first
+    }
 
     private fun search(title: String, artist: String?, durationSec: Int?): String? {
         val query = listOfNotNull(artist?.split(',')?.first()?.trim(), title).joinToString(" ")

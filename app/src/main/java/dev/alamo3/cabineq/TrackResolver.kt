@@ -88,6 +88,11 @@ object TrackResolver {
                 val link = settings.addonLink
                 cachedLink(track)?.let { return Resolved(it.url, it.quality, it.headers, it.via) }
                 val youtube = YouTubeCompanion.usable(context)
+                // A song picked from YouTube's own results: that video, Nebula only if it fails.
+                if (track.youtubeId != null && YouTubeCompanion.installed(context)) {
+                    fromYouTube(context, track, onNote)?.let { return it }
+                    if (link.isBlank()) throw IllegalStateException("YouTube couldn't play “${track.title}”")
+                }
                 if (link.isBlank()) {
                     // No Nebula: YouTube alone, when the companion is there.
                     if (youtube) fromYouTube(context, track, onNote)?.let { return it }
