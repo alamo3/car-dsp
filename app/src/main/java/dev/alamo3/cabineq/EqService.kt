@@ -864,10 +864,16 @@ class EqService : MediaBrowserServiceCompat() {
                 "${player.currentInfo?.artist} ${player.currentInfo?.title ?: track.title}"
             else -> player.currentInfo?.title ?: track.title
         }
+        val artQuery = if (track?.artworkUrl == null) fallbackQuery else null
+        // Some car screens (the Ioniq's own media widget) ask for the art once, early, and keep
+        // the placeholder they got. Once the cover is cached the URI changes so they ask again.
+        val ready = art != null &&
+            dev.alamo3.cabineq.music.Artwork.cachedFileFor(this, track?.artworkUrl, artQuery, ART_PX) != null
         ArtworkProvider.uriFor(
             url = track?.artworkUrl,
-            query = if (track?.artworkUrl == null) fallbackQuery else null,
+            query = artQuery,
             sizePx = ART_PX,
+            ready = ready,
         )?.let { b.putString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, it.toString()) }
         art?.let { b.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) }
         return b.build()

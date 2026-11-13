@@ -146,7 +146,12 @@ class ArtworkProvider : ContentProvider() {
             .appendQueryParameter("s", sizePx.toString())
             .build()
 
-        fun uriFor(url: String? = null, query: String? = null, sizePx: Int = 512): Uri? {
+        /**
+         * @param ready the real image is already cached. It changes the URI: a car that was handed
+         * the placeholder for this song keeps it until the URI changes, so the now-playing art is
+         * re-published with this set once the cover has arrived.
+         */
+        fun uriFor(url: String? = null, query: String? = null, sizePx: Int = 512, ready: Boolean = false): Uri? {
             val hasUrl = !url.isNullOrBlank()
             val hasQuery = !query.isNullOrBlank()
             if (!hasUrl && !hasQuery) return null
@@ -158,6 +163,7 @@ class ArtworkProvider : ContentProvider() {
                     if (hasUrl) appendQueryParameter("u", url)
                     if (hasQuery) appendQueryParameter("q", query)
                     appendQueryParameter("s", sizePx.toString())
+                    if (ready) appendQueryParameter("r", "1")
                 }
                 .build()
         }
