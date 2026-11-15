@@ -108,7 +108,9 @@ object AudioPath {
         if (!Settings(context).bluetoothHfGuard) return "off"
         val bt = device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
             device?.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
-        return if (bt) "on — Bluetooth, low-pass at 15.5 kHz" else "armed (Bluetooth only)"
+        if (bt) return "on — Bluetooth, low-pass at 15.5 kHz"
+        if (CarVolume.inCar(context)) return "on — Android Auto, low-pass at 15.5 kHz"
+        return "armed (Bluetooth and Android Auto)"
     }
 
     private fun trackRateOf(player: FilePlayer?): Int? =
