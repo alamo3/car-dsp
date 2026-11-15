@@ -227,6 +227,13 @@ class FilePlayer private constructor(private val context: Context) {
             val receiver = object : android.content.BroadcastReceiver() {
                 override fun onReceive(c: Context, intent: android.content.Intent) {
                     DLog.i(TAG, "car mode: ${intent.action}")
+                    // The car was switched off or the phone unplugged: whatever was playing to
+                    // the car must not carry on out of the phone's speaker.
+                    if (intent.action == android.app.UiModeManager.ACTION_EXIT_CAR_MODE &&
+                        (state == State.PLAYING || state == State.LOADING)) {
+                        DLog.i(TAG, "pause: left the car")
+                        pause()
+                    }
                     runCatching { CarVolume.sync(c) }
                 }
             }
@@ -506,7 +513,18 @@ class FilePlayer private constructor(private val context: Context) {
             note = null
             version++
             exoActive = true
-            exoEngine().start(startIndex.coerceIn(0, tracks.lastIndex), startAtMs.coerceAtLeast(0))
+            // Audio focus is ours to hold (Media3's own focus handling is off): without it the
+            // car's projection host never tells us when the head unit switches to the radio, a
+            // notification plays, or a call comes in — the phone just kept playing.
+            val gen = ++generation
+            val index = startIndex.coerceIn(0, tracks.lastIndex)
+            val at = startAtMs.coerceAtLeast(0)
+            if (!requestFocus()) {
+                DLog.w(TAG, "play: focus refused, retrying")
+                requestFocusForUser { if (gen == generation) exoEngine().start(index, at) }
+                return
+            }
+            exoEngine().start(index, at)
             return
         }
         if (exoActive) {
@@ -540,7 +558,9 @@ class FilePlayer private constructor(private val context: Context) {
         if (!isActive) return
         if (exoActive) {
             userPaused = true
+            interrupted = false
             exo?.pause()
+            abandonFocus()
             return
         }
         userPaused = true
@@ -560,7 +580,8 @@ class FilePlayer private constructor(private val context: Context) {
         }
         if (exoActive) {
             userPaused = false
-            exo?.resume()
+            interrupted = false
+            requestFocusForUser { exo?.resume() }
             return
         }
         userPaused = false
@@ -961,26 +982,42 @@ class FilePlayer private constructor(private val context: Context) {
         DLog.i(TAG, "focus change $change (state=${state.name}, userPaused=$userPaused)")
         when (change) {
             AudioManager.AUDIOFOCUS_LOSS -> {
-                // Another app took over. Not a user pause: in Android Auto the projection host
-                // grabs focus around the media panel, so when focus comes back we resume by
-                // ourselves. Never grab it back on a timer — that would fight a real player.
+                // Another app took over (or the car switched to its radio). Not a user pause: in
+                // Android Auto the projection host grabs focus around the media panel, so if focus
+                // comes back we resume by ourselves. Never grab it back on a timer — that would
+                // fight a real player.
                 interrupted = state == State.PLAYING || state == State.LOADING
-                if (isActive) setState(State.PAUSED, "audio focus lost")
+                focusPause("audio focus lost")
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                // Phone call etc.: pause, resume when it ends.
+                // A call, a notification read out: pause, resume when it ends.
                 focusPaused = true
                 if (state == State.PLAYING || state == State.LOADING) {
-                    setState(State.PAUSED, "audio focus transient loss")
+                    interrupted = true
+                    focusPause("audio focus transient loss")
                 }
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
                 val resume = interrupted && !userPaused && state == State.PAUSED
                 interrupted = false
                 focusPaused = false
-                if (resume) setState(State.PLAYING, "audio focus back")
+                if (resume) {
+                    if (exoActive) exo?.resume() else setState(State.PLAYING, "audio focus back")
+                    DLog.i(TAG, "resumed: audio focus back")
+                }
             }
             // LOSS_TRANSIENT_CAN_DUCK (navigation prompts): the system ducks us automatically.
+        }
+    }
+
+    /** Pauses for someone else's audio, keeping the focus request so its return can resume us. */
+    private fun focusPause(why: String) {
+        if (!isActive) return
+        if (exoActive) {
+            DLog.i(TAG, "pause: $why")
+            exo?.pause()
+        } else {
+            setState(State.PAUSED, why)
         }
     }
 
