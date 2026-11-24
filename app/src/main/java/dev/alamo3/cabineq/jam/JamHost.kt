@@ -55,7 +55,7 @@ object JamHost {
         private set
     @Volatile var sessionId: String? = null
         private set
-    /** Guests may skip to the next track. */
+    /** Guests may control playback: play/pause, next, previous. */
     @Volatile var canSkip = false
 
     private val io = Executors.newSingleThreadExecutor { r ->
@@ -120,6 +120,8 @@ object JamHost {
         latestSearch.clear()
         synchronized(budgets) { budgets.clear() }
         running = true
+        // The guests fill the queue now: the radio's picks ahead would bury their songs.
+        FilePlayer.peek()?.dropRadioPicks()
         val orphan = settings.lastJamSession?.takeIf { it != sid }
         settings.lastJamSession = sid
         io.execute {
@@ -310,11 +312,14 @@ object JamHost {
                 if (player.queue.size >= MAX_QUEUE) {
                     Log.w(TAG, "queue full ($MAX_QUEUE), add ignored")
                 } else {
-                    player.enqueue(listOf(trackFrom(it)))
+                    // "next": right after the playing song. Otherwise after what people queued,
+                    // ahead of any radio pick.
+                    val track = trackFrom(it)
+                    val key = if (op.optString("mode") == "next") player.playNext(track) else player.addBeforeRadio(track)
                     // A jam must not go quiet because the last queued song finished: if the
                     // player is idle (not paused by someone), start the song that was just added.
-                    if (player.state == FilePlayer.State.IDLE && !player.userPaused) {
-                        player.skipTo(player.queue.lastIndex)
+                    if (key != null && player.state == FilePlayer.State.IDLE && !player.userPaused) {
+                        player.indexOfKey(key).takeIf { i -> i >= 0 }?.let { i -> player.skipTo(i) }
                     }
                 }
             }
@@ -326,7 +331,11 @@ object JamHost {
                 val i = keys.indexOf(op.optString("key"))
                 if (i > player.currentIndex + 1) player.moveUpcoming(op.optString("key"), i - 1)
             }
+            // Playback controls, when the host allows them ("Guests can control playback").
             "skip" -> if (canSkip) player.next()
+            "prev" -> if (canSkip) player.previous()
+            "pause" -> if (canSkip) player.pause()
+            "play" -> if (canSkip) player.resume()
             "search" -> answerSearch(app, sid, op)
         }
         player.version.let { }   // no-op: keeps the linter honest about the instance use

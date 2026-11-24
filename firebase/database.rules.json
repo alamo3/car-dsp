@@ -17,7 +17,7 @@
           ".read": true,
           "$op": {
             ".write": "!data.exists() || !newData.exists()",
-            ".validate": "!newData.exists() || (newData.hasChildren(['op', 'guest', 'at']) && newData.child('op').isString() && newData.child('op').val().matches(/^(add|move|remove|vote|skip|search)$/) && newData.child('guest').isString() && newData.child('guest').val().length <= 64 && newData.child('at').isNumber())",
+            ".validate": "!newData.exists() || (newData.hasChildren(['op', 'guest', 'at']) && newData.child('op').isString() && newData.child('op').val().matches(/^(add|move|remove|vote|skip|prev|pause|play|search)$/) && newData.child('guest').isString() && newData.child('guest').val().length <= 64 && newData.child('at').isNumber())",
             "op": {
               ".validate": true
             },
@@ -46,6 +46,9 @@
               "$f": {
                 ".validate": "$f.length <= 16 && ((newData.isString() && newData.val().length <= 1000) || newData.isNumber() || newData.isBoolean())"
               }
+            },
+            "mode": {
+              ".validate": "newData.isString() && newData.val().matches(/^(next|queue)$/)"
             },
             "$other": {
               ".validate": false

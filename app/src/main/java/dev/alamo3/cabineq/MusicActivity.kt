@@ -2644,9 +2644,17 @@ class MusicActivity : Activity() {
                 startActivity(Intent.createChooser(send, "Share jam link"))
             }, wrapLp(top = 8))
             page.addView(Ui.pill(this,
-                if (JamHost.canSkip) "Guests can skip: on" else "Guests can skip: off", filled = false) {
+                if (JamHost.canSkip) "Guest playback controls: on" else "Guest playback controls: off", filled = false) {
                 JamHost.canSkip = !JamHost.canSkip
                 renderSettings()
+            }, wrapLp(top = 8))
+            page.addView(Ui.text(this,
+                "On: guests can pause, play, skip and go back from their phones.",
+                12f, Ui.TEXT_2, lines = 2).apply { setPadding(0, dp(4), 0, 0) })
+            // Host only: a guest's "Play next" never removes anyone else's songs.
+            page.addView(Ui.pill(this, "Clear queue", filled = false) {
+                val n = FilePlayer.peek()?.clearUpcoming() ?: 0
+                toast(if (n == 0) "Nothing queued" else "Removed $n upcoming song${if (n == 1) "" else "s"}")
             }, wrapLp(top = 8))
         }
 

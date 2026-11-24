@@ -729,10 +729,45 @@ class FilePlayer private constructor(private val context: Context) {
         return keys
     }
 
+    /**
+     * Queues [track] after everything people queued but before the radio's own picks: a song
+     * someone asked for should not wait behind songs nobody asked for.
+     */
+    fun addBeforeRadio(track: Track): String? {
+        val firstPick = synchronized(eqLock) {
+            (currentIndex + 1 until queueKeys.size).firstOrNull { queueKeys[it] in radioKeys }
+        }
+        val key = enqueue(listOf(track)).firstOrNull() ?: return null
+        if (firstPick != null) moveUpcoming(key, firstPick)
+        return key
+    }
+
+    /** Where the entry with [key] sits in the queue now, or -1. */
+    fun indexOfKey(key: String): Int = synchronized(eqLock) { queueKeys.indexOf(key) }
+
+    /** Removes the radio's own upcoming picks (a jam takes over the queue). */
+    fun dropRadioPicks(): Int {
+        val picks = synchronized(eqLock) {
+            (currentIndex + 1 until queueKeys.size).map { queueKeys[it] }.filter { it in radioKeys }
+        }
+        picks.forEach { removeUpcoming(it); radioKeys.remove(it) }
+        if (picks.isNotEmpty()) DLog.i(TAG, "Radio: dropped ${picks.size} upcoming picks")
+        return picks.size
+    }
+
+    /** Removes every upcoming song (the jam host's "Clear queue"); the radio refills as usual. */
+    fun clearUpcoming(): Int {
+        val keys = synchronized(eqLock) { queueKeys.drop(currentIndex + 1) }
+        keys.forEach { removeUpcoming(it); radioKeys.remove(it) }
+        DLog.i(TAG, "Queue: cleared ${keys.size} upcoming")
+        return keys.size
+    }
+
     /** Queues [track] right after the one that is playing. */
-    fun playNext(track: Track) {
-        val key = enqueue(listOf(track)).firstOrNull() ?: return
+    fun playNext(track: Track): String? {
+        val key = enqueue(listOf(track)).firstOrNull() ?: return null
         moveUpcoming(key, currentIndex + 1)
+        return key
     }
 
     /** True while the radio tops the queue up by itself. */
@@ -832,7 +867,10 @@ class FilePlayer private constructor(private val context: Context) {
         // Keep a deep queue: plenty of listeners skip a lot, and a skip should land on a song that
         // is already there. Picks are cheap once the background matcher (Radio.prepare) has
         // songs ready, so this costs little; TorBox is still only asked about the next four.
-        if (!force && queue.lastIndex - currentIndex >= RADIO_AHEAD) return
+        // In a jam the guests fill the queue: the radio only keeps one song ready behind theirs,
+        // so the music never stops but a guest's song never lands behind a wall of picks.
+        val ahead = if (dev.alamo3.cabineq.jam.JamHost.running) 1 else RADIO_AHEAD
+        if (!force && queue.lastIndex - currentIndex >= ahead) return
         if (!force && state != State.PLAYING && state != State.LOADING) return
         radioBusy = true
         val gen = generation

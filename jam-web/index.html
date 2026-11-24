@@ -45,6 +45,10 @@
   button.primary.adding { background:var(--surface2); color:var(--text2); }
   @keyframes flash { from { background:rgba(90,209,154,.35); } to { background:var(--surface2); } }
   button.primary.fresh { animation:flash 1.2s ease-out; }
+  .controls { display:flex; justify-content:center; gap:18px; margin-top:12px; }
+  .controls button { font-size:20px; min-width:56px; padding:10px 0; }
+  .adds { display:flex; gap:6px; flex:0 0 auto; }
+  .adds button { padding:8px 10px; font-size:14px; }
 </style>
 </head>
 <body>
@@ -59,12 +63,16 @@
       <div class="meta" id="nowMeta"></div>
     </div>
   </div>
+  <div class="controls" id="controls" hidden>
+    <button id="prev" aria-label="Previous">⏮</button>
+    <button id="playPause" aria-label="Play or pause">⏯</button>
+    <button id="next" aria-label="Next">⏭</button>
+  </div>
 </div>
 
 <div class="card">
   <div class="row" style="justify-content:space-between;margin-bottom:10px">
     <strong>Up next</strong>
-    <button class="ghost" id="skip" hidden>Skip</button>
   </div>
   <div class="list" id="queue"><div class="muted">Nothing queued yet.</div></div>
 </div>
@@ -194,8 +202,8 @@
       if ((counts.get(p.key) || 0) <= p.baseCount) continue;
       pending.delete(id);
       if (p.btn && p.btn.isConnected) {
-        p.btn.textContent = "Add";
-        p.btn.disabled = false;
+        p.btn.textContent = p.label;
+        p.btns.forEach((b) => { b.disabled = false; });
         p.btn.classList.remove("adding");
         p.btn.classList.add("fresh");
         setTimeout(() => p.btn && p.btn.classList.remove("fresh"), 1300);
@@ -210,8 +218,8 @@
       if (Date.now() - p.at < 20000) continue;
       pending.delete(id);
       if (p.btn && p.btn.isConnected) {
-        p.btn.textContent = "Add";
-        p.btn.disabled = false;
+        p.btn.textContent = p.label;
+        p.btns.forEach((b) => { b.disabled = false; });
         p.btn.classList.remove("adding");
       }
       hint("Couldn't add “" + p.track.title + "” — try again.");
@@ -238,7 +246,11 @@
       nowCard.hidden = true;
     }
 
-    document.getElementById("skip").hidden = !(s && s.canSkip);
+    // Playback controls, when the host allows them.
+    document.getElementById("controls").hidden = !(s && s.canSkip);
+    const pp = document.getElementById("playPause");
+    pp.textContent = (s && s.playing) ? "⏸" : "▶";
+    pp.setAttribute("aria-label", (s && s.playing) ? "Pause" : "Play");
 
     dropConfirmed();
 
@@ -300,7 +312,11 @@
     }
   });
 
-  document.getElementById("skip").addEventListener("click", () => op({ op: "skip" }));
+  const control = (o) => { op(o).catch((e) => hint("Couldn't reach the car — " + e.message)); poke(); };
+  document.getElementById("prev").addEventListener("click", () => control({ op: "prev" }));
+  document.getElementById("next").addEventListener("click", () => control({ op: "skip" }));
+  document.getElementById("playPause").addEventListener("click", () =>
+    control({ op: (state && state.playing) ? "pause" : "play" }));
 
   let pollAgain = false;
   async function pollState() {
@@ -427,30 +443,35 @@
           <div class="title">${esc(t.title)}</div>
           <div class="meta">${esc(meta(t))}</div>
         </div>
-        <button class="primary" data-add="1">Add</button>`;
-      const addBtn = el.querySelector("[data-add]");
-      addBtn.addEventListener("click", async () => {
+        <div class="adds">
+          <button data-mode="next">Play next</button>
+          <button class="primary" data-mode="queue">Add</button>
+        </div>`;
+      const btns = [...el.querySelectorAll("[data-mode]")];
+      btns.forEach((addBtn) => addBtn.addEventListener("click", async () => {
         // Never leave the tap unanswered: show the row in "Up next" and mark the button at once.
+        const mode = addBtn.dataset.mode;
+        const label = addBtn.textContent;
         const key = trackKey(t);
         const baseCount = ((state && state.queue) || []).filter((x) => trackKey(x) === key).length;
-        const entry = { id: ++localSeq, key, baseCount, track: t, at: Date.now(), btn: addBtn };
+        const entry = { id: ++localSeq, key, baseCount, track: t, at: Date.now(), btn: addBtn, btns, label };
         pending.set(entry.id, entry);
-        addBtn.disabled = true;
+        btns.forEach((b) => { b.disabled = true; });
         addBtn.textContent = "Adding…";
         addBtn.classList.add("adding");
         render();
         try {
-          await op({ op: "add", track: t });
+          await op({ op: "add", track: t, mode });
           poke();
         } catch (e) {
           pending.delete(entry.id);
-          addBtn.disabled = false;
-          addBtn.textContent = "Add";
+          btns.forEach((b) => { b.disabled = false; });
+          addBtn.textContent = label;
           addBtn.classList.remove("adding");
           hint("Couldn't add — " + e.message);
           render();
         }
-      });
+      }));
       resultsEl.appendChild(el);
     });
   }
