@@ -333,14 +333,19 @@ class FilePlayer private constructor(private val context: Context) {
         val subsonic = if (settings.subsonicFilter) EqDesign.highPass(rate.toDouble()) else DoubleArray(0)
         val coeffs = subsonic + user + cabinCoeffs
         val bandCount = subsonic.size / 5 + bands.size + (cabin?.bands?.size ?: 0)
-        val preamp = eqPreampDb + (cabin?.preampFor(settings.cabinAmount) ?: 0.0).toFloat()
+        // In the car, the whole chain sits lower: the AA encoder and the head unit's own EQ come
+        // after us and clip a hot signal on treble. The limiter ceiling drops with it, so it
+        // still only catches peaks rather than doing the attenuation itself.
+        val headroom = if (CarVolume.inCar(context)) settings.carHeadroomDb else 0
+        val preamp = eqPreampDb + (cabin?.preampFor(settings.cabinAmount) ?: 0.0).toFloat() - headroom
+        val ceiling = eqLimiterLin * EqService.dbToLin(-headroom.toFloat())
         // Any lossy hop to the speakers: Bluetooth, or Android Auto, which re-encodes the phone's
         // audio for the car and never shows up as a Bluetooth route (so the guard used to stay
         // off exactly in the car, where the crackle on bright material was heard).
         val lossy = bluetooth || CarVolume.inCar(context)
         val guard = if (settings.bluetoothHfGuard && lossy) EqDesign.lowPass(rate.toDouble(), 15500.0) else null
         NativeDsp.setParams(
-            handle, coeffs, bandCount, EqService.dbToLin(preamp), eqLimiterLin,
+            handle, coeffs, bandCount, EqService.dbToLin(preamp), ceiling,
             guard, if (guard == null) 0 else 2,
         )
         return true

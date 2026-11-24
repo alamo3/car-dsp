@@ -312,6 +312,15 @@ class Settings(context: Context) {
      * In car mode, raise the media stream to maximum so the mixer does not attenuate the
      * signal before it leaves the phone; restored when car mode ends.
      */
+    /**
+     * Headroom left below full scale in the car (dB). Android Auto re-encodes the audio and the
+     * head unit runs its own EQ after that; a signal at -2 dBFS with the phone at 100% clips in
+     * there on bright passages, heard as crackle on treble at higher volume.
+     */
+    var carHeadroomDb: Int
+        get() = prefs.getInt(KEY_CAR_HEADROOM_DB, 6)
+        set(v) = prefs.edit().putInt(KEY_CAR_HEADROOM_DB, v.coerceIn(0, 12)).apply()
+
     var maxVolumeInCar: Boolean
         get() = prefs.getBoolean(KEY_MAX_VOLUME_IN_CAR, true)
         set(v) = prefs.edit().putBoolean(KEY_MAX_VOLUME_IN_CAR, v).apply()
@@ -446,6 +455,7 @@ class Settings(context: Context) {
         const val KEY_RADIO_SEED = "radio_seed"
         const val KEY_REPEAT = "repeat_mode"
         const val KEY_BT_HF_GUARD = "bluetooth_hf_guard"
+        const val KEY_CAR_HEADROOM_DB = "car_headroom_db"
         const val KEY_SUBSONIC = "subsonic_filter"
         const val KEY_IMPORTED_PLAYLISTS = "imported_playlists"
         const val KEY_MAX_VOLUME_IN_CAR = "max_volume_in_car"

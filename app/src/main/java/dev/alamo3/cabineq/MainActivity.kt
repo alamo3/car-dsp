@@ -257,6 +257,20 @@ class MainActivity : Activity() {
                 refreshOutputPath()
             }
         })
+        slider(root, { "Car headroom: ${it.roundToInt()} dB" }, 0f, 12f, 1f, settings.carHeadroomDb.toFloat()) { v ->
+            settings.carHeadroomDb = v.roundToInt()
+            FilePlayer.peek()?.refreshRouteDependentParams()
+            refreshOutputPath()
+        }
+        root.addView(TextView(this).apply {
+            text = "In the car, play this much below full scale. Android Auto re-encodes the " +
+                "sound and the car runs its own EQ afterwards; with the phone at 100% a hotter " +
+                "signal clips in there, heard as crackle on treble at higher volume. Turn the " +
+                "car's knob up a little to make up the level."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(4))
+        })
         outputPathText = TextView(this).apply {
             setPadding(0, dp(4), 0, dp(8))
             typeface = android.graphics.Typeface.MONOSPACE
