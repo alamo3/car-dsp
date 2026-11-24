@@ -451,6 +451,9 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
 
     // ============================================================ the player (main thread)
 
+    private fun isPlatformSoftware(name: String) =
+        name.startsWith("c2.android.") || name.startsWith("OMX.google.")
+
     private fun ensurePlayer(): ExoPlayer {
         player?.let { return it }
         val freshSink = DspAudioSink(bridge)
@@ -463,6 +466,14 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
                 enableFloatOutput: Boolean,
                 enableAudioTrackPlaybackParams: Boolean,
             ): AudioSink = freshSink
+        }.setMediaCodecSelector { mime, secure, tunneling ->
+            // Android's own software audio decoders first. Decoding audio costs next to nothing,
+            // and they say truthfully what they output; some vendor decoders accept a request for
+            // float and then hand out something else, heard as noise ("High-resolution decoding").
+            val all = androidx.media3.exoplayer.mediacodec.MediaCodecSelector.DEFAULT
+                .getDecoderInfos(mime, secure, tunneling)
+            if (!androidx.media3.common.MimeTypes.isAudio(mime)) all
+            else all.sortedBy { if (isPlatformSoftware(it.name)) 0 else 1 }
         }
         // Audio is cheap to hold: keep a minute or more buffered, and refill early, so a slow
         // stretch of road is ridden out of the buffer, not heard.
@@ -498,6 +509,16 @@ internal class ExoEngine(private val owner: FilePlayer, private val bridge: File
         // (or the end of a song) moves into audio that is already waiting.
         built.preloadConfiguration = ExoPlayer.PreloadConfiguration(PRELOAD_NEXT_US)
         built.addListener(listener)
+        built.addAnalyticsListener(object : androidx.media3.exoplayer.analytics.AnalyticsListener {
+            override fun onAudioDecoderInitialized(
+                eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
+                decoderName: String,
+                initializedTimestampMs: Long,
+                initializationDurationMs: Long,
+            ) {
+                DLog.i(TAG, "audio decoder: $decoderName (${if (bridge.settings.floatDecoding) "float asked" else "16-bit"})")
+            }
+        })
         player = built
         registerNetworkCallback()
         return built
