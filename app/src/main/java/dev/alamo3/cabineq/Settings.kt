@@ -318,7 +318,7 @@ class Settings(context: Context) {
      * there on bright passages, heard as crackle on treble at higher volume.
      */
     var carHeadroomDb: Int
-        get() = prefs.getInt(KEY_CAR_HEADROOM_DB, 6)
+        get() = prefs.getInt(KEY_CAR_HEADROOM_DB, 0)
         set(v) = prefs.edit().putInt(KEY_CAR_HEADROOM_DB, v.coerceIn(0, 12)).apply()
 
     var maxVolumeInCar: Boolean

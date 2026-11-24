@@ -397,6 +397,7 @@ class FilePlayer private constructor(private val context: Context) {
 
         fun state(s: State, reason: String? = null) = setState(s, reason)
         fun index(i: Int) {
+            if (i != currentIndex) logSongLevels(queue.getOrNull(currentIndex)?.title)
             currentIndex = i
             version++
         }
@@ -980,8 +981,38 @@ class FilePlayer private constructor(private val context: Context) {
             val h = if (exoActive) exo?.sink?.handleOrZero ?: 0L else current?.handle ?: 0L
             if (h == 0L || state != State.PLAYING) return null
             NativeDsp.readMeters(h, meterScratch)
+            songLevels.add(meterScratch)
             return meterScratch.copyOf()
         }
+    }
+
+    /**
+     * Per-song level summary for the diagnostics log, so a "crackle on loud, bright songs" report
+     * can be told apart: input pinned at full scale (clipped before the DSP, in the decoder),
+     * the limiter working hard, or clicks counted at the output.
+     */
+    private class SongLevels {
+        var reads = 0; var pinned = 0; var hardLimit = 0; var clicks = 0
+        var inPeak = 0f; var truePeak = 0f; var minGain = 1f
+        fun add(m: FloatArray) {
+            reads++
+            inPeak = max(inPeak, m[0]); truePeak = max(truePeak, m[3]); minGain = minOf(minGain, m[2])
+            if (m[0] >= 0.999f) pinned++
+            if (m[2] < 0.708f) hardLimit++            // more than 3 dB of gain reduction
+            clicks += m[4].toInt()
+        }
+        fun describe(): String = String.format(java.util.Locale.US,
+            "in peak %.1f dBFS (at full scale in %d of %d reads), limiter down to %.1f dB (over 3 dB in %d), out true peak %.1f dBFS, %d clicks",
+            EqService.toDb(inPeak), pinned, reads, EqService.toDb(minGain), hardLimit, EqService.toDb(truePeak), clicks)
+    }
+    private var songLevels = SongLevels()
+
+    /** Logs the levels of the song that just ended (or was left) and starts counting afresh. */
+    private fun logSongLevels(title: String?) {
+        val done = synchronized(eqLock) { songLevels.also { songLevels = SongLevels() } }
+        if (done.reads < 10 || title == null) return
+        DLog.i(TAG, "Levels for \"$title\" (${if (settings.floatDecoding) "float" else "16-bit"} decode, " +
+            "${qualityLabel ?: "?"}): ${done.describe()}")
     }
 
     fun routedDeviceType(): Int? = if (state == State.PLAYING) current?.track?.routedDevice?.type else null
